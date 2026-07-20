@@ -4457,6 +4457,26 @@ class CodeParser:
                 continue
             receiver = edge.extra.get("receiver")
             has_receiver = bool(receiver)
+            if edge.kind in ("CALLS", "REFERENCES") and "::" not in edge.target:
+                # JS/TS calls retain their full member expression as evidence
+                # (``app.handle``) while keeping the method name (``handle``)
+                # as the fallback target for external calls. Prefer the full
+                # expression when it identifies a same-file member-assigned
+                # function; otherwise preserve the existing bare-name
+                # resolution behavior.
+                member_call = edge.extra.get("member_call")
+                member_candidates = symbols.get(member_call, [])
+                if member_candidates:
+                    edge = EdgeInfo(
+                        kind=edge.kind,
+                        source=edge.source,
+                        target=member_candidates[0][0],
+                        file_path=edge.file_path,
+                        line=edge.line,
+                        extra=edge.extra,
+                    )
+                    resolved.append(edge)
+                    continue
             cpp_lexical_receiver = is_cpp and receiver == "this"
             if (
                 is_cpp
@@ -10333,6 +10353,10 @@ class CodeParser:
             # uses this evidence during parsing, and the Spring DI resolver
             # consumes the same metadata for Java injected fields.
             call_extra: dict = {}
+            if language in ("javascript", "typescript", "tsx"):
+                member_call = self._get_js_member_call_name(child)
+                if member_call:
+                    call_extra["member_call"] = member_call
             if (
                 language in self._TYPED_CALL_LANGUAGES
                 or language in ("cpp", "rust")
@@ -10425,6 +10449,26 @@ class CodeParser:
             ))
 
         return False
+
+    @staticmethod
+    def _get_js_member_call_name(node) -> Optional[str]:
+        """Return a static JS/TS member-call expression, if present.
+
+        ``_get_call_name`` intentionally reduces ``app.handle()`` to
+        ``handle`` for general method-call handling. Retain ``app.handle`` as
+        supplemental evidence so the same-file resolver can link it to a
+        member-assigned definition without changing unresolved external calls.
+        Computed and multiline expressions are intentionally excluded.
+        """
+        callee = node.child_by_field_name("function")
+        if callee is None and node.children:
+            callee = node.children[0]
+        if callee is None or callee.type != "member_expression":
+            return None
+        member_call = callee.text.decode("utf-8", errors="replace")
+        if not member_call or "[" in member_call or "\n" in member_call:
+            return None
+        return member_call
 
     def _get_member_call_receiver_method(
         self,
