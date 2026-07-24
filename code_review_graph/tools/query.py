@@ -370,7 +370,10 @@ def query_graph(
                     if node.language == "cpp"
                     else 0
                 )
-                for e in store.iter_edges_by_target_name(node.name):
+                for e in store.iter_edges_by_target_name(
+                    node.name,
+                    language=node.language or None,
+                ):
                     # A C++ overload set deliberately keeps the target bare.
                     # Its candidates support disambiguation, but do not prove
                     # that any one exact overload was called.
@@ -540,7 +543,9 @@ def query_graph(
             # (e.g. "sample.dart::Animal"). Search by plain name too. See: #87
             if total_results == 0 and node:
                 for kind in ("INHERITS", "IMPLEMENTS"):
-                    for e in store.iter_edges_by_target_name(node.name, kind=kind):
+                    for e in store.iter_edges_by_target_name(
+                        node.name, kind=kind, language=node.language or None,
+                    ):
                         child = store.get_node(e.source_qualified)
                         if child:
                             add_result(node_to_dict(child), e)
