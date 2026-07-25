@@ -1398,10 +1398,23 @@ def _create_watch_handler(
                     changed_files=changed_files,
                     reconcile_stale=False,
                 )
-                if result["errors"]:
-                    raise RuntimeError("incremental watch update reported parse errors")
+                errors = result.get("errors") or []
+                if errors:
+                    details = "; ".join(
+                        f"{error.get('file', 'unknown')}: "
+                        f"{error.get('error', 'unknown error')}"
+                        for error in errors
+                    )
+                    raise RuntimeError(f"incremental update reported errors: {details}")
                 if result["files_updated"] > 0 and on_files_updated is not None:
-                    on_files_updated(store)
+                    postprocess_result = on_files_updated(store)
+                    if isinstance(postprocess_result, dict):
+                        warnings = postprocess_result.get("warnings") or []
+                        if warnings:
+                            details = "; ".join(str(warning) for warning in warnings)
+                            raise RuntimeError(
+                                f"post-processing reported warnings: {details}"
+                            )
             except BaseException as exc:
                 self.failure = exc
 

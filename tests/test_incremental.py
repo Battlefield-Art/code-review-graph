@@ -1445,6 +1445,26 @@ class TestWatchReconciliation:
         finally:
             store.close()
 
+    def test_watch_incremental_error_result_propagates_to_boundary(self, tmp_path):
+        source = tmp_path / "source.py"
+        source.write_text("def source():\n    return 1\n")
+        store = GraphStore(tmp_path / "graph.db")
+        handler = _create_watch_handler(tmp_path, store, None)
+        try:
+            from watchdog.events import FileCreatedEvent
+
+            with patch(
+                "code_review_graph.incremental.CodeParser.parse_bytes",
+                side_effect=RuntimeError("forced parse failure"),
+            ):
+                handler.process([FileCreatedEvent(str(source))])
+
+            with pytest.raises(RuntimeError, match="watch update failed") as exc_info:
+                handler.raise_if_failed()
+            assert "source.py: forced parse failure" in str(exc_info.value.__cause__)
+        finally:
+            store.close()
+
     def test_watch_callback_failure_propagates_to_boundary(self, tmp_path):
         source = tmp_path / "source.py"
         source.write_text("def source():\n    pass\n")
@@ -1502,6 +1522,30 @@ class TestWatchReconciliation:
 
             callback.assert_not_called()
             assert store.get_all_files() == []
+        finally:
+            store.close()
+
+    def test_watch_postprocess_warning_result_propagates_to_boundary(self, tmp_path):
+        import sqlite3
+
+        from watchdog.events import FileCreatedEvent
+
+        from code_review_graph.postprocessing import run_post_processing
+
+        source = tmp_path / "source.py"
+        source.write_text("def source():\n    return 1\n")
+        store = GraphStore(tmp_path / "graph.db")
+        handler = _create_watch_handler(tmp_path, store, run_post_processing)
+        try:
+            with patch(
+                "code_review_graph.search.rebuild_fts_index",
+                side_effect=sqlite3.OperationalError("forced FTS failure"),
+            ):
+                handler.process([FileCreatedEvent(str(source))])
+
+            with pytest.raises(RuntimeError, match="watch update failed") as exc_info:
+                handler.raise_if_failed()
+            assert "FTS index rebuild failed" in str(exc_info.value.__cause__)
         finally:
             store.close()
 
