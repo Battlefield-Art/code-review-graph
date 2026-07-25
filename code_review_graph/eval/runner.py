@@ -290,27 +290,40 @@ def run_eval(
         db_path = get_db_path(repo_path)
         store = GraphStore(db_path)
 
-        full_build(repo_path, store)
-        # full_build is the parsing-only primitive; the higher-level CLI/MCP
-        # wrappers run postprocessing on top. The eval framework bypasses
-        # those, so call it directly here. Without this, FTS5 stays empty
-        # and downstream benchmarks (token_efficiency, search_quality)
-        # silently produce useless results. See: search.rebuild_fts_index.
-        pp_result = run_post_processing(store)
-        for warning in pp_result.get("warnings", []):
-            logger.warning("  postprocessing: %s", warning)
+        try:
+            full_build(repo_path, store)
+            # full_build is the parsing-only primitive; the higher-level CLI/MCP
+            # wrappers run postprocessing on top. The eval framework bypasses
+            # those, so call it directly here. Without this, FTS5 stays empty
+            # and downstream benchmarks (token_efficiency, search_quality)
+            # silently produce useless results. See: search.rebuild_fts_index.
+            pp_result = run_post_processing(store)
+            for warning in pp_result.get("warnings", []):
+                logger.warning("  postprocessing: %s", warning)
 
-        # run_post_processing's embedding step is a refresh, not a bootstrap:
-        # refresh_embeddings() returns early on a graph with no existing
-        # vectors, by design, so no build path can silently load a model or
-        # incur API cost. The eval framework therefore has to build the index
-        # explicitly, or every semantic query returns zero hits and the
-        # affected rows are dropped from the aggregate as "no_graph_results".
+            # run_post_processing's embedding step is a refresh, not a bootstrap:
+            # refresh_embeddings() returns early on a graph with no existing
+            # vectors, by design, so no build path can silently load a model or
+            # incur API cost. The eval framework therefore has to build the index
+            # explicitly, or every semantic query returns zero hits and the
+            # affected rows are dropped from the aggregate as "no_graph_results".
+            if embed:
+                _build_embedding_index(
+                    store, db_path, embedding_provider, embedding_model,
+                )
+            _warn_if_semantic_index_missing(store, benchmark_names)
+        except BaseException:
+            store.close()
+            raise
+
+        # The embedding table is provider-scoped. A custom provider/model used
+        # to build the index must also be used by every semantic query, or the
+        # benchmark opens the same table under a different identity and sees
+        # zero vectors. Keep these run-only values out of the loaded config.
+        benchmark_config = dict(config)
         if embed:
-            _build_embedding_index(
-                store, db_path, embedding_provider, embedding_model,
-            )
-        _warn_if_semantic_index_missing(store, benchmark_names)
+            benchmark_config["_embedding_provider"] = embedding_provider
+            benchmark_config["_embedding_model"] = embedding_model
 
         for bench_name in benchmark_names:
             if bench_name not in BENCHMARK_REGISTRY:
@@ -320,7 +333,7 @@ def run_eval(
             logger.info("  Running %s...", bench_name)
             try:
                 bench_fn = BENCHMARK_REGISTRY[bench_name]
-                results = bench_fn(repo_path, store, config)
+                results = bench_fn(repo_path, store, benchmark_config)
 
                 key = f"{name}_{bench_name}"
                 all_results[key] = results

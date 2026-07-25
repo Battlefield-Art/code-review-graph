@@ -965,6 +965,188 @@ def test_reporter_impact_f1_skips_error_and_co_change_rows():
     assert "0.9" not in tables
 
 
+def test_eval_embed_bootstraps_vectors_and_returns_real_graph_results(
+    tmp_path,
+    monkeypatch,
+):
+    """The public eval path must build vectors that its semantic benchmark can use."""
+    from code_review_graph.eval import runner
+
+    repo_path = _make_repo(tmp_path)
+    helper = repo_path / "helper.py"
+    helper.write_text(
+        "# salutation_marker appears only in source text, not in graph node names\n"
+        + helper.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    config = _mock_config(
+        agent_questions=["Where is salutation_marker handled?"],
+    )
+    monkeypatch.setattr(runner, "load_config", lambda _name: config)
+    monkeypatch.setattr(runner, "clone_or_update", lambda _config: repo_path)
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("CRG_HOME", str(state_dir))
+    from code_review_graph import registry as registry_module
+
+    monkeypatch.setattr(
+        registry_module,
+        "_REGISTRY_PATH",
+        state_dir / "registry.json",
+        raising=False,
+    )
+
+    class _StubProvider:
+        dimension = 2
+
+        def __init__(self, name):
+            self.name = name
+
+        @staticmethod
+        def embed(texts):
+            return [[float(len(text)), 1.0] for text in texts]
+
+        @staticmethod
+        def embed_query(_text):
+            return [1.0, 0.0]
+
+    monkeypatch.setattr(
+        "code_review_graph.embeddings.get_provider",
+        lambda provider=None, model=None: _StubProvider(
+            f"{provider or 'local'}:{model or 'default'}",
+        ),
+    )
+
+    results = runner.run_eval(
+        repos=["mock"],
+        benchmarks=["agent_baseline"],
+        output_dir=tmp_path / "results",
+        embed=True,
+        embedding_provider="local",
+        embedding_model="eval-test",
+    )
+
+    rows = results["mock_agent_baseline"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "ok"
+    assert rows[0]["graph_tokens"] > 0
+
+    from code_review_graph.graph import GraphStore
+    from code_review_graph.incremental import get_db_path
+
+    store = GraphStore(get_db_path(repo_path))
+    try:
+        assert runner._embedding_count(store) > 0
+    finally:
+        store.close()
+
+
+def test_search_quality_uses_the_index_provider_and_model(monkeypatch, tmp_path):
+    """A custom eval index is useless unless benchmark queries select that identity."""
+    from code_review_graph.eval.benchmarks import search_quality
+
+    observed = {}
+
+    def _search(_store, _query, *, limit, provider=None, model=None):
+        observed.update(provider=provider, model=model, limit=limit)
+        return []
+
+    monkeypatch.setattr("code_review_graph.search.hybrid_search", _search)
+    search_quality.run(
+        tmp_path,
+        object(),
+        {
+            "name": "mock",
+            "search_queries": [{"query": "natural language", "expected": "target"}],
+            "_embedding_provider": "google",
+            "_embedding_model": "text-embedding-test",
+        },
+    )
+
+    assert observed == {
+        "provider": "google",
+        "model": "text-embedding-test",
+        "limit": 20,
+    }
+
+
+def test_multi_hop_uses_the_index_provider_and_model(monkeypatch, tmp_path):
+    from code_review_graph.eval.benchmarks import multi_hop_retrieval
+
+    observed = {}
+
+    def _search(_store, _query, *, limit, provider=None, model=None):
+        observed.update(provider=provider, model=model, limit=limit)
+        return []
+
+    monkeypatch.setattr("code_review_graph.search.hybrid_search", _search)
+    multi_hop_retrieval.run(
+        tmp_path,
+        object(),
+        {
+            "name": "mock",
+            "multi_hop_tasks": [
+                {
+                    "id": "task",
+                    "nl_query": "natural language",
+                    "anchor_qualified_suffix": "::target",
+                    "k": 7,
+                },
+            ],
+            "_embedding_provider": "minimax",
+            "_embedding_model": "embedding-01",
+        },
+    )
+
+    assert observed == {
+        "provider": "minimax",
+        "model": "embedding-01",
+        "limit": 7,
+    }
+
+
+def test_eval_closes_graph_store_when_embedding_bootstrap_fails(
+    tmp_path,
+    monkeypatch,
+):
+    """A provider failure must not leave the evaluation database connection open."""
+    from code_review_graph.eval import runner
+    from code_review_graph.graph import GraphStore
+
+    repo_path = _make_repo(tmp_path)
+    config = _mock_config()
+    monkeypatch.setattr(runner, "load_config", lambda _name: config)
+    monkeypatch.setattr(runner, "clone_or_update", lambda _config: repo_path)
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    monkeypatch.setenv("CRG_HOME", str(tmp_path / "state"))
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(runner, "_build_embedding_index", _boom)
+    closed = []
+    original_close = GraphStore.close
+
+    def _track_close(self):
+        closed.append(self.db_path)
+        original_close(self)
+
+    monkeypatch.setattr(GraphStore, "close", _track_close)
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        runner.run_eval(
+            repos=["mock"],
+            benchmarks=["agent_baseline"],
+            output_dir=tmp_path / "results",
+            embed=True,
+            embedding_provider="local",
+            embedding_model="eval-test",
+        )
+
+    assert closed
+
+
 # -- Semantic index guard (agent_baseline and friends) ---------------------
 
 

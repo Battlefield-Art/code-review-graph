@@ -147,7 +147,13 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
 
         try:
             from code_review_graph.search import hybrid_search
-            hits = hybrid_search(store, question, limit=5)
+            hits = hybrid_search(
+                store,
+                question,
+                limit=5,
+                provider=config.get("_embedding_provider"),
+                model=config.get("_embedding_model"),
+            )
         except Exception as exc:
             logger.warning("hybrid_search failed on %r: %s", question, exc)
             row["status"] = "error"
