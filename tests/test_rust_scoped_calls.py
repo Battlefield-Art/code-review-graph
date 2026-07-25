@@ -314,6 +314,39 @@ def test_unrelated_import_path_does_not_resolve(tmp_path: Path) -> None:
     assert len(dangling) == 1
 
 
+def test_partial_suffix_from_unrelated_module_does_not_resolve(
+    tmp_path: Path,
+) -> None:
+    """A coincidental queue/mailer suffix is not the imported Rust module."""
+    store = _build(
+        tmp_path,
+        {
+            "src/order/queue/mailer.rs": (
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn go(to: &str) -> bool { true }\n"
+                "}\n"
+            ),
+            "src/billing/legacy/mailer.rs": (
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn go(to: &str) -> bool { true }\n"
+                "}\n"
+            ),
+            "src/app.rs": (
+                "use crate::warehouse::queue::mailer::Mailer;\n"
+                "pub fn run() -> bool {\n"
+                "    Mailer::go(\"x\")\n"
+                "}\n"
+            ),
+        },
+    )
+
+    assert not any(c["confidence_tier"] == "INFERRED" for c in _calls(store))
+    dangling = [c for c in _calls(store) if c["target_qualified"] == "Mailer::go"]
+    assert len(dangling) == 1
+
+
 def test_multi_segment_module_path_is_left_untouched(tmp_path: Path) -> None:
     # A fully-qualified ``crate::mailer::Mailer::dispatch`` is a multi-segment
     # path; resolving it by its last two segments would be unsound, so it stays
@@ -340,4 +373,3 @@ def test_multi_segment_module_path_is_left_untouched(tmp_path: Path) -> None:
     ]
     assert len(multi) == 1
     assert multi[0]["confidence_tier"] == "EXTRACTED"
-

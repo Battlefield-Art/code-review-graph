@@ -91,20 +91,52 @@ def _path_tokens(file_path: str) -> list[str]:
     ``/repo/src/Queue/Mailer.php`` → ``["repo", "src", "Queue", "Mailer"]``;
     ``/repo/src/mailer.rs`` → ``["repo", "src", "mailer"]``.
     """
-    parts = [p for p in file_path.split("/") if p]
+    parts = [p for p in file_path.replace("\\", "/").split("/") if p]
     if parts:
         parts[-1] = parts[-1].rsplit(".", 1)[0]
     return parts
 
 
-def _common_suffix_len(a: list[str], b: list[str], language: str) -> int:
-    """Length of the longest common trailing run of *a* and *b* (case per lang)."""
-    count = 0
-    for left, right in zip(reversed(a), reversed(b)):
-        if _fold(left, language) != _fold(right, language):
-            break
-        count += 1
-    return count
+def _path_key(file_path: str) -> str:
+    """Normalize path separators for exact resolved-import comparisons."""
+    return file_path.replace("\\", "/")
+
+
+def _path_ends_with(
+    path_tokens: list[str], suffix: list[str], language: str
+) -> bool:
+    """Whether a complete import/module suffix matches a defining file path."""
+    if not suffix or len(suffix) > len(path_tokens):
+        return False
+    path_tail = path_tokens[-len(suffix) :]
+    return all(
+        _fold(left, language) == _fold(right, language)
+        for left, right in zip(path_tail, suffix)
+    )
+
+
+def _safe_import_suffixes(segments: list[str], language: str) -> list[list[str]]:
+    """Return complete import suffixes that can safely identify a source path.
+
+    PHP projects commonly map one leading namespace root (for example ``App``)
+    onto a source directory. Rust imports carry a trailing type and may start
+    with a module-root keyword. We strip only those known structural segments;
+    arbitrary leading namespace/module segments are never discarded.
+    """
+    if language == "php":
+        suffixes = [segments]
+        if len(segments) > 2:
+            suffixes.append(segments[1:])
+        return [suffix for suffix in suffixes if len(suffix) >= 2]
+
+    if language == "rust" and len(segments) >= 2:
+        module_path = segments[:-1]
+        suffixes = [module_path]
+        if module_path and module_path[0] in {"crate", "self", "super"}:
+            suffixes.append(module_path[1:])
+        return [suffix for suffix in suffixes if suffix]
+
+    return []
 
 
 def _is_unresolved_scoped_target(target: str) -> bool:
@@ -251,42 +283,42 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         # (1) Prefer a candidate whose defining file is explicitly imported.
         # #574's PHP import resolver rewrites resolvable ``use`` targets to the
         # absolute path of the class file, so a direct path match is exact.
-        imported_paths = {t for t in imported if "/" in t}
-        matched = [c for c in candidates if file_of.get(c) in imported_paths]
+        imported_paths = {
+            _path_key(target)
+            for target in imported
+            if "/" in target or "\\" in target
+        }
+        matched = [
+            candidate
+            for candidate in candidates
+            if _path_key(file_of.get(candidate, "")) in imported_paths
+        ]
         if len(matched) == 1:
             return matched[0]
         # (2) Fall back to a fully-qualified ``use`` target that could not be
-        # resolved to a path (no composer PSR-4 map). Score each candidate by
-        # how much of the imported namespace/module path matches a *suffix* of
-        # the candidate's file path, so ``use App\Order\Queue\Mailer`` picks
-        # ``src/Order/Queue/Mailer.php`` over an unrelated ``src/Queue/Mailer.php``
-        # that merely shares a single segment. The class name lives in the path
-        # for PHP (``Mailer.php``) but not for Rust (``mailer.rs`` holds the
-        # ``Mailer`` type), so each import is scored both with and without its
-        # trailing class segment.
-        best: Optional[str] = None
-        best_score = 0
-        tied = False
+        # resolved to a path (no composer/module map). A candidate must match a
+        # complete normalized import suffix, not merely have the longest partial
+        # overlap. Otherwise an unrelated import such as
+        # ``App\Warehouse\Queue\Mailer`` could be fabricated as
+        # ``src/Order/Queue/Mailer.php`` just because both end in Queue/Mailer.
+        matched_by_suffix: set[str] = set()
         for candidate in candidates:
             tokens = _path_tokens(file_of.get(candidate, ""))
-            score = 0
             for target in imported:
                 segments = _import_segments(target)
                 if not segments:
                     continue
                 if _fold(segments[-1], language) != _fold(class_name, language):
                     continue
-                score = max(
-                    score,
-                    _common_suffix_len(segments, tokens, language),
-                    _common_suffix_len(segments[:-1], tokens, language),
-                )
-            if score > best_score:
-                best_score, best, tied = score, candidate, False
-            elif score == best_score and score > 0:
-                tied = True
-        if best_score >= 1 and not tied:
-            return best
+                suffixes = _safe_import_suffixes(segments, language)
+                if any(
+                    _path_ends_with(tokens, suffix, language)
+                    for suffix in suffixes
+                ):
+                    matched_by_suffix.add(candidate)
+                    break
+        if len(matched_by_suffix) == 1:
+            return next(iter(matched_by_suffix))
         return None
 
     calls_rows = conn.execute(
@@ -358,4 +390,3 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         resolved, len(file_language),
     )
     return {"files_indexed": len(file_language), "calls_resolved": resolved}
-

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build, incremental_update
+from code_review_graph.scoped_resolver import _path_tokens, resolve_scoped_calls
 from code_review_graph.tools.query import get_impact_radius, query_graph
 
 
@@ -35,6 +36,17 @@ def _calls(store: GraphStore) -> list[dict]:
             "SELECT source_qualified, target_qualified, confidence_tier "
             "FROM edges WHERE kind = 'CALLS'"
         ).fetchall()
+    ]
+
+
+def test_path_tokens_normalizes_windows_separators() -> None:
+    assert _path_tokens(r"C:\repo\src\Order\Queue\Mailer.php") == [
+        "C:",
+        "repo",
+        "src",
+        "Order",
+        "Queue",
+        "Mailer",
     ]
 
 
@@ -187,6 +199,57 @@ def test_ambiguous_same_named_methods_disambiguated_by_import(tmp_path: Path) ->
     assert "Mail/Mailer" not in resolved[0]["target_qualified"]
 
 
+def test_windows_resolved_import_path_disambiguates_same_named_methods(
+    tmp_path: Path,
+) -> None:
+    store = _build(
+        tmp_path,
+        {
+            "src/Mail/Mailer.php": (
+                "<?php\n"
+                "namespace App\\Mail;\n"
+                "class Mailer {\n"
+                "    public static function dispatch($to) { return 1; }\n"
+                "}\n"
+            ),
+            "src/Queue/Mailer.php": (
+                "<?php\n"
+                "namespace App\\Queue;\n"
+                "class Mailer {\n"
+                "    public static function dispatch($to) { return 2; }\n"
+                "}\n"
+            ),
+            "src/Http/Ctrl.php": (
+                "<?php\n"
+                "namespace App\\Http;\n"
+                "use App\\Unknown\\Mailer;\n"
+                "class Ctrl {\n"
+                "    public function reg($e) { return Mailer::dispatch($e); }\n"
+                "}\n"
+            ),
+        },
+    )
+    queue_file = store._conn.execute(
+        "SELECT file_path FROM nodes "
+        "WHERE name = 'dispatch' AND file_path LIKE '%/Queue/Mailer.php'"
+    ).fetchone()["file_path"]
+    store._conn.execute(
+        "UPDATE edges SET target_qualified = ? WHERE kind = 'IMPORTS_FROM'",
+        (queue_file.replace("/", "\\"),),
+    )
+    store._conn.commit()
+
+    stats = resolve_scoped_calls(store)
+    assert stats["calls_resolved"] == 1
+    resolved = [
+        call
+        for call in _calls(store)
+        if call["confidence_tier"] == "INFERRED"
+    ]
+    assert len(resolved) == 1
+    assert "Queue/Mailer.php::Mailer.dispatch" in resolved[0]["target_qualified"]
+
+
 def test_php_method_matching_is_case_insensitive(tmp_path: Path) -> None:
     # PHP class/function names are case-insensitive, so a differently-cased call
     # still resolves to the same definition.
@@ -245,6 +308,45 @@ def test_unrelated_import_namespace_does_not_resolve(tmp_path: Path) -> None:
     )
     assert not any(c["confidence_tier"] == "INFERRED" for c in _calls(store))
     dangling = [c for c in _calls(store) if c["target_qualified"] == "Mailer::dispatch"]
+    assert len(dangling) == 1
+
+
+def test_partial_suffix_from_unrelated_namespace_does_not_resolve(
+    tmp_path: Path,
+) -> None:
+    """A coincidental Queue/Mailer suffix is not proof of the imported namespace."""
+    store = _build(
+        tmp_path,
+        {
+            "src/Order/Queue/Mailer.php": (
+                "<?php\n"
+                "namespace App\\Order\\Queue;\n"
+                "class Mailer {\n"
+                "    public static function dispatch($to) { return 1; }\n"
+                "}\n"
+            ),
+            "src/Billing/Legacy/Mailer.php": (
+                "<?php\n"
+                "namespace App\\Billing\\Legacy;\n"
+                "class Mailer {\n"
+                "    public static function dispatch($to) { return 2; }\n"
+                "}\n"
+            ),
+            "src/Http/Ctrl.php": (
+                "<?php\n"
+                "namespace App\\Http;\n"
+                "use App\\Warehouse\\Queue\\Mailer;\n"
+                "class Ctrl {\n"
+                "    public function reg($e) { return Mailer::dispatch($e); }\n"
+                "}\n"
+            ),
+        },
+    )
+
+    assert not any(c["confidence_tier"] == "INFERRED" for c in _calls(store))
+    dangling = [
+        c for c in _calls(store) if c["target_qualified"] == "Mailer::dispatch"
+    ]
     assert len(dangling) == 1
 
 
@@ -371,4 +473,3 @@ def test_resolver_is_idempotent(tmp_path: Path) -> None:
     stats = resolve_scoped_calls(store)
     assert stats["calls_resolved"] == 0
     assert _calls(store) == before
-
