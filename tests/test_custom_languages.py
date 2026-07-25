@@ -457,3 +457,25 @@ class TestNameFieldResolution:
         src.write_text(BIBTEX_SOURCE, encoding="utf-8")
         nodes, _ = CodeParser(tmp_path).parse_file(src)
         assert self._named(nodes, "Class") == set()
+
+    def test_configured_name_field_precedes_unrelated_direct_identifier(
+        self, tmp_path,
+    ):
+        write_config(tmp_path, (
+            "[languages.java_custom]\n"
+            'extensions = [".jcustom"]\n'
+            'grammar = "java"\n'
+            'function_node_types = ["method_declaration"]\n'
+            'name_field = ["name"]\n'
+        ))
+        src = tmp_path / "sample.jcustom"
+        src.write_text(
+            "class Example { Result build() { return null; } }\n",
+            encoding="utf-8",
+        )
+
+        nodes, _ = CodeParser(tmp_path).parse_file(src)
+        functions = self._named(nodes, "Function")
+
+        assert "build" in functions
+        assert "Result" not in functions

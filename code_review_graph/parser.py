@@ -13518,7 +13518,18 @@ class CodeParser:
                                 return None
                 return None
 
-        # Most languages use a 'name' child.
+        # Config-driven custom languages make ``name_field`` authoritative.
+        # Resolve it before the generic direct-child heuristic so an unrelated
+        # identifier (for example a Java return type) cannot win.
+        if language in self._custom_languages:
+            resolved = self._resolve_custom_name(node, language)
+            if resolved:
+                return resolved
+            name_child = node.child_by_field_name("name")
+            if name_child is not None:
+                return name_child.text.decode("utf-8", errors="replace")
+
+        # Most built-in languages use a 'name' child.
         # field_identifier covers C++ class member function names inside
         # function_declarator (e.g. virtual std::string get_name() = 0).
         for child in node.children:
@@ -13532,17 +13543,6 @@ class CodeParser:
             for child in node.children:
                 if child.type == "type_spec":
                     return self._get_name(child, language, kind)
-        # Custom languages (languages.toml): grammars often expose the
-        # definition name through a ``name`` field whose child type is
-        # grammar-specific (Erlang ``atom``, Haskell ``variable``) and thus
-        # not in the generic child-type list above.
-        if language in self._custom_languages:
-            resolved = self._resolve_custom_name(node, language)
-            if resolved:
-                return resolved
-            name_child = node.child_by_field_name("name")
-            if name_child is not None:
-                return name_child.text.decode("utf-8", errors="replace")
         return None
 
     def _get_go_receiver_type(self, node) -> Optional[str]:
