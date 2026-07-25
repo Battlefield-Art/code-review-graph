@@ -852,9 +852,28 @@ def _reconcile_stale_files(
     current_files: list[str] | None = None,
 ) -> list[str]:
     """Remove graph files absent from the current parseable repository inventory."""
-    files = current_files if current_files is not None else collect_all_files(repo_root)
-    current_paths = {str(repo_root / file_path) for file_path in files}
-    stale_files = sorted(set(store.get_all_files()) - current_paths)
+    stored_files = set(store.get_all_files())
+    if current_files is not None:
+        current_paths = {str(repo_root / file_path) for file_path in current_files}
+    else:
+        ignore_patterns = _load_ignore_patterns(repo_root)
+        parser = CodeParser(repo_root)
+        current_paths: set[str] = set()
+        for stored_file in stored_files:
+            path = Path(stored_file)
+            try:
+                relative = str(path.relative_to(repo_root))
+            except ValueError:
+                continue
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and not _should_ignore(relative, ignore_patterns)
+                and parser.detect_language(path) is not None
+                and not _is_binary(path)
+            ):
+                current_paths.add(stored_file)
+    stale_files = sorted(stored_files - current_paths)
     if stale_files:
         store.remove_files_permanently(stale_files)
     return stale_files

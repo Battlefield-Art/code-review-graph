@@ -775,6 +775,45 @@ class TestIncrementalUpdate:
         finally:
             store.close()
 
+    def test_reconciliation_keeps_existing_untracked_files_in_git_repo(self, tmp_path):
+        subprocess.run(
+            ["git", "init", "-q"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        tracked = tmp_path / "tracked.py"
+        tracked.write_text("def tracked():\n    return 1\n")
+        subprocess.run(
+            ["git", "add", "tracked.py"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        untracked = tmp_path / "untracked.py"
+        untracked.write_text("def untracked():\n    return 2\n")
+
+        store = GraphStore(tmp_path / "test.db")
+        try:
+            incremental_update(
+                tmp_path,
+                store,
+                changed_files=["tracked.py", "untracked.py"],
+            )
+            assert store.get_nodes_by_file(str(untracked))
+
+            tracked.write_text("def tracked():\n    return 3\n")
+            result = incremental_update(
+                tmp_path,
+                store,
+                changed_files=["tracked.py"],
+            )
+
+            assert result["stale_files_removed"] == 0
+            assert store.get_nodes_by_file(str(untracked))
+        finally:
+            store.close()
+
     def test_incremental_with_changed_file(self, tmp_path):
         py_file = tmp_path / "mod.py"
         py_file.write_text("def greet():\n    return 'hi'\n")
