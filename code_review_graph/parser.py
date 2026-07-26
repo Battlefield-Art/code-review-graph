@@ -9627,6 +9627,9 @@ class CodeParser:
             decorators = tuple(deco_list)
 
         is_test = _is_test_function(name, file_path, decorators)
+        # PHPUnit's name convention is ``test*`` (not only ``test_*``).
+        if language == "php" and _is_test_file(file_path) and name.startswith("test"):
+            is_test = True
         kind = "Test" if is_test else "Function"
 
         parent_name = enclosing_class
