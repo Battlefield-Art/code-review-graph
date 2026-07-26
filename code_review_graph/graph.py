@@ -687,6 +687,104 @@ class GraphStore:
         ]
         return supported[0] if len(supported) == 1 else None
 
+    def _resolve_python_import_targets(self) -> int:
+        """Resolve raw Python module imports against indexed repository files.
+
+        A module such as ``mypkg.runner`` may live below any source root
+        (``src/``, ``lib/``, or a monorepo package). Match by module suffix
+        after every file has been indexed, and only resolve a unique match.
+        """
+        conn = self._conn
+        python_files = [
+            row["file_path"]
+            for row in conn.execute(
+                "SELECT file_path FROM nodes "
+                "WHERE kind = 'File' AND language = 'python'"
+            ).fetchall()
+        ]
+        if not python_files:
+            return 0
+
+        modules: dict[str, set[str]] = {}
+        for file_path in python_files:
+            parts = [
+                part for part in file_path.replace("\\", "/").split("/")
+                if part
+            ]
+            if not parts:
+                continue
+            filename = parts[-1]
+            if filename == "__init__.py":
+                components = parts[:-1]
+            elif filename.endswith(".py"):
+                components = [*parts[:-1], filename[:-3]]
+            else:
+                continue
+            for start in range(len(components)):
+                modules.setdefault(
+                    ".".join(components[start:]), set(),
+                ).add(file_path)
+
+        rows = conn.execute(
+            "SELECT DISTINCT e.id, e.target_qualified, e.extra "
+            "FROM edges e JOIN nodes f "
+            "ON f.kind = 'File' AND f.file_path = e.file_path "
+            "WHERE e.kind = 'IMPORTS_FROM' AND f.language = 'python'"
+        ).fetchall()
+        changed = 0
+        python_file_set = set(python_files)
+        for edge in rows:
+            try:
+                extra = json.loads(edge["extra"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+
+            raw_module = extra.get("python_module")
+            if not isinstance(raw_module, str):
+                raw_module = edge["target_qualified"]
+                if (
+                    raw_module in python_file_set
+                    or raw_module.startswith(".")
+                    or "/" in raw_module
+                    or "\\" in raw_module
+                ):
+                    continue
+
+            candidates = sorted(modules.get(raw_module, ()))
+            desired_extra = dict(extra)
+            desired_extra["python_module"] = raw_module
+            if len(candidates) == 1:
+                desired_target = candidates[0]
+                desired_extra["import_resolution"] = "repository_suffix"
+                desired_extra.pop("import_candidates", None)
+                desired_extra.pop("import_candidate_count", None)
+                desired_extra.pop("import_candidates_truncated", None)
+            else:
+                desired_target = raw_module
+                desired_extra["import_resolution"] = (
+                    "ambiguous" if candidates else "unresolved"
+                )
+                desired_extra["import_candidates"] = candidates[:20]
+                desired_extra["import_candidate_count"] = len(candidates)
+                desired_extra["import_candidates_truncated"] = len(candidates) > 20
+
+            if (
+                edge["target_qualified"] == desired_target
+                and extra == desired_extra
+            ):
+                continue
+            conn.execute(
+                "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+                (desired_target, json.dumps(desired_extra, sort_keys=True), edge["id"]),
+            )
+            changed += 1
+
+        if changed:
+            conn.commit()
+        return changed
+
     def resolve_bare_call_targets(self) -> int:
         """Resolve bare CALLS targets backed by same-file or import evidence.
 
@@ -698,6 +796,7 @@ class GraphStore:
 
         Returns the number of resolved edges.
         """
+        self._resolve_python_import_targets()
         return self._resolve_bare_endpoints("CALLS", "target_qualified")
 
     def resolve_cpp_scoped_call_targets(self) -> int:
@@ -922,19 +1021,23 @@ class GraphStore:
     def _resolve_bare_endpoints(self, kind: str, endpoint: str) -> int:
         """Resolve a bare edge endpoint only when one candidate has evidence."""
         if endpoint == "target_qualified":
+            raw_key = "bare_call_target"
+            endpoint_column = "target_qualified"
             select_sql = (
                 "SELECT id, source_qualified, target_qualified, file_path, extra "
                 "FROM edges WHERE kind = ? "
-                "AND target_qualified NOT LIKE '%::%'"
+                "AND (target_qualified NOT LIKE '%::%' "
+                "OR extra LIKE '%\"bare_call_target\"%')"
             )
-            update_sql = "UPDATE edges SET target_qualified = ? WHERE id = ?"
         elif endpoint == "source_qualified":
+            raw_key = "bare_tested_by_source"
+            endpoint_column = "source_qualified"
             select_sql = (
                 "SELECT id, source_qualified, target_qualified, file_path, extra "
                 "FROM edges WHERE kind = ? "
-                "AND source_qualified NOT LIKE '%::%'"
+                "AND (source_qualified NOT LIKE '%::%' "
+                "OR extra LIKE '%\"bare_tested_by_source\"%')"
             )
-            update_sql = "UPDATE edges SET source_qualified = ? WHERE id = ?"
         else:
             raise ValueError(f"Invalid edge endpoint column: {endpoint!r}")
 
@@ -965,37 +1068,91 @@ class GraphStore:
             import_targets.setdefault(row["file_path"], set()).add(target_file)
 
         resolved = 0
+        changed = False
         for edge in bare_edges:
             try:
                 edge_extra = json.loads(edge["extra"] or "{}")
             except (TypeError, json.JSONDecodeError):
                 edge_extra = {}
-            if isinstance(edge_extra, dict) and (
+            if not isinstance(edge_extra, dict):
+                edge_extra = {}
+            if raw_key not in edge_extra and (
                 "ambiguous_targets" in edge_extra
                 or "unresolved_targets" in edge_extra
             ):
                 continue
 
-            bare_name = edge[endpoint]
-            candidates = node_lookup.get(bare_name, [])
-            if not candidates:
+            bare_name = edge_extra.get(raw_key, edge[endpoint])
+            if not isinstance(bare_name, str):
                 continue
+            candidates = node_lookup.get(bare_name, [])
 
             context_file = edge["file_path"]
             imported_files = import_targets.get(context_file, set())
-            qualified = self._select_evidence_backed_candidate(
-                candidates,
-                context_file,
-                imported_files,
-            )
-            if qualified is None:
+            supported = [
+                qualified
+                for qualified, candidate_file in candidates
+                if candidate_file == context_file or candidate_file in imported_files
+            ]
+            managed = raw_key in edge_extra
+            if len(supported) != 1 and not managed and len(supported) < 2:
                 continue
+            desired_extra = dict(edge_extra)
+            desired_extra[raw_key] = bare_name
+            if len(supported) == 1:
+                desired_endpoint = supported[0]
+                for key in (
+                    "ambiguous_targets",
+                    "ambiguous_target_count",
+                    "ambiguous_targets_truncated",
+                    "unresolved_targets",
+                    "unresolved_target_count",
+                    "unresolved_targets_truncated",
+                ):
+                    desired_extra.pop(key, None)
+            else:
+                desired_endpoint = bare_name
+                if len(supported) > 1:
+                    resolution = "ambiguous"
+                    resolution_candidates = supported
+                    other = "unresolved"
+                else:
+                    resolution = "unresolved"
+                    resolution_candidates = [
+                        qualified for qualified, _ in candidates
+                    ]
+                    other = "ambiguous"
+                for key in (
+                    f"{other}_targets",
+                    f"{other}_target_count",
+                    f"{other}_targets_truncated",
+                ):
+                    desired_extra.pop(key, None)
+                desired_extra.update({
+                    f"{resolution}_targets": resolution_candidates[:20],
+                    f"{resolution}_target_count": len(resolution_candidates),
+                    f"{resolution}_targets_truncated": (
+                        len(resolution_candidates) > 20
+                    ),
+                })
 
-            conn.execute(update_sql, (qualified, edge["id"]))
-            resolved += 1
+            serialized_extra = json.dumps(desired_extra, sort_keys=True)
+            if (
+                edge[endpoint] == desired_endpoint
+                and edge_extra == desired_extra
+            ):
+                continue
+            conn.execute(
+                f"UPDATE edges SET {endpoint_column} = ?, extra = ? WHERE id = ?",
+                (desired_endpoint, serialized_extra, edge["id"]),
+            )
+            changed = True
+            if len(supported) == 1 and edge[endpoint] != desired_endpoint:
+                resolved += 1
 
-        if resolved:
+        if changed:
             conn.commit()
+        if resolved:
             endpoint_label = (
                 "sources" if endpoint == "source_qualified" else "targets"
             )

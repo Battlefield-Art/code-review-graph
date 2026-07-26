@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from code_review_graph.graph import GraphStore
-from code_review_graph.incremental import full_build
+from code_review_graph.incremental import full_build, incremental_update
 from code_review_graph.parser import EdgeInfo, NodeInfo
 from code_review_graph.postprocessing import run_post_processing
 
@@ -289,6 +289,77 @@ class TestToolBuildUsesSharedPipeline:
 
             assert len(unsigned_before_pp) > 0
             assert len(unsigned_after_pp) == 0
+        finally:
+            store.close()
+
+    def test_src_layout_imports_resolve_before_test_coverage(self, tmp_path):
+        runner = tmp_path / "src" / "mypkg" / "runner.py"
+        test_file = tmp_path / "tests" / "test_runner.py"
+        runner.parent.mkdir(parents=True)
+        test_file.parent.mkdir()
+        (runner.parent / "__init__.py").write_text("")
+        runner.write_text(
+            "def render_thing(code: str) -> str:\n"
+            "    return code.upper()\n"
+        )
+        test_file.write_text(
+            "from mypkg.runner import render_thing\n\n"
+            "def test_render_thing_basic():\n"
+            "    assert render_thing('a') == 'A'\n\n"
+            "def test_pipeline_uses_uppercase():\n"
+            "    assert render_thing('bc') == 'BC'\n"
+        )
+        (tmp_path / ".git").mkdir()
+        graph_dir = tmp_path / ".code-review-graph"
+        graph_dir.mkdir()
+
+        store = GraphStore(graph_dir / "graph.db")
+        try:
+            tracked = [
+                "src/mypkg/__init__.py",
+                "src/mypkg/runner.py",
+                "tests/test_runner.py",
+            ]
+            with patch(
+                "code_review_graph.incremental.get_all_tracked_files",
+                return_value=tracked,
+            ):
+                full_build(tmp_path, store)
+            run_post_processing(store)
+
+            production = f"{runner}::render_thing"
+            tests = store.get_transitive_tests(production, max_depth=0)
+            assert {test["name"] for test in tests} == {
+                "test_render_thing_basic",
+                "test_pipeline_uses_uppercase",
+            }
+            assert {
+                row["target_qualified"]
+                for row in store._conn.execute(
+                    "SELECT target_qualified FROM edges "
+                    "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                    (str(test_file),),
+                ).fetchall()
+            } == {str(runner)}
+
+            duplicate = tmp_path / "packages" / "other" / "src" / "mypkg" / "runner.py"
+            duplicate.parent.mkdir(parents=True)
+            duplicate.write_text(runner.read_text())
+            incremental_update(
+                tmp_path,
+                store,
+                changed_files=["packages/other/src/mypkg/runner.py"],
+            )
+            run_post_processing(store)
+
+            assert store.get_transitive_tests(production, max_depth=0) == []
+            imported = store._conn.execute(
+                "SELECT target_qualified, extra FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                (str(test_file),),
+            ).fetchone()
+            assert imported["target_qualified"] == "mypkg.runner"
+            assert '"import_resolution": "ambiguous"' in imported["extra"]
         finally:
             store.close()
 

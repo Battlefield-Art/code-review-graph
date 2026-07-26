@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolved repository-local Python imports by unique module suffix after indexing,
+  so `src/` layouts produce canonical `CALLS` and `TESTED_BY` edges while
+  duplicate package candidates remain explicitly unresolved (#720).
+
 ## [2.3.7] - 2026-07-18
 
 **Maintainer-reconciliation release.** This release packages the verified work
