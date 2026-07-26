@@ -389,9 +389,9 @@ def query_graph(
                         seen_sources.add(e.source_qualified)
                         caller = store.get_node(e.source_qualified)
                         if caller:
-                            result = node_to_dict(caller)
-                            result["target_resolution"] = "unresolved"
-                            add_result(result, e)
+                            caller_result = node_to_dict(caller)
+                            caller_result["target_resolution"] = "unresolved"
+                            add_result(caller_result, e)
 
         elif pattern == "callees_of":
             seen_targets: set[str] = set()
