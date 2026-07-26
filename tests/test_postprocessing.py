@@ -324,15 +324,8 @@ class TestToolBuildUsesSharedPipeline:
                 "code_review_graph.incremental.get_all_tracked_files",
                 return_value=tracked,
             ):
-                full_build(tmp_path, store)
-            run_post_processing(store)
-
-            production = f"{runner}::render_thing"
-            tests = store.get_transitive_tests(production, max_depth=0)
-            assert {test["name"] for test in tests} == {
-                "test_render_thing_basic",
-                "test_pipeline_uses_uppercase",
-            }
+                result = full_build(tmp_path, store)
+            assert result["python_resolution"]["imports_resolved"] == 1
             assert {
                 row["target_qualified"]
                 for row in store._conn.execute(
@@ -342,17 +335,23 @@ class TestToolBuildUsesSharedPipeline:
                 ).fetchall()
             } == {str(runner)}
 
+            run_post_processing(store)
+            production = f"{runner}::render_thing"
+            tests = store.get_transitive_tests(production, max_depth=0)
+            assert {test["name"] for test in tests} == {
+                "test_render_thing_basic",
+                "test_pipeline_uses_uppercase",
+            }
+
             duplicate = tmp_path / "packages" / "other" / "src" / "mypkg" / "runner.py"
             duplicate.parent.mkdir(parents=True)
             duplicate.write_text(runner.read_text())
-            incremental_update(
+            update = incremental_update(
                 tmp_path,
                 store,
                 changed_files=["packages/other/src/mypkg/runner.py"],
             )
-            run_post_processing(store)
-
-            assert store.get_transitive_tests(production, max_depth=0) == []
+            assert update["python_resolution"]["imports_ambiguous"] == 1
             imported = store._conn.execute(
                 "SELECT target_qualified, extra FROM edges "
                 "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
@@ -360,6 +359,30 @@ class TestToolBuildUsesSharedPipeline:
             ).fetchone()
             assert imported["target_qualified"] == "mypkg.runner"
             assert '"import_resolution": "ambiguous"' in imported["extra"]
+
+            run_post_processing(store)
+            assert store.get_transitive_tests(production, max_depth=0) == []
+
+            duplicate.unlink()
+            update = incremental_update(
+                tmp_path,
+                store,
+                changed_files=["packages/other/src/mypkg/runner.py"],
+            )
+            assert update["python_resolution"]["imports_resolved"] == 1
+            imported = store._conn.execute(
+                "SELECT target_qualified FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                (str(test_file),),
+            ).fetchone()
+            assert imported["target_qualified"] == str(runner)
+
+            run_post_processing(store)
+            tests = store.get_transitive_tests(production, max_depth=0)
+            assert {test["name"] for test in tests} == {
+                "test_render_thing_basic",
+                "test_pipeline_uses_uppercase",
+            }
         finally:
             store.close()
 
