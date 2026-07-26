@@ -34,6 +34,21 @@ from .parser import EdgeInfo, NodeInfo
 
 logger = logging.getLogger(__name__)
 
+# These are the canonical language values stored for the JavaScript ecosystem.
+# JSX files are stored as ``javascript`` and Astro files as ``typescript`` by
+# ``EXTENSION_TO_LANGUAGE``; TSX keeps its own grammar name.
+_JAVASCRIPT_LANGUAGE_FAMILY = ("javascript", "typescript", "tsx")
+_JAVASCRIPT_LANGUAGE_FAMILY_SET = frozenset(_JAVASCRIPT_LANGUAGE_FAMILY)
+
+
+def _compatible_edge_languages(language: str) -> tuple[str, ...]:
+    """Return languages that can safely share unresolved bare edge targets."""
+    normalized = language.casefold()
+    if normalized in _JAVASCRIPT_LANGUAGE_FAMILY_SET:
+        return _JAVASCRIPT_LANGUAGE_FAMILY
+    return (language,)
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -416,10 +431,13 @@ class GraphStore:
         reverse call tracing (callers_of) works even when qualified-name lookup
         returns nothing.
 
-        When ``language`` is given, only edges whose source node was parsed from
-        that language are returned. Bare (unqualified) names are ambiguous across
-        the whole graph, so without this filter a common method name like
-        ``clone`` can match a same-named method in an unrelated language (#708).
+        When ``language`` is given, only edges whose source node has a compatible
+        language are returned. JavaScript, TypeScript, and TSX form one family
+        because calls and inheritance routinely cross those source types (JSX is
+        stored as JavaScript; Astro as TypeScript). Other languages require an
+        exact match. Bare names are ambiguous across the whole graph, so without
+        this filter a common method name like ``clone`` can match a same-named
+        method in an unrelated language (#708).
         """
         return list(self.iter_edges_by_target_name(name, kind=kind, language=language))
 
@@ -428,12 +446,14 @@ class GraphStore:
     ) -> Iterator[GraphEdge]:
         """Yield exact bare-target edges without materializing all matches."""
         if language:
+            languages = _compatible_edge_languages(language)
+            placeholders = ", ".join("?" for _ in languages)
             rows = self._conn.execute(
                 "SELECT edges.* FROM edges "
                 "JOIN nodes ON nodes.qualified_name = edges.source_qualified "
                 "WHERE edges.target_qualified = ? AND edges.kind = ? "
-                "AND nodes.language = ?",
-                (name, kind, language),
+                f"AND nodes.language IN ({placeholders})",
+                (name, kind, *languages),
             )
         else:
             rows = self._conn.execute(
