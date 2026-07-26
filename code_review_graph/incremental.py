@@ -1255,7 +1255,10 @@ def incremental_update(
         store.commit()
 
     # Only re-run language-specific resolvers when the relevant files changed.
-    python_changed = any(rp.endswith(".py") for rp in all_files)
+    python_changed = any(
+        path.endswith(".py")
+        for path in set(all_files) | set(stale_files) | missing_paths
+    )
     python_stats = _run_python_resolver(store) if python_changed else None
 
     rescript_changed = any(

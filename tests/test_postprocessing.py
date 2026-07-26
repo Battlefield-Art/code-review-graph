@@ -418,6 +418,62 @@ class TestWatchCallbackIntegration:
         finally:
             store.close()
 
+    def test_watch_deletion_reresolves_python_imports(self, tmp_path):
+        from code_review_graph.incremental import full_build, watch
+
+        runner = tmp_path / "src" / "mypkg" / "runner.py"
+        duplicate = tmp_path / "packages" / "other" / "src" / "mypkg" / "runner.py"
+        test_file = tmp_path / "tests" / "test_runner.py"
+        runner.parent.mkdir(parents=True)
+        duplicate.parent.mkdir(parents=True)
+        test_file.parent.mkdir()
+        (runner.parent / "__init__.py").write_text("")
+        runner.write_text("def render_thing(code: str) -> str:\n    return code.upper()\n")
+        duplicate.write_text(runner.read_text())
+        test_file.write_text(
+            "from mypkg.runner import render_thing\n\n"
+            "def test_render_thing():\n"
+            "    assert render_thing('a') == 'A'\n"
+        )
+        (tmp_path / ".git").mkdir()
+        store = GraphStore(tmp_path / "graph.db")
+        observer = MagicMock()
+
+        try:
+            tracked = [
+                "src/mypkg/__init__.py",
+                "src/mypkg/runner.py",
+                "packages/other/src/mypkg/runner.py",
+                "tests/test_runner.py",
+            ]
+            with patch(
+                "code_review_graph.incremental.get_all_tracked_files",
+                return_value=tracked,
+            ):
+                full_build(tmp_path, store)
+            run_post_processing(store)
+            duplicate.unlink()
+
+            with (
+                patch("watchdog.observers.Observer", return_value=observer),
+                patch("time.sleep", side_effect=KeyboardInterrupt),
+            ):
+                watch(tmp_path, store, on_files_updated=run_post_processing)
+
+            imported = store._conn.execute(
+                "SELECT target_qualified FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                (str(test_file),),
+            ).fetchone()
+            assert imported["target_qualified"] == str(runner)
+            tests = store.get_transitive_tests(
+                f"{runner}::render_thing",
+                max_depth=0,
+            )
+            assert {test["name"] for test in tests} == {"test_render_thing"}
+        finally:
+            store.close()
+
 
 class TestResolveBareEndpointsStep:
     """The shared/watch pipeline resolves evidence-backed bare endpoints."""
