@@ -2361,24 +2361,24 @@ def test_impact_radius_tool_exposes_best_first_scores(monkeypatch, tmp_path):
     """The public tool adds scores without changing the stored node schema."""
     store = GraphStore(tmp_path / "impact.db")
     seed = "/seed.py::seed"
-    called = "/called.py::called"
-    imported = "/imported.py::imported"
+    caller = "/caller.py::caller"
+    importer = "/importer.py::importer"
     for name, path in (
         ("seed", "/seed.py"),
-        ("called", "/called.py"),
-        ("imported", "/imported.py"),
+        ("caller", "/caller.py"),
+        ("importer", "/importer.py"),
     ):
         store.upsert_node(NodeInfo(
             kind="Function", name=name, file_path=path,
             line_start=1, line_end=3, language="python",
         ))
     store.upsert_edge(EdgeInfo(
-        kind="CALLS", source=seed, target=called,
-        file_path="/seed.py", line=1,
+        kind="CALLS", source=caller, target=seed,
+        file_path="/caller.py", line=1,
     ))
     store.upsert_edge(EdgeInfo(
-        kind="IMPORTS_FROM", source=seed, target=imported,
-        file_path="/seed.py", line=2,
+        kind="IMPORTS_FROM", source=importer, target=seed,
+        file_path="/importer.py", line=2,
     ))
     store.commit()
 
@@ -2396,7 +2396,7 @@ def test_impact_radius_tool_exposes_best_first_scores(monkeypatch, tmp_path):
     )
 
     assert [node["name"] for node in result["impacted_nodes"]] == [
-        "called", "imported",
+        "caller", "importer",
     ]
     scores = [node["impact_score"] for node in result["impacted_nodes"]]
     assert scores == sorted(scores, reverse=True)
