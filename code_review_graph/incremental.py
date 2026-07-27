@@ -846,6 +846,40 @@ def collect_all_files(
     return files
 
 
+def _reconcile_stale_files(
+    repo_root: Path,
+    store: GraphStore,
+    current_files: list[str] | None = None,
+) -> list[str]:
+    """Remove graph files absent from the current parseable repository inventory."""
+    stored_files = set(store.get_all_files())
+    current_paths: set[str]
+    if current_files is not None:
+        current_paths = {str(repo_root / file_path) for file_path in current_files}
+    else:
+        ignore_patterns = _load_ignore_patterns(repo_root)
+        parser = CodeParser(repo_root)
+        current_paths = set()
+        for stored_file in stored_files:
+            path = Path(stored_file)
+            try:
+                relative = str(path.relative_to(repo_root))
+            except ValueError:
+                continue
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and not _should_ignore(relative, ignore_patterns)
+                and parser.detect_language(path) is not None
+                and not _is_binary(path)
+            ):
+                current_paths.add(stored_file)
+    stale_files = sorted(stored_files - current_paths)
+    if stale_files:
+        store.remove_files_permanently(stale_files)
+    return stale_files
+
+
 _MAX_DEPENDENT_HOPS = int(os.environ.get("CRG_DEPENDENT_HOPS", "2"))
 _MAX_DEPENDENT_FILES = 500
 
@@ -970,17 +1004,7 @@ def full_build(
     """
     parser = CodeParser(repo_root)
     files = collect_all_files(repo_root, recurse_submodules)
-
-    # Purge stale data from files no longer on disk
-    existing_files = set(store.get_all_files())
-    current_abs = {str(repo_root / f) for f in files}
-    stale_files = existing_files - current_abs
-    for stale in stale_files:
-        store.remove_file_data(stale)
-    # Ensure deletions are persisted before store_file_nodes_edges()
-    # starts its own explicit transaction via BEGIN IMMEDIATE.
-    if stale_files:
-        store.commit()
+    stale_files = _reconcile_stale_files(repo_root, store, files)
 
     total_nodes = 0
     total_edges = 0
@@ -1058,6 +1082,7 @@ def full_build(
 
     return {
         "files_parsed": len(files),
+        "stale_files_removed": len(stale_files),
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "errors": errors,
@@ -1075,6 +1100,7 @@ def incremental_update(
     store: GraphStore,
     base: str = "HEAD~1",
     changed_files: list[str] | None = None,
+    reconcile_stale: bool = True,
 ) -> dict:
     """Incremental update: re-parse changed + dependent files only."""
     parser = CodeParser(repo_root)
@@ -1106,14 +1132,17 @@ def incremental_update(
     # Determine changed files
     if changed_files is None:
         changed_files = get_changed_files(repo_root, base)
+    stale_files = _reconcile_stale_files(repo_root, store) if reconcile_stale else []
 
-    if not changed_files:
+    if not changed_files and not stale_files:
         return {
             "files_updated": 0,
             "total_nodes": 0,
             "total_edges": 0,
             "changed_files": [],
             "dependent_files": [],
+            "stale_files_removed": 0,
+            "errors": [],
         }
 
     # Find dependent files (files that import from changed files)
@@ -1134,17 +1163,17 @@ def incremental_update(
     total_nodes = 0
     total_edges = 0
     errors = []
+    missing_paths: set[str] = set()
 
     # Separate deleted/unparseable files from files that need re-parsing
     to_parse: list[str] = []
-    removed_any = False
     for rel_path in all_files:
         if _should_ignore(rel_path, ignore_patterns):
             continue
         abs_path = repo_root / rel_path
         if not abs_path.is_file():
-            store.remove_file_data(str(abs_path))
-            removed_any = True
+            if str(abs_path) not in stale_files:
+                missing_paths.add(str(abs_path))
             continue
         if parser.detect_language(abs_path) is None:
             continue
@@ -1161,10 +1190,8 @@ def incremental_update(
 
     # Persist deletions before store_file_nodes_edges() opens its own
     # explicit transaction — avoids nested transaction errors.
-    if removed_any:
-        store.commit()
-
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
+    parsed_files = 0
 
     if use_serial or len(to_parse) < 8:
         for rel_path in to_parse:
@@ -1174,6 +1201,7 @@ def incremental_update(
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(abs_path, source)
                 store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
+                parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
             except (OSError, PermissionError) as e:
@@ -1200,14 +1228,18 @@ def incremental_update(
                     edges,
                     fhash,
                 )
+                parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
 
-    store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
-    store.set_metadata("last_build_type", "incremental")
-    store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
-    _store_vcs_metadata(repo_root, store)
-    store.commit()
+    removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
+    files_updated = parsed_files + len(stale_files) + removed_files
+    if files_updated:
+        store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
+        store.set_metadata("last_build_type", "incremental")
+        store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
+        _store_vcs_metadata(repo_root, store)
+        store.commit()
 
     # Only re-run language-specific resolvers when the relevant files changed.
     rescript_changed = any(
@@ -1229,11 +1261,12 @@ def incremental_update(
     scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
 
     return {
-        "files_updated": len(all_files),
+        "files_updated": files_updated,
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "changed_files": list(changed_files),
         "dependent_files": list(dependent_files),
+        "stale_files_removed": len(stale_files),
         "errors": errors,
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
@@ -1249,7 +1282,181 @@ def incremental_update(
 # ---------------------------------------------------------------------------
 
 
-_DEBOUNCE_SECONDS = 0.3
+_DEBOUNCE_SECONDS = 1
+
+
+def _raise_watch_update_errors(result: dict, context: str) -> None:
+    """Fail the watch boundary when an incremental update reports errors."""
+    errors = result.get("errors") or []
+    if not errors:
+        return
+    details = "; ".join(
+        f"{error.get('file', 'unknown')}: {error.get('error', 'unknown error')}"
+        for error in errors
+    )
+    raise RuntimeError(f"{context} reported errors: {details}")
+
+
+def _raise_watch_postprocess_warnings(result: object) -> None:
+    """Treat structured post-processing warnings as a failed watch update."""
+    if not isinstance(result, dict):
+        return
+    warnings = result.get("warnings") or []
+    if warnings:
+        details = "; ".join(str(warning) for warning in warnings)
+        raise RuntimeError(f"post-processing reported warnings: {details}")
+
+
+def _create_watch_handler(
+    repo_root: Path,
+    store: GraphStore,
+    on_files_updated: Optional[Callable],
+):
+    """Create the debounced watchdog handler for one repository."""
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.utils.event_debouncer import EventDebouncer
+
+    ignore_patterns = _load_ignore_patterns(repo_root)
+    parser = CodeParser(repo_root)
+    lexical_root = Path(os.path.abspath(repo_root))
+    resolved_root = lexical_root.resolve()
+
+    class WatchBatchProcessor:
+        def __init__(self) -> None:
+            self.failure: BaseException | None = None
+
+        def _relative_path(self, path: str) -> str | None:
+            candidate = Path(os.path.abspath(path))
+            try:
+                relative = candidate.relative_to(lexical_root)
+            except ValueError:
+                return None
+            existing = candidate
+            while not existing.exists() and existing != lexical_root:
+                existing = existing.parent
+            try:
+                existing.resolve().relative_to(resolved_root)
+            except ValueError:
+                return None
+            if any(
+                component.is_symlink()
+                for component in [
+                    lexical_root / Path(*relative.parts[:index])
+                    for index in range(1, len(relative.parts) + 1)
+                ]
+            ):
+                return None
+            if _should_ignore(str(relative), ignore_patterns):
+                return None
+            return str(relative)
+
+        def _stored_descendants(self, relative_directory: str) -> set[str]:
+            directory = str(repo_root / relative_directory) + os.sep
+            return {
+                str(Path(file_path).relative_to(repo_root))
+                for file_path in store.get_all_files()
+                if file_path.startswith(directory)
+            }
+
+        def _parseable_file(self, relative_path: str) -> bool:
+            absolute_path = repo_root / relative_path
+            resolved_path = absolute_path.resolve()
+            try:
+                resolved_path.relative_to(resolved_root)
+            except ValueError:
+                return False
+            return (
+                absolute_path.is_file()
+                and not absolute_path.is_symlink()
+                and parser.detect_language(absolute_path) is not None
+                and not _is_binary(absolute_path)
+            )
+
+        def _parseable_descendants(self, relative_directory: str) -> set[str]:
+            directory = repo_root / relative_directory
+            if not directory.is_dir() or directory.is_symlink():
+                return set()
+            return {
+                str(path.relative_to(repo_root))
+                for path in directory.rglob("*")
+                if self._parseable_file(str(path.relative_to(repo_root)))
+                and not _should_ignore(str(path.relative_to(repo_root)), ignore_patterns)
+            }
+
+        def _event_paths(self, event: FileSystemEvent) -> set[str]:
+            paths: set[str] = set()
+            source = self._relative_path(os.fsdecode(event.src_path))
+            destination_path = getattr(event, "dest_path", "")
+            destination = (
+                self._relative_path(os.fsdecode(destination_path))
+                if destination_path
+                else None
+            )
+            if event.is_directory:
+                if source is not None and event.event_type in {"deleted", "moved"}:
+                    paths.update(self._stored_descendants(source))
+                if destination is not None:
+                    paths.update(self._parseable_descendants(destination))
+                elif source is not None and event.event_type == "created":
+                    paths.update(self._parseable_descendants(source))
+            else:
+                if source is not None and event.event_type in {"deleted", "moved"}:
+                    paths.add(source)
+                elif source is not None and self._parseable_file(source):
+                    paths.add(source)
+                if destination is not None and self._parseable_file(destination):
+                    paths.add(destination)
+            return paths
+
+        def process(self, events: list[FileSystemEvent]) -> None:
+            try:
+                changed_files = sorted(
+                    {path for event in events for path in self._event_paths(event)}
+                )
+                if not changed_files:
+                    return
+                result = incremental_update(
+                    repo_root,
+                    store,
+                    changed_files=changed_files,
+                    reconcile_stale=False,
+                )
+                _raise_watch_update_errors(result, "incremental update")
+                if result["files_updated"] > 0 and on_files_updated is not None:
+                    postprocess_result = on_files_updated(store)
+                    _raise_watch_postprocess_warnings(postprocess_result)
+            except BaseException as exc:
+                self.failure = exc
+
+        def raise_if_failed(self) -> None:
+            if self.failure is not None:
+                raise RuntimeError("watch update failed") from self.failure
+
+    processor = WatchBatchProcessor()
+    debouncer = EventDebouncer(_DEBOUNCE_SECONDS, processor.process)
+
+    class GraphUpdateHandler(FileSystemEventHandler):
+        def dispatch(self, event: FileSystemEvent) -> None:
+            if event.event_type not in {"created", "modified", "deleted", "moved"}:
+                return
+            if event.is_directory and event.event_type == "modified":
+                return
+            debouncer.handle_event(event)
+
+        def start(self) -> None:
+            debouncer.start()
+
+        def stop(self) -> None:
+            debouncer.stop()
+            debouncer.join()
+
+        def process(self, events: list[FileSystemEvent]) -> None:
+            processor.process(events)
+
+        def raise_if_failed(self) -> None:
+            processor.raise_if_failed()
+
+    return GraphUpdateHandler()
 
 
 def watch(
@@ -1259,7 +1466,7 @@ def watch(
 ) -> None:
     """Watch for file changes and auto-update the graph.
 
-    Uses a 300ms debounce to batch rapid-fire saves into a single update.
+    Uses a one-second debounce to batch rapid-fire saves into a single update.
 
     Args:
         repo_root: Repository root to watch.
@@ -1269,119 +1476,17 @@ def watch(
             only argument.  Used by the CLI to run post-processing
             (FTS, flows, communities) after watch updates.
     """
-    import threading
-
-    from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
 
-    parser = CodeParser(repo_root)
-    ignore_patterns = _load_ignore_patterns(repo_root)
-
-    class GraphUpdateHandler(FileSystemEventHandler):
-        def __init__(self):
-            self._pending: set[str] = set()
-            self._lock = threading.Lock()
-            self._timer: threading.Timer | None = None
-
-        def _should_handle(self, path: str) -> bool:
-            if Path(path).is_symlink():
-                return False
-            try:
-                rel = str(Path(path).relative_to(repo_root))
-            except ValueError:
-                return False
-            if _should_ignore(rel, ignore_patterns):
-                return False
-            if parser.detect_language(Path(path)) is None:
-                return False
-            return True
-
-        def on_modified(self, event):
-            if event.is_directory:
-                return
-            if self._should_handle(event.src_path):
-                self._schedule(event.src_path)
-
-        def on_created(self, event):
-            if event.is_directory:
-                return
-            if self._should_handle(event.src_path):
-                self._schedule(event.src_path)
-
-        def on_deleted(self, event):
-            if event.is_directory:
-                return
-            # Only handle files we would normally track
-            try:
-                rel = str(Path(event.src_path).relative_to(repo_root))
-            except ValueError:
-                return
-            if _should_ignore(rel, ignore_patterns):
-                return
-            try:
-                store.remove_file_data(event.src_path)
-                store.commit()
-                logger.info("Removed: %s", rel)
-            except Exception as e:
-                logger.error("Error removing %s: %s", rel, e)
-
-        def _schedule(self, abs_path: str):
-            """Add file to pending set and reset the debounce timer."""
-            with self._lock:
-                self._pending.add(abs_path)
-                if self._timer is not None:
-                    self._timer.cancel()
-                self._timer = threading.Timer(_DEBOUNCE_SECONDS, self._flush)
-                self._timer.start()
-
-        def _flush(self):
-            """Process all pending files after the debounce window."""
-            with self._lock:
-                paths = list(self._pending)
-                self._pending.clear()
-                self._timer = None
-
-            updated = 0
-            for abs_path in paths:
-                if self._update_file(abs_path):
-                    updated += 1
-
-            if updated > 0 and on_files_updated is not None:
-                try:
-                    on_files_updated(store)
-                except Exception as e:
-                    logger.error("Post-update callback failed: %s", e)
-
-        def _update_file(self, abs_path: str) -> bool:
-            path = Path(abs_path)
-            if not path.is_file():
-                return False
-            if path.is_symlink():
-                return False
-            if _is_binary(path):
-                return False
-            try:
-                source = path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
-                nodes, edges = parser.parse_bytes(path, source)
-                store.store_file_nodes_edges(abs_path, nodes, edges, fhash)
-                store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
-                store.commit()
-                rel = str(path.relative_to(repo_root))
-                logger.info(
-                    "Updated: %s (%d nodes, %d edges)",
-                    rel,
-                    len(nodes),
-                    len(edges),
-                )
-                return True
-            except Exception as e:
-                logger.error("Error updating %s: %s", abs_path, e)
-                return False
-
-    handler = GraphUpdateHandler()
+    initial = incremental_update(repo_root, store, changed_files=[])
+    _raise_watch_update_errors(initial, "initial watch reconciliation")
+    if initial["files_updated"] > 0 and on_files_updated is not None:
+        postprocess_result = on_files_updated(store)
+        _raise_watch_postprocess_warnings(postprocess_result)
+    handler = _create_watch_handler(repo_root, store, on_files_updated)
     observer = Observer()
     observer.schedule(handler, str(repo_root), recursive=True)
+    handler.start()
     observer.start()
 
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
@@ -1390,9 +1495,13 @@ def watch(
 
         while True:
             _time.sleep(1)
+            handler.raise_if_failed()
     except KeyboardInterrupt:
         observer.stop()
-    observer.join()
+    finally:
+        observer.stop()
+        observer.join()
+        handler.stop()
     logger.info("Watch stopped.")
 
 
