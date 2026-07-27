@@ -1284,6 +1284,28 @@ def incremental_update(
 _DEBOUNCE_SECONDS = 1
 
 
+def _raise_watch_update_errors(result: dict, context: str) -> None:
+    """Fail the watch boundary when an incremental update reports errors."""
+    errors = result.get("errors") or []
+    if not errors:
+        return
+    details = "; ".join(
+        f"{error.get('file', 'unknown')}: {error.get('error', 'unknown error')}"
+        for error in errors
+    )
+    raise RuntimeError(f"{context} reported errors: {details}")
+
+
+def _raise_watch_postprocess_warnings(result: object) -> None:
+    """Treat structured post-processing warnings as a failed watch update."""
+    if not isinstance(result, dict):
+        return
+    warnings = result.get("warnings") or []
+    if warnings:
+        details = "; ".join(str(warning) for warning in warnings)
+        raise RuntimeError(f"post-processing reported warnings: {details}")
+
+
 def _create_watch_handler(
     repo_root: Path,
     store: GraphStore,
@@ -1398,23 +1420,10 @@ def _create_watch_handler(
                     changed_files=changed_files,
                     reconcile_stale=False,
                 )
-                errors = result.get("errors") or []
-                if errors:
-                    details = "; ".join(
-                        f"{error.get('file', 'unknown')}: "
-                        f"{error.get('error', 'unknown error')}"
-                        for error in errors
-                    )
-                    raise RuntimeError(f"incremental update reported errors: {details}")
+                _raise_watch_update_errors(result, "incremental update")
                 if result["files_updated"] > 0 and on_files_updated is not None:
                     postprocess_result = on_files_updated(store)
-                    if isinstance(postprocess_result, dict):
-                        warnings = postprocess_result.get("warnings") or []
-                        if warnings:
-                            details = "; ".join(str(warning) for warning in warnings)
-                            raise RuntimeError(
-                                f"post-processing reported warnings: {details}"
-                            )
+                    _raise_watch_postprocess_warnings(postprocess_result)
             except BaseException as exc:
                 self.failure = exc
 
@@ -1469,10 +1478,10 @@ def watch(
     from watchdog.observers import Observer
 
     initial = incremental_update(repo_root, store, changed_files=[])
-    if initial["errors"]:
-        raise RuntimeError("initial watch reconciliation reported parse errors")
+    _raise_watch_update_errors(initial, "initial watch reconciliation")
     if initial["files_updated"] > 0 and on_files_updated is not None:
-        on_files_updated(store)
+        postprocess_result = on_files_updated(store)
+        _raise_watch_postprocess_warnings(postprocess_result)
     handler = _create_watch_handler(repo_root, store, on_files_updated)
     observer = Observer()
     observer.schedule(handler, str(repo_root), recursive=True)

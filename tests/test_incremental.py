@@ -8,8 +8,8 @@ import pytest
 import code_review_graph.incremental as incremental_module
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
-    _decode_name_status_paths,
     _create_watch_handler,
+    _decode_name_status_paths,
     _is_binary,
     _load_ignore_patterns,
     _parse_single_file,
@@ -1212,6 +1212,35 @@ class TestWatchReconciliation:
             assert callback_count == 1
             assert store.get_all_files() == []
             observer.return_value.start.assert_called_once()
+        finally:
+            store.close()
+
+    def test_watch_startup_postprocess_warning_prevents_observer_start(self, tmp_path):
+        import sqlite3
+
+        from code_review_graph.postprocessing import run_post_processing
+
+        deleted = tmp_path / "offline.py"
+        deleted.write_text("def offline():\n    pass\n")
+        store = GraphStore(tmp_path / "graph.db")
+        incremental_update(tmp_path, store, changed_files=["offline.py"])
+        deleted.unlink()
+        try:
+            with (
+                patch("watchdog.observers.Observer") as observer,
+                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.search.rebuild_fts_index",
+                    side_effect=sqlite3.OperationalError("forced FTS failure"),
+                ),
+                pytest.raises(
+                    RuntimeError,
+                    match="post-processing reported warnings",
+                ),
+            ):
+                watch(tmp_path, store, on_files_updated=run_post_processing)
+
+            observer.assert_not_called()
         finally:
             store.close()
 
