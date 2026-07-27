@@ -11,6 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import inspect
+import json
 import subprocess
 import sys
 import tempfile
@@ -611,3 +612,161 @@ def test_cli_update_brief_default_base_does_not_crash(
     # It ran the incremental update and the brief impact summary without error.
     assert "Incremental:" in out
     assert "changed file" in out
+
+
+def test_update_auto_base_multi_commit_rename_matches_full_rebuild(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Three commits after the stored SHA converge exactly to a fresh graph.
+
+    The commits deliberately split a module rename, its importer update, and a
+    new importing file. A HEAD~1 update sees only the new file; the automatic
+    stored-SHA base must reconcile all three commits and purge the old path.
+    """
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo = tmp_path / "multi-commit-repo"
+    repo.mkdir()
+    _git_ok(repo, "init", "-b", "main")
+    _git_ok(repo, "config", "user.email", "test@test.com")
+    _git_ok(repo, "config", "user.name", "Test")
+
+    package = repo / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    old_module = package / "service.py"
+    old_module.write_text(
+        "def provide():\n"
+        "    return 'value'\n",
+        encoding="utf-8",
+    )
+    importer = repo / "app.py"
+    importer.write_text(
+        "from pkg.service import provide\n\n"
+        "def run():\n"
+        "    return provide()\n",
+        encoding="utf-8",
+    )
+    _git_ok(repo, "add", ".")
+    _git_ok(repo, "commit", "-m", "initial graph state")
+    stored_sha = _git_ok(repo, "rev-parse", "HEAD").stdout.strip()
+
+    incremental_data = tmp_path / "incremental-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(incremental_data))
+    initial = build_or_update_graph(
+        full_rebuild=True,
+        repo_root=str(repo),
+        postprocess="none",
+    )
+    assert initial["errors"] == []
+    with GraphStore(incremental_data / "graph.db") as stored:
+        assert stored.get_metadata("git_head_sha") == stored_sha
+        assert stored.get_nodes_by_file(str(old_module))
+
+    # Commit 1: rename the provider module.
+    new_module = package / "core.py"
+    _git_ok(repo, "mv", "pkg/service.py", "pkg/core.py")
+    _git_ok(repo, "commit", "-m", "rename provider module")
+
+    # Commit 2: update the existing importer.
+    importer.write_text(
+        "from pkg.core import provide\n\n"
+        "def run():\n"
+        "    return provide()\n",
+        encoding="utf-8",
+    )
+    _git_ok(repo, "add", "app.py")
+    _git_ok(repo, "commit", "-m", "update provider importer")
+
+    # Commit 3: add another importing file.
+    new_consumer = repo / "worker.py"
+    new_consumer.write_text(
+        "from pkg.core import provide\n\n"
+        "def work():\n"
+        "    return provide()\n",
+        encoding="utf-8",
+    )
+    _git_ok(repo, "add", "worker.py")
+    _git_ok(repo, "commit", "-m", "add provider worker")
+
+    commits_since_graph = _git_ok(
+        repo,
+        "rev-list",
+        "--count",
+        f"{stored_sha}..HEAD",
+    ).stdout.strip()
+    assert commits_since_graph == "3"
+    assert get_changed_files(repo, "HEAD~1") == ["worker.py"]
+
+    updated = build_or_update_graph(
+        full_rebuild=False,
+        repo_root=str(repo),
+        postprocess="none",
+    )
+    assert updated["build_type"] == "incremental"
+    assert updated["base_resolved"] == stored_sha
+    assert set(updated["changed_files"]) == {
+        "app.py",
+        "pkg/service.py",
+        "pkg/core.py",
+        "worker.py",
+    }
+    assert updated["errors"] == []
+
+    def node_snapshot(store: GraphStore) -> set[tuple[object, ...]]:
+        return {
+            (
+                node.kind,
+                node.name,
+                node.qualified_name,
+                node.file_path,
+                node.line_start,
+                node.line_end,
+                node.language,
+                node.parent_name,
+                node.params,
+                node.return_type,
+                node.is_test,
+                node.file_hash,
+                json.dumps(node.extra, sort_keys=True),
+            )
+            for node in store.get_all_nodes(exclude_files=False)
+        }
+
+    def edge_snapshot(store: GraphStore) -> set[tuple[object, ...]]:
+        return {
+            (
+                edge.kind,
+                edge.source_qualified,
+                edge.target_qualified,
+                edge.file_path,
+                edge.line,
+                json.dumps(edge.extra, sort_keys=True),
+                edge.confidence,
+                edge.confidence_tier,
+            )
+            for edge in store.get_all_edges()
+        }
+
+    with GraphStore(incremental_data / "graph.db") as incremental_store:
+        assert incremental_store.get_nodes_by_file(str(old_module)) == []
+        assert incremental_store.get_nodes_by_file(str(new_module))
+        incremental_nodes = node_snapshot(incremental_store)
+        incremental_edges = edge_snapshot(incremental_store)
+        assert all(
+            str(old_module) not in repr(edge)
+            for edge in incremental_edges
+        )
+
+    fresh_data = tmp_path / "fresh-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(fresh_data))
+    fresh = build_or_update_graph(
+        full_rebuild=True,
+        repo_root=str(repo),
+        postprocess="none",
+    )
+    assert fresh["errors"] == []
+
+    with GraphStore(fresh_data / "graph.db") as fresh_store:
+        assert incremental_nodes == node_snapshot(fresh_store)
+        assert incremental_edges == edge_snapshot(fresh_store)
