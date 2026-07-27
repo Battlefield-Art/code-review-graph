@@ -302,7 +302,7 @@ def _write_data_dir_gitignore(data_dir: Path) -> None:
             pass
 
 
-def get_data_dir(repo_root: Path) -> Path:
+def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
     """Return the directory where this project's graph data lives.
 
     Resolution priority:
@@ -315,19 +315,25 @@ def get_data_dir(repo_root: Path) -> Path:
     instead — letting you keep graphs outside the working tree (useful
     for ephemeral workspaces, Docker volumes, or shared caches). See: #155
 
-    The directory is created if it does not already exist; an inner
-    ``.gitignore`` (with ``*``) is written so any accidentally-nested
-    files never get committed. Both are idempotent.
+    By default the directory is created if it does not already exist; an
+    inner ``.gitignore`` (with ``*``) is written so any accidentally-nested
+    files never get committed. Both are idempotent. Pass ``create=False``
+    when resolving the path for a read-only existence check.
     """
     # Check registry first
     try:
-        from .registry import Registry
-        registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
-        if registry_data_dir:
-            data_dir = Path(registry_data_dir).resolve()
-            data_dir.mkdir(parents=True, exist_ok=True)
-            _write_data_dir_gitignore(data_dir)
-            return data_dir
+        from .registry import Registry, default_registry_path
+
+        # Registry construction creates its parent directory. A read-only
+        # lookup must skip it entirely when no registry file exists.
+        if create or default_registry_path().is_file():
+            registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
+            if registry_data_dir:
+                data_dir = Path(registry_data_dir).resolve()
+                if create:
+                    data_dir.mkdir(parents=True, exist_ok=True)
+                    _write_data_dir_gitignore(data_dir)
+                return data_dir
     except Exception as exc:
         # If registry lookup fails, log and fall through to other methods
         logger.debug("Registry lookup failed for %s: %s", repo_root, exc)
@@ -339,21 +345,27 @@ def get_data_dir(repo_root: Path) -> Path:
     else:
         data_dir = repo_root / ".code-review-graph"
 
-    data_dir.mkdir(parents=True, exist_ok=True)
-    _write_data_dir_gitignore(data_dir)
+    if create:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _write_data_dir_gitignore(data_dir)
 
     return data_dir
 
 
-def get_db_path(repo_root: Path) -> Path:
+def get_db_path(repo_root: Path, *, read_only: bool = False) -> Path:
     """Determine the database path for a repository.
 
     Respects ``CRG_DATA_DIR`` (see :func:`get_data_dir`). Migrates a
     legacy top-level ``.code-review-graph.db`` file into the new
-    directory when it exists (WAL/SHM side-files are discarded).
+    directory when it exists (WAL/SHM side-files are discarded). Pass
+    ``read_only=True`` to resolve the current path without creating a data
+    directory, migrating a legacy database, or deleting side-files.
     """
-    crg_dir = get_data_dir(repo_root)
+    crg_dir = get_data_dir(repo_root, create=not read_only)
     new_db = crg_dir / "graph.db"
+
+    if read_only:
+        return new_db
 
     # Migrate legacy database if present (only meaningful when the
     # legacy file sits at the repo root — if CRG_DATA_DIR is set we

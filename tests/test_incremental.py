@@ -176,6 +176,23 @@ class TestGetDbPath:
         for suffix in ("-wal", "-shm", "-journal"):
             assert not (tmp_path / f".code-review-graph.db{suffix}").exists()
 
+    def test_read_only_resolution_does_not_create_migrate_or_clean(self, tmp_path):
+        legacy = tmp_path / ".code-review-graph.db"
+        legacy.write_text("legacy data")
+        side_files = [
+            tmp_path / f".code-review-graph.db{suffix}"
+            for suffix in ("-wal", "-shm", "-journal")
+        ]
+        for side_file in side_files:
+            side_file.write_text("side")
+
+        db_path = get_db_path(tmp_path, read_only=True)
+
+        assert db_path == tmp_path / ".code-review-graph" / "graph.db"
+        assert not db_path.parent.exists()
+        assert legacy.read_text() == "legacy data"
+        assert all(side_file.read_text() == "side" for side_file in side_files)
+
 
 class TestEnsureRepoGitignoreExcludesCrg:
     def test_creates_gitignore_when_missing(self, tmp_path):
