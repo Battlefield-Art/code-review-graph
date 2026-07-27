@@ -10,6 +10,7 @@ import pytest
 
 import code_review_graph.constants as constants_module
 from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import full_build
 from code_review_graph.parser import EdgeInfo, NodeInfo
 
 
@@ -671,6 +672,46 @@ class TestImpactRadiusSql:
         assert result["changed_nodes"] == []
         assert result["impacted_nodes"] == []
         assert result["total_impacted"] == 0
+
+
+def test_impact_radius_real_build_includes_importer_not_imported_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real parsed import graph follows impact toward dependents only."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    dependency = tmp_path / "dependency.py"
+    changed = tmp_path / "changed.py"
+    importer = tmp_path / "importer.py"
+    dependency.write_text("VALUE = 1\n", encoding="utf-8")
+    changed.write_text(
+        "from dependency import VALUE\n\n"
+        "def changed_value():\n"
+        "    return VALUE\n",
+        encoding="utf-8",
+    )
+    importer.write_text(
+        "from changed import changed_value\n\n"
+        "def consume():\n"
+        "    return changed_value()\n",
+        encoding="utf-8",
+    )
+
+    with GraphStore(tmp_path / "graph.db") as store:
+        built = full_build(tmp_path, store)
+        assert built["errors"] == []
+
+        sql = store.get_impact_radius_sql([str(changed)], max_depth=1)
+        networkx = store._get_impact_radius_networkx(
+            [str(changed)],
+            max_depth=1,
+        )
+
+    expected = {str(importer)}
+    assert set(sql["impacted_files"]) == expected
+    assert set(networkx["impacted_files"]) == expected
+    assert str(dependency) not in sql["impacted_files"]
+    assert sql["impact_scores"] == networkx["impact_scores"]
 
 
 @pytest.mark.parametrize(
