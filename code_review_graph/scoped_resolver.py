@@ -1,4 +1,4 @@
-"""Post-build resolver for static/scoped ``Class::method`` calls.
+"""Post-build resolver for PHP/Rust scoped calls and constructed PHP receivers.
 
 Tree-sitter extraction records a scoped/static call such as ``Mailer::send($x)``
 (PHP) or ``Mailer::send(x)`` / ``Self::new()`` (Rust) as a ``CALLS`` edge whose
@@ -7,6 +7,11 @@ neither the canonical node key (``<file>::Class.method``) nor a bare method
 name, so ``callers_of``, ``get_impact_radius`` and ``tests_for`` never see the
 edge and report zero callers for a method that is obviously being called
 (GitHub #567).
+
+PHP instance calls keep their historical bare method target during parsing.
+When a local receiver was directly constructed (``$x = new Type(); $x->run()``),
+the parser stores the class as ``extra.receiver_scope`` and this pass uses that
+evidence to resolve the call without changing parse-only output (GitHub #745).
 
 This module runs after the graph is built and rewrites the resolvable
 ``Class::method`` targets to the canonical qualified name of the defined
@@ -217,7 +222,7 @@ def _scope_and_method(
 
 
 def resolve_scoped_calls(store: GraphStore) -> dict:
-    """Rewrite resolvable ``Class::method`` CALLS targets to node qualified names.
+    """Rewrite evidence-backed scoped CALLS targets to node qualified names.
 
     Safe to call repeatedly — rewritten edges start with a path head (and carry
     ``extra.scoped_resolved``), so they are no longer treated as candidates.
@@ -322,7 +327,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         return None
 
     calls_rows = conn.execute(
-        "SELECT id, source_qualified, target_qualified, extra, file_path "
+        "SELECT id, source_qualified, target_qualified, extra, file_path, line "
         "FROM edges WHERE kind = 'CALLS'"
     ).fetchall()
 
@@ -332,10 +337,26 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         if language is None:
             continue
         target = row["target_qualified"]
-        if not _is_unresolved_scoped_target(target):
+        try:
+            extra = json.loads(row["extra"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            extra = {}
+        if not isinstance(extra, dict):
+            extra = {}
+
+        resolution_target = target
+        receiver_scope = extra.get("receiver_scope")
+        if (
+            language == "php"
+            and "::" not in target
+            and isinstance(receiver_scope, str)
+            and receiver_scope
+        ):
+            resolution_target = f"{receiver_scope}::{target}"
+        elif not _is_unresolved_scoped_target(target):
             continue
 
-        parsed = _scope_and_method(target, language)
+        parsed = _scope_and_method(resolution_target, language)
         if parsed is None:
             continue
         class_name, method, needs_enclosing = parsed
@@ -364,22 +385,37 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
                 continue
             via = "import"
 
-        try:
-            extra = json.loads(row["extra"] or "{}")
-        except (json.JSONDecodeError, TypeError):
-            extra = {}
         extra["scoped_resolved"] = True
         extra["scoped_via"] = via
+        serialized_extra = json.dumps(extra)
 
         conn.execute(
             "UPDATE edges SET target_qualified = ?, extra = ?, "
             "confidence_tier = 'INFERRED' WHERE id = ?",
-            (new_target, json.dumps(extra), row["id"]),
+            (new_target, serialized_extra, row["id"]),
+        )
+        # The parser mirrors calls made by Test nodes as TESTED_BY edges.
+        # Keep that mirror aligned when a scoped target becomes canonical;
+        # otherwise public tests_for still sees the original Class::method
+        # source even though callers_of sees the resolved CALLS target.
+        conn.execute(
+            "UPDATE edges SET source_qualified = ?, extra = ?, "
+            "confidence_tier = 'INFERRED' "
+            "WHERE kind = 'TESTED_BY' AND source_qualified = ? "
+            "AND target_qualified = ? AND file_path = ? AND line = ?",
+            (
+                new_target,
+                serialized_extra,
+                target,
+                row["source_qualified"],
+                row["file_path"],
+                row["line"],
+            ),
         )
         resolved += 1
         logger.debug(
             "Scoped resolver: %s → %s (via %s)",
-            target, new_target, via,
+            resolution_target, new_target, via,
         )
 
     if resolved:

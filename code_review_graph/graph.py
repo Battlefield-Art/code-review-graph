@@ -530,10 +530,13 @@ class GraphStore:
         seen: set[str] = set()
         results: list[dict] = []
 
-        # If the input is a class, expand to its methods first.
+        # If the input is a class or file, expand to the production symbols it
+        # contains first. File targets are accepted by the public query tool,
+        # so tests_for("src/Foo.php") must cover methods nested under classes
+        # as well as top-level functions.
         input_qns = [qualified_name]
         row = conn.execute(
-            "SELECT kind FROM nodes WHERE qualified_name = ?",
+            "SELECT kind, file_path FROM nodes WHERE qualified_name = ?",
             (qualified_name,),
         ).fetchone()
         if row and row["kind"] == "Class":
@@ -543,6 +546,14 @@ class GraphStore:
                 (qualified_name,),
             ).fetchall():
                 input_qns.append(mrow["target_qualified"])
+        elif row and row["kind"] == "File":
+            for symbol in conn.execute(
+                "SELECT qualified_name FROM nodes "
+                "WHERE file_path = ? AND qualified_name != ? "
+                "AND kind IN ('Class', 'Function', 'Method')",
+                (row["file_path"], qualified_name),
+            ).fetchall():
+                input_qns.append(symbol["qualified_name"])
 
         def _node_dict(qn: str, indirect: bool) -> dict | None:
             row = conn.execute(
