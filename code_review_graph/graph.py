@@ -933,19 +933,23 @@ class GraphStore:
     def _resolve_bare_endpoints(self, kind: str, endpoint: str) -> int:
         """Resolve a bare edge endpoint only when one candidate has evidence."""
         if endpoint == "target_qualified":
+            raw_key = "bare_call_target"
+            endpoint_column = "target_qualified"
             select_sql = (
                 "SELECT id, source_qualified, target_qualified, file_path, extra "
                 "FROM edges WHERE kind = ? "
-                "AND target_qualified NOT LIKE '%::%'"
+                "AND (target_qualified NOT LIKE '%::%' "
+                "OR extra LIKE '%\"bare_call_target\"%')"
             )
-            update_sql = "UPDATE edges SET target_qualified = ? WHERE id = ?"
         elif endpoint == "source_qualified":
+            raw_key = "bare_tested_by_source"
+            endpoint_column = "source_qualified"
             select_sql = (
                 "SELECT id, source_qualified, target_qualified, file_path, extra "
                 "FROM edges WHERE kind = ? "
-                "AND source_qualified NOT LIKE '%::%'"
+                "AND (source_qualified NOT LIKE '%::%' "
+                "OR extra LIKE '%\"bare_tested_by_source\"%')"
             )
-            update_sql = "UPDATE edges SET source_qualified = ? WHERE id = ?"
         else:
             raise ValueError(f"Invalid edge endpoint column: {endpoint!r}")
 
@@ -967,46 +971,145 @@ class GraphStore:
 
         # call-site file -> explicitly imported files
         import_targets: dict[str, set[str]] = {}
+        # Python's repository-suffix resolver keeps a raw import when multiple
+        # indexed modules match and records the candidate files in edge metadata.
+        # Carry that evidence into bare CALLS / TESTED_BY endpoints so a graph
+        # first built in the ambiguous state cannot fall back to a name-only
+        # caller match for every candidate.
+        ambiguous_import_targets: dict[str, set[str]] = {}
         for row in conn.execute(
-            "SELECT DISTINCT file_path, target_qualified FROM edges "
+            "SELECT DISTINCT file_path, target_qualified, extra FROM edges "
             "WHERE kind = 'IMPORTS_FROM'"
         ).fetchall():
             target = row["target_qualified"]
             target_file = target.split("::", 1)[0] if "::" in target else target
             import_targets.setdefault(row["file_path"], set()).add(target_file)
+            try:
+                import_extra = json.loads(row["extra"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                import_extra = {}
+            if (
+                isinstance(import_extra, dict)
+                and import_extra.get("import_resolution") == "ambiguous"
+                and isinstance(import_extra.get("import_candidates"), list)
+            ):
+                ambiguous_import_targets.setdefault(
+                    row["file_path"], set(),
+                ).update(
+                    candidate
+                    for candidate in import_extra["import_candidates"]
+                    if isinstance(candidate, str)
+                )
 
         resolved = 0
+        changed = False
         for edge in bare_edges:
             try:
                 edge_extra = json.loads(edge["extra"] or "{}")
             except (TypeError, json.JSONDecodeError):
                 edge_extra = {}
-            if isinstance(edge_extra, dict) and (
+            if not isinstance(edge_extra, dict):
+                edge_extra = {}
+            if raw_key not in edge_extra and (
                 "ambiguous_targets" in edge_extra
                 or "unresolved_targets" in edge_extra
             ):
                 continue
 
-            bare_name = edge[endpoint]
-            candidates = node_lookup.get(bare_name, [])
-            if not candidates:
+            bare_name = edge_extra.get(raw_key, edge[endpoint])
+            if not isinstance(bare_name, str):
                 continue
+            candidates = node_lookup.get(bare_name, [])
 
             context_file = edge["file_path"]
             imported_files = import_targets.get(context_file, set())
-            qualified = self._select_evidence_backed_candidate(
-                candidates,
-                context_file,
-                imported_files,
-            )
-            if qualified is None:
+            supported = [
+                qualified
+                for qualified, candidate_file in candidates
+                if candidate_file == context_file or candidate_file in imported_files
+            ]
+            ambiguous_files = ambiguous_import_targets.get(context_file, set())
+            ambiguity_supported = [
+                qualified
+                for qualified, candidate_file in candidates
+                if candidate_file in ambiguous_files
+            ]
+            managed = raw_key in edge_extra
+            if (
+                len(supported) != 1
+                and not managed
+                and len(supported) < 2
+                and not ambiguity_supported
+            ):
                 continue
+            desired_extra = dict(edge_extra)
+            desired_extra[raw_key] = bare_name
+            if len(supported) == 1:
+                desired_endpoint = supported[0]
+                for key in (
+                    "ambiguous_targets",
+                    "ambiguous_target_count",
+                    "ambiguous_targets_truncated",
+                    "unresolved_targets",
+                    "unresolved_target_count",
+                    "unresolved_targets_truncated",
+                ):
+                    desired_extra.pop(key, None)
+            else:
+                desired_endpoint = bare_name
+                if len(supported) > 1:
+                    resolution = "ambiguous"
+                    resolution_candidates = supported
+                    other = "unresolved"
+                elif ambiguity_supported:
+                    resolution = (
+                        "ambiguous"
+                        if len(ambiguity_supported) > 1
+                        else "unresolved"
+                    )
+                    resolution_candidates = ambiguity_supported
+                    other = (
+                        "unresolved"
+                        if resolution == "ambiguous"
+                        else "ambiguous"
+                    )
+                else:
+                    resolution = "unresolved"
+                    resolution_candidates = [
+                        qualified for qualified, _ in candidates
+                    ]
+                    other = "ambiguous"
+                for key in (
+                    f"{other}_targets",
+                    f"{other}_target_count",
+                    f"{other}_targets_truncated",
+                ):
+                    desired_extra.pop(key, None)
+                desired_extra.update({
+                    f"{resolution}_targets": resolution_candidates[:20],
+                    f"{resolution}_target_count": len(resolution_candidates),
+                    f"{resolution}_targets_truncated": (
+                        len(resolution_candidates) > 20
+                    ),
+                })
 
-            conn.execute(update_sql, (qualified, edge["id"]))
-            resolved += 1
+            serialized_extra = json.dumps(desired_extra, sort_keys=True)
+            if (
+                edge[endpoint] == desired_endpoint
+                and edge_extra == desired_extra
+            ):
+                continue
+            conn.execute(
+                f"UPDATE edges SET {endpoint_column} = ?, extra = ? WHERE id = ?",
+                (desired_endpoint, serialized_extra, edge["id"]),
+            )
+            changed = True
+            if len(supported) == 1 and edge[endpoint] != desired_endpoint:
+                resolved += 1
 
-        if resolved:
+        if changed:
             conn.commit()
+        if resolved:
             endpoint_label = (
                 "sources" if endpoint == "source_qualified" else "targets"
             )

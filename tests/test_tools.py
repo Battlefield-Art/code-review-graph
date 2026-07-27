@@ -319,6 +319,9 @@ class TestQueryGraphCallTargetFallbacks:
         names = {r["name"] for r in result["results"]}
         assert names == {"same_file_caller", "cross_file_caller"}
         assert len(result["results"]) == 2
+        by_name = {r["name"]: r for r in result["results"]}
+        assert "target_resolution" not in by_name["same_file_caller"]
+        assert by_name["cross_file_caller"]["target_resolution"] == "unresolved"
 
         edge_targets = {e["target"] for e in result["edges"]}
         assert edge_targets == {f"{self.target_file}::target_func", "target_func"}
@@ -595,6 +598,11 @@ class TestQueryGraphTestsFor:
             line_start=1, line_end=5, language="python", is_test=True,
         ))
         self.store.upsert_node(NodeInfo(
+            kind="Test", name="test_combine",
+            file_path="/tests/spec.py",
+            line_start=7, line_end=10, language="python", is_test=True,
+        ))
+        self.store.upsert_node(NodeInfo(
             kind="Function", name="shared_name", file_path="/src/first.py",
             line_start=1, line_end=5, language="python",
         ))
@@ -638,6 +646,18 @@ class TestQueryGraphTestsFor:
             "line_start", "line_end", "language", "parent_name", "is_test",
             "indirect",
         }
+
+    def test_query_graph_marks_naming_only_test_as_inferred(self):
+        from code_review_graph.tools import query_graph
+
+        result = query_graph(
+            pattern="tests_for",
+            target="/src/calc.py::combine",
+            repo_root=str(self.repo_root),
+        )
+
+        match = next(r for r in result["results"] if r["name"] == "test_combine")
+        assert match["inferred_by"] == "naming_convention"
 
     def test_query_graph_tests_for_finds_one_hop_indirect_test(self):
         from code_review_graph.tools import query_graph
