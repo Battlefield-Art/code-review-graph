@@ -28,18 +28,41 @@ aside rather than second-guessing that choice.
 
 from __future__ import annotations
 
+import ipaddress
+
 from starlette.middleware import Middleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-#: Host names that mean "this machine" for a loopback-bound server.
+#: Common spellings retained for callers that import this public constant.
+#: Numeric validation itself uses :mod:`ipaddress` so all of 127.0.0.0/8 is
+#: protected, not only 127.0.0.1.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 _ALLOWED_ORIGIN_SCHEMES = frozenset({"http", "https"})
+_FORBIDDEN_AUTHORITY_CHARS = frozenset("/\\?#@")
 
 
 def is_loopback_host(host: str) -> bool:
     """Return ``True`` when ``host`` is a loopback bind address."""
-    return host.strip().lower() in LOOPBACK_HOSTS
+    value = host.strip().lower()
+    if value == "localhost":
+        return True
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _normalize_port(value: str) -> str | None:
+    """Return a canonical valid TCP port, or ``None`` when invalid."""
+    if not value.isdigit():
+        return None
+    port = int(value)
+    if not 0 <= port <= 65535:
+        return None
+    return str(port)
 
 
 def split_host_port(value: str) -> tuple[str, str | None]:
@@ -47,16 +70,59 @@ def split_host_port(value: str) -> tuple[str, str | None]:
 
     Handles bracketed IPv6 literals (``[::1]:5555``) as well as the usual
     ``127.0.0.1:5555`` and bare ``localhost`` forms.
+
+    Invalid authorities return ``("", None)``. In particular, bracketed IPv6
+    must end after ``]`` or continue with exactly ``:<numeric-port>``.
     """
     value = value.strip()
+    if (
+        not value
+        or any(char.isspace() for char in value)
+        or any(char in _FORBIDDEN_AUTHORITY_CHARS for char in value)
+    ):
+        return "", None
+
     if value.startswith("["):
-        host, _, rest = value.partition("]")
-        port = rest[1:] if rest.startswith(":") else ""
-        return f"{host}]".lower(), port or None
-    host, separator, port = value.rpartition(":")
-    if separator and port.isdigit():
-        return host.lower(), port
-    return value.lower(), None
+        closing = value.find("]")
+        if closing <= 1:
+            return "", None
+        literal = value[1:closing]
+        rest = value[closing + 1 :]
+        try:
+            address = ipaddress.ip_address(literal)
+        except ValueError:
+            return "", None
+        if address.version != 6:
+            return "", None
+        if not rest:
+            port = None
+        elif rest.startswith(":"):
+            port = _normalize_port(rest[1:])
+            if port is None:
+                return "", None
+        else:
+            return "", None
+        return f"[{address.compressed}]", port
+
+    if "[" in value or "]" in value or value.count(":") > 1:
+        return "", None
+
+    host, separator, raw_port = value.rpartition(":")
+    if separator:
+        if not host:
+            return "", None
+        port = _normalize_port(raw_port)
+        if port is None:
+            return "", None
+    else:
+        host = value
+        port = None
+
+    try:
+        host = ipaddress.ip_address(host).compressed
+    except ValueError:
+        host = host.lower()
+    return host, port
 
 
 class LoopbackOriginGuard:
@@ -72,23 +138,30 @@ class LoopbackOriginGuard:
         self.app = app
         self.enabled = is_loopback_host(host)
         self.port = str(port)
-        self.allowed_hosts = LOOPBACK_HOSTS
 
-    def _authority_allowed(self, value: str | None) -> bool:
+    def _authority_allowed(
+        self,
+        value: str | None,
+        *,
+        implicit_port: str | None = None,
+    ) -> bool:
         if not value:
             return False
         host, port = split_host_port(value)
-        if port is not None and port != self.port:
+        effective_port = port if port is not None else implicit_port
+        if effective_port is not None and effective_port != self.port:
             return False
-        return host in self.allowed_hosts
+        return is_loopback_host(host)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if not self.enabled or scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        headers = {key.decode("latin-1").lower(): value.decode("latin-1")
-                   for key, value in scope["headers"]}
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope["headers"]
+        }
 
         # DNS rebinding: the browser resolves an attacker-controlled name to
         # 127.0.0.1 but still sends that name in Host.
@@ -101,9 +174,14 @@ class LoopbackOriginGuard:
         origin = headers.get("origin")
         if origin is not None:
             scheme, separator, authority = origin.partition("://")
-            if (not separator
-                    or scheme.lower() not in _ALLOWED_ORIGIN_SCHEMES
-                    or not self._authority_allowed(authority)):
+            if (
+                not separator
+                or scheme.lower() not in _ALLOWED_ORIGIN_SCHEMES
+                or not self._authority_allowed(
+                    authority,
+                    implicit_port="443" if scheme.lower() == "https" else "80",
+                )
+            ):
                 await self._forbid(send, "Forbidden: cross-origin request")
                 return
 
@@ -112,14 +190,16 @@ class LoopbackOriginGuard:
     @staticmethod
     async def _forbid(send: Send, message: str) -> None:
         body = message.encode()
-        await send({
-            "type": "http.response.start",
-            "status": 403,
-            "headers": [
-                (b"content-type", b"text/plain; charset=utf-8"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 403,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
         await send({"type": "http.response.body", "body": body})
 
 

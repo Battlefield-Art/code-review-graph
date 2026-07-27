@@ -27,8 +27,7 @@ BASE_URL = f"http://{HOST}:{PORT}"
 MCP_PATH = "/mcp/"
 # streamable-http requires both content types; without them FastMCP answers 406
 # before dispatching, which is still proof the request passed the guard.
-MCP_HEADERS = {"Accept": "application/json, text/event-stream",
-               "Content-Type": "application/json"}
+MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 
 
 @pytest.fixture(scope="module")
@@ -46,8 +45,9 @@ def client() -> TestClient:
 
 
 def _post(client: TestClient, **kwargs) -> int:
-    return client.post(MCP_PATH, headers={**MCP_HEADERS, **kwargs.pop("headers", {})},
-                       json={}, **kwargs).status_code
+    return client.post(
+        MCP_PATH, headers={**MCP_HEADERS, **kwargs.pop("headers", {})}, json={}, **kwargs
+    ).status_code
 
 
 class TestGuardEndToEnd:
@@ -79,8 +79,29 @@ class TestGuardEndToEnd:
     def test_origin_on_wrong_port_is_rejected(self, client: TestClient) -> None:
         assert _post(client, headers={"Origin": f"http://127.0.0.1:{PORT + 1}"}) == 403
 
+    def test_origin_with_implicit_wrong_port_is_rejected(
+        self,
+        client: TestClient,
+    ) -> None:
+        assert _post(client, headers={"Origin": "http://127.0.0.1"}) == 403
+        assert _post(client, headers={"Origin": "https://localhost"}) == 403
+
     def test_non_http_origin_scheme_is_rejected(self, client: TestClient) -> None:
         assert _post(client, headers={"Origin": "file://"}) == 403
+
+    def test_other_ipv4_loopback_bind_is_guarded(self) -> None:
+        """Every address in 127.0.0.0/8 is loopback, not only 127.0.0.1."""
+        mcp: FastMCP = FastMCP("alternate-loopback-guard-test")
+        host = "127.0.0.2"
+        app = mcp.http_app(middleware=build_http_middleware(host, PORT))
+        with TestClient(app, base_url=f"http://{host}:{PORT}") as test_client:
+            assert (
+                _post(
+                    test_client,
+                    headers={"Origin": "http://evil.example"},
+                )
+                == 403
+            )
 
 
 class TestFastMcpSignatureContract:
@@ -124,8 +145,13 @@ class TestHelpers:
         assert split_host_port("[::1]:5555") == ("[::1]", "5555")
         assert split_host_port("[::1]") == ("[::1]", None)
 
+    def test_split_host_port_rejects_trailing_data_after_ipv6(self) -> None:
+        assert split_host_port("[::1]evil") == ("", None)
+        assert split_host_port("[::1]:5555evil") == ("", None)
+
     def test_is_loopback_host(self) -> None:
         assert is_loopback_host("127.0.0.1")
+        assert is_loopback_host("127.0.0.2")
         assert is_loopback_host("LocalHost")
         assert not is_loopback_host("0.0.0.0")
         assert not is_loopback_host("evil.example")
