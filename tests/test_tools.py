@@ -327,6 +327,47 @@ class TestQueryGraphCallTargetFallbacks:
         edge_targets = {e["target"] for e in result["edges"]}
         assert edge_targets == {f"{self.target_file}::target_func", "target_func"}
 
+    def test_references_to_returns_type_dependents(self, monkeypatch):
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        type_path = self.root / "types.ts"
+        use_path = self.root / "use.ts"
+        alias_path = self.root / "alias.ts"
+        type_path.write_text(
+            "export interface Finding { id: string }\n",
+            encoding="utf-8",
+        )
+        use_path.write_text(
+            "import type { Finding } from './types';\n"
+            "export function summarize(item: Finding): string { return item.id; }\n",
+            encoding="utf-8",
+        )
+        alias_path.write_text(
+            "import type { Finding as ImportedFinding } from './types';\n"
+            "export function summarizeAlias(item: ImportedFinding): string {\n"
+            "  return item.id;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with GraphStore(self.db_path) as store:
+            build = full_build(self.root, store)
+            assert build["errors"] == []
+
+        type_qn = f"{type_path}::Finding"
+        direct_qn = f"{use_path}::summarize"
+        alias_qn = f"{alias_path}::summarizeAlias"
+        result = query_graph(
+            pattern="references_to",
+            target=type_qn,
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        assert {node["qualified_name"] for node in result["results"]} == {
+            direct_qn,
+            alias_qn,
+        }
+        assert {edge["kind"] for edge in result["edges"]} == {"REFERENCES"}
+
     def test_callees_of_includes_resolved_and_bare_target_callees(self):
         result = query_graph(
             pattern="callees_of",

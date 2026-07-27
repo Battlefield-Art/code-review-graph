@@ -839,8 +839,19 @@ _TASK_META_KEYS: frozenset[str] = frozenset({
 _CLASS_TYPES: dict[str, list[str]] = {
     "python": ["class_definition"],
     "javascript": ["class_declaration", "class"],
-    "typescript": ["class_declaration", "class"],
-    "tsx": ["class_declaration", "class"],
+    # TS types are declarations, not just runtime classes: an interface or type
+    # alias is the thing callers depend on, so it needs a node of its own the way
+    # Java/C#/PHP interfaces do. Without them a types-only module (types.ts,
+    # *.d.ts) contributes zero symbol nodes and its blast radius collapses to
+    # whole-file IMPORTS_FROM fan-out. See: #737
+    "typescript": [
+        "class_declaration", "class",
+        "interface_declaration", "type_alias_declaration", "enum_declaration",
+    ],
+    "tsx": [
+        "class_declaration", "class",
+        "interface_declaration", "type_alias_declaration", "enum_declaration",
+    ],
     "go": ["type_declaration"],
     # impl_item is a scope for methods, not a second type definition. It is
     # dispatched separately so repeated impl blocks cannot overwrite structs.
@@ -908,6 +919,20 @@ _CLASS_TYPES: dict[str, list[str]] = {
     # _extract_hcl_constructs.
     "hcl": [],
 }
+
+# TS/TSX heritage clauses. Classes wrap theirs in class_heritage; interfaces use
+# extends_type_clause. A type_identifier inside one is already covered by an
+# INHERITS edge, so it must not also emit REFERENCES.
+_TS_HERITAGE_CLAUSES = frozenset({
+    "extends_clause", "implements_clause", "extends_type_clause",
+})
+
+# TS/TSX declarations whose ``name`` field is a type_identifier. That occurrence
+# is the definition site, not a use of the type.
+_TS_TYPE_DECLARATIONS = frozenset({
+    "class_declaration", "abstract_class_declaration", "interface_declaration",
+    "type_alias_declaration", "enum_declaration",
+})
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
     "python": ["function_definition"],
@@ -1213,6 +1238,7 @@ _SPRING_EVENT_LISTENER_ANNOTATIONS = frozenset({"EventListener"})
 _SPRING_EVENT_PUBLISH_METHODS = frozenset({"publishEvent"})
 _JAVA_PACKAGE_KEY = "__crg_java_package__"
 _SPRING_REQUEST_PREFIX_KEY = "__crg_spring_request_prefix__:"
+_JS_IMPORT_ORIGINAL_PREFIX_KEY = "__crg_js_import_original__:"
 _SPRING_REQUEST_MAPPINGS = {
     "DeleteMapping": ("DELETE",),
     "GetMapping": ("GET",),
@@ -5150,7 +5176,7 @@ class CodeParser:
             return None
         if base_type in import_map:
             resolved = self._resolve_imported_symbol(
-                base_type,
+                self._js_imported_symbol_name(base_type, import_map),
                 import_map[base_type],
                 file_path,
                 language,
@@ -6137,6 +6163,14 @@ class CodeParser:
                 and node_type in ("jsx_opening_element", "jsx_self_closing_element")
             ):
                 self._extract_jsx_component_call(
+                    child, language, file_path, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names,
+                )
+
+            # --- TS type-position references ---
+            if language in ("typescript", "tsx") and node_type == "type_identifier":
+                self._extract_ts_type_reference(
                     child, language, file_path, edges,
                     enclosing_class, enclosing_func,
                     import_map, defined_names,
@@ -11520,6 +11554,75 @@ class CodeParser:
         "self", "this", "cls", "super",
     })
 
+    def _extract_ts_type_reference(
+        self,
+        child,
+        language: str,
+        file_path: str,
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+    ) -> None:
+        """Emit a ``REFERENCES`` edge for a type used in a TS type position.
+
+        ``function summarize(items: Finding[])`` is a real dependency on
+        ``Finding``, but a type annotation is not call syntax, so neither
+        _extract_calls nor _extract_value_references sees it and callers_of on
+        an interface stays empty.
+
+        ``REFERENCES`` (0.6 in IMPACT_EDGE_WEIGHTS) rather than ``CALLS`` (1.0):
+        a type use is a weaker signal than an invocation, and folding the two
+        together would let type churn outrank call churn in impact ranking.
+        """
+        parent = child.parent
+        if parent is not None:
+            # The declaration's own name is a definition, not a use. Compare by
+            # byte span: child_by_field_name returns a fresh wrapper object, so
+            # identity/equality checks against *child* are unreliable.
+            if parent.type in _TS_TYPE_DECLARATIONS:
+                name_node = parent.child_by_field_name("name")
+                if (
+                    name_node is not None
+                    and name_node.start_byte == child.start_byte
+                    and name_node.end_byte == child.end_byte
+                ):
+                    return
+            # extends/implements are already covered by INHERITS edges. Generic
+            # bases add a ``generic_type`` wrapper, so walk up to the clause.
+            # Do not suppress a separate imported type used as a type argument:
+            # ``extends Base<Dependency>`` inherits Base but references Dependency.
+            ancestor = parent
+            inside_type_arguments = False
+            while ancestor is not None:
+                if ancestor.type == "type_arguments":
+                    inside_type_arguments = True
+                if ancestor.type in _TS_HERITAGE_CLAUSES:
+                    if not inside_type_arguments:
+                        return
+                    break
+                if ancestor.type in _TS_TYPE_DECLARATIONS:
+                    break
+                ancestor = ancestor.parent
+
+        # Attribute to the enclosing function, else the enclosing type, else the
+        # file — so `interface Wrapper { nested: Verdict }` names Wrapper as the
+        # dependent rather than collapsing to the whole module.
+        if enclosing_func:
+            caller = self._qualify(enclosing_func, file_path, enclosing_class)
+        elif enclosing_class:
+            caller = self._qualify(enclosing_class, file_path, None)
+        else:
+            caller = file_path
+
+        self._emit_reference_if_known(
+            child.text.decode("utf-8", errors="replace"),
+            language, file_path, caller, edges,
+            import_map or {}, defined_names or set(),
+            line=child.start_point[0] + 1,
+        )
+
     def _extract_value_references(
         self,
         child,
@@ -12964,6 +13067,8 @@ class CodeParser:
                 for spec in child.children:
                     if spec.type == "import_specifier":
                         # Could be: name or name as alias
+                        imported_node = spec.child_by_field_name("name")
+                        alias_node = spec.child_by_field_name("alias")
                         names = [
                             s.text.decode("utf-8", errors="replace")
                             for s in spec.children
@@ -12971,7 +13076,30 @@ class CodeParser:
                         ]
                         # Last identifier is the local name
                         if names:
-                            import_map[names[-1]] = module
+                            local_name = names[-1]
+                            import_map[local_name] = module
+                            imported_name = (
+                                imported_node.text.decode(
+                                    "utf-8", errors="replace",
+                                )
+                                if imported_node is not None
+                                else names[0]
+                            )
+                            if alias_node is not None and imported_name != local_name:
+                                import_map[
+                                    f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}"
+                                ] = imported_name
+
+    @staticmethod
+    def _js_imported_symbol_name(
+        local_name: str,
+        import_map: dict[str, str],
+    ) -> str:
+        """Return the exported name behind a local JS/TS import alias."""
+        return import_map.get(
+            f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}",
+            local_name,
+        )
 
     def exclude_files(self, paths: set[str]) -> None:
         """Treat these files as absent when resolving imports.
@@ -13629,7 +13757,10 @@ class CodeParser:
             if language == "julia":
                 return import_map[call_name]
             resolved = self._resolve_imported_symbol(
-                call_name, import_map[call_name], file_path, language,
+                self._js_imported_symbol_name(call_name, import_map),
+                import_map[call_name],
+                file_path,
+                language,
             )
             if resolved:
                 return resolved
@@ -14521,12 +14652,28 @@ class CodeParser:
                         if sub.type == "type_identifier":
                             bases.append(sub.text.decode("utf-8", errors="replace"))
         elif language in ("typescript", "javascript", "tsx"):
-            # extends clause
+            # Classes nest their heritage one level down, under class_heritage
+            # (`class C extends B implements I`); interfaces carry
+            # extends_type_clause as a direct child. Scanning only direct
+            # children therefore missed every class base.
+            clauses: list = []
             for child in node.children:
-                if child.type in ("extends_clause", "implements_clause"):
-                    for sub in child.children:
-                        if sub.type in ("identifier", "type_identifier", "nested_identifier"):
-                            bases.append(sub.text.decode("utf-8", errors="replace"))
+                if child.type == "class_heritage":
+                    clauses.extend(child.children)
+                else:
+                    clauses.append(child)
+            for clause in clauses:
+                if clause.type not in _TS_HERITAGE_CLAUSES:
+                    continue
+                for sub in clause.children:
+                    if sub.type in ("identifier", "type_identifier", "nested_identifier"):
+                        bases.append(sub.text.decode("utf-8", errors="replace"))
+                    elif sub.type == "generic_type":
+                        # `extends Base<T>` — the base is the generic's head.
+                        for ident in sub.children:
+                            if ident.type in ("type_identifier", "nested_type_identifier"):
+                                bases.append(ident.text.decode("utf-8", errors="replace"))
+                                break
         elif language == "solidity":
             # contract Foo is Bar, Baz { ... }
             for child in node.children:
