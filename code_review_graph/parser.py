@@ -4574,7 +4574,7 @@ class CodeParser:
         return resolved
 
     _TYPED_CALL_LANGUAGES = frozenset({
-        "python", "kotlin", "java", "javascript", "typescript", "tsx",
+        "python", "kotlin", "java", "javascript", "typescript", "tsx", "php",
     })
     _TRANSPARENT_TYPE_WRAPPERS = frozenset({"Annotated", "Optional", "Type"})
     _NON_RECEIVER_TYPE_NAMES = frozenset({
@@ -4595,9 +4595,11 @@ class CodeParser:
         """Collect evidence-backed targets for calls on typed receivers.
 
         The result is keyed by source line, receiver, and method so the normal
-        call extractor remains the single producer of CALLS edges. Only
-        repository-local imported types and same-file classes are qualified;
-        unknown or ambiguous types keep their existing bare targets.
+        call extractor remains the single producer of CALLS edges. Statically
+        typed receivers resolve directly when their class is repository-local.
+        PHP variables assigned from ``new Type`` retain a bare parse-time target
+        plus the constructed class scope for conservative graph-wide resolution.
+        Unknown or ambiguous types keep their existing bare targets.
         """
         if language not in self._TYPED_CALL_LANGUAGES:
             return {}
@@ -4611,6 +4613,7 @@ class CodeParser:
             "javascript": {"statement_block"},
             "typescript": {"statement_block"},
             "tsx": {"statement_block"},
+            "php": {"compound_statement"},
         }.get(language, set())
         targets: dict[tuple[int, str, str], tuple[str, str, str]] = {}
 
@@ -4647,11 +4650,18 @@ class CodeParser:
                 return
 
             new_bindings = self._typed_bindings_from_node(node, language)
-            if new_bindings:
+            assigned_names = (
+                self._php_assigned_variables(node)
+                if language == "php"
+                else set()
+            )
+            if new_bindings or assigned_names:
                 # Initializers are evaluated before their declaration becomes
                 # visible, so visit children with the previous environment.
                 for child in node.children:
                     walk(child, bindings, class_fields, depth + 1)
+                for name in assigned_names:
+                    bindings.pop(name, None)
                 bindings.update(new_bindings)
                 return
 
@@ -4661,7 +4671,11 @@ class CodeParser:
                 )
                 if receiver and method:
                     type_name = bindings.get(receiver)
-                    evidence = "typed_receiver"
+                    evidence = (
+                        "constructed_receiver"
+                        if language == "php"
+                        else "typed_receiver"
+                    )
                     if type_name is None and receiver[:1].isupper():
                         if receiver in import_map or receiver in defined_names:
                             type_name = receiver
@@ -4856,7 +4870,45 @@ class CodeParser:
                 node.child_by_field_name("type"),
             )
 
+        elif language == "php" and node.type == "assignment_expression":
+            name_node = node.child_by_field_name("left")
+            value_node = node.child_by_field_name("right")
+            if (
+                name_node is not None
+                and name_node.type == "variable_name"
+                and value_node is not None
+                and value_node.type == "object_creation_expression"
+            ):
+                type_node = next(
+                    (
+                        child
+                        for child in value_node.children
+                        if child.type in ("name", "qualified_name")
+                    ),
+                    None,
+                )
+                if type_node is not None:
+                    name = name_node.text.decode(
+                        "utf-8", errors="replace",
+                    )
+                    type_name = type_node.text.decode(
+                        "utf-8", errors="replace",
+                    ).strip("\\")
+                    if name and type_name:
+                        result[name] = type_name
+
         return result
+
+    @staticmethod
+    def _php_assigned_variables(node) -> set[str]:
+        """Return simple PHP variables invalidated by one assignment."""
+        if node.type != "assignment_expression":
+            return set()
+        name_node = node.child_by_field_name("left")
+        if name_node is None or name_node.type != "variable_name":
+            return set()
+        name = name_node.text.decode("utf-8", errors="replace")
+        return {name} if name else set()
 
     @classmethod
     def _store_typed_binding(cls, result: dict[str, str], name_node, type_node) -> None:
@@ -4909,6 +4961,15 @@ class CodeParser:
         import_map: dict[str, str],
         defined_names: set[str],
     ) -> Optional[str]:
+        if language == "php":
+            normalized = type_name.strip("\\")
+            if not normalized:
+                return None
+            local_name = normalized.rsplit("\\", 1)[-1]
+            imported = import_map.get(local_name.casefold())
+            scope = imported or normalized
+            return f"{scope}::{method}"
+
         base_type = self._base_type_name(type_name)
         if not base_type:
             return None
@@ -4944,10 +5005,19 @@ class CodeParser:
                     "receiver_type": type_name,
                     "receiver_resolution": evidence_kind,
                 })
+                resolved_target = target
+                if evidence_kind == "constructed_receiver":
+                    # Keep PHP parse-only CALLS output backward-compatible
+                    # (bare method target) while preserving the constructed
+                    # class scope for the graph-wide resolver.
+                    scope, separator, _ = target.rpartition("::")
+                    if separator and scope:
+                        extra["receiver_scope"] = scope
+                    resolved_target = edge.target
                 edge = EdgeInfo(
                     kind=edge.kind,
                     source=edge.source,
-                    target=target,
+                    target=resolved_target,
                     file_path=edge.file_path,
                     line=edge.line,
                     extra=extra,
@@ -10099,6 +10169,22 @@ class CodeParser:
         receiver so class-field annotations can resolve them. More complex
         receiver expressions are deliberately left unresolved.
         """
+        if language == "php" and node.type in (
+            "member_call_expression",
+            "nullsafe_member_call_expression",
+        ):
+            receiver = node.child_by_field_name("object")
+            method = node.child_by_field_name("name")
+            if method is None:
+                return None, None
+            method_name = method.text.decode("utf-8", errors="replace")
+            if receiver is None or receiver.type != "variable_name":
+                return None, method_name
+            return (
+                receiver.text.decode("utf-8", errors="replace"),
+                method_name,
+            )
+
         if language == "rust" and node.type == "call_expression":
             callee = node.child_by_field_name("function")
             while callee is not None and callee.type == "generic_function":
@@ -12507,6 +12593,9 @@ class CodeParser:
             local_name = alias.strip() if separator else original.rsplit(".", 1)[-1]
             if local_name:
                 import_map[local_name] = original.strip()
+
+        elif language == "php":
+            import_map.update(self._php_import_bindings(node))
 
     def _collect_js_import_names(
         self, clause_node, module: str, import_map: dict[str, str],

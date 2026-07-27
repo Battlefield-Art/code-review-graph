@@ -9,6 +9,7 @@ post-build scoped resolver rewrites the resolvable ones to the defining node.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from code_review_graph.graph import GraphStore
@@ -37,6 +38,198 @@ def _calls(store: GraphStore) -> list[dict]:
             "FROM edges WHERE kind = 'CALLS'"
         ).fetchall()
     ]
+
+
+def _build_phpunit_calculator(tmp_path: Path) -> GraphStore:
+    """Build the exact two-file PHPUnit reproduction from issue #745."""
+    return _build(
+        tmp_path,
+        {
+            "src/Calculator.php": (
+                "<?php\n"
+                "namespace App;\n"
+                "\n"
+                "class Calculator\n"
+                "{\n"
+                "    public function add(int $a, int $b): int\n"
+                "    {\n"
+                "        return $a + $b;\n"
+                "    }\n"
+                "}\n"
+            ),
+            "tests/CalculatorTest.php": (
+                "<?php\n"
+                "namespace App\\Tests;\n"
+                "\n"
+                "use App\\Calculator;\n"
+                "use PHPUnit\\Framework\\TestCase;\n"
+                "\n"
+                "class CalculatorTest extends TestCase\n"
+                "{\n"
+                "    public function testItAddsTwoNumbers(): void\n"
+                "    {\n"
+                "        $calculator = new Calculator();\n"
+                "        $this->assertSame(3, $calculator->add(1, 2));\n"
+                "    }\n"
+                "}\n"
+            ),
+        },
+    )
+
+
+def test_phpunit_instance_call_creates_canonical_tested_by_edge(
+    tmp_path: Path,
+) -> None:
+    store = _build_phpunit_calculator(tmp_path)
+    test_node = store._conn.execute(
+        "SELECT qualified_name, kind, is_test FROM nodes "
+        "WHERE name = 'testItAddsTwoNumbers'"
+    ).fetchone()
+    add_node = store._conn.execute(
+        "SELECT qualified_name FROM nodes "
+        "WHERE name = 'add' AND parent_name = 'Calculator'"
+    ).fetchone()
+
+    assert dict(test_node) == {
+        "qualified_name": (
+            f"{tmp_path}/tests/CalculatorTest.php"
+            "::CalculatorTest.testItAddsTwoNumbers"
+        ),
+        "kind": "Test",
+        "is_test": 1,
+    }
+    call = store._conn.execute(
+        "SELECT target_qualified, extra, confidence_tier FROM edges "
+        "WHERE kind = 'CALLS' AND source_qualified = ? AND target_qualified = ?",
+        (test_node["qualified_name"], add_node["qualified_name"]),
+    ).fetchone()
+    tested_by = store._conn.execute(
+        "SELECT source_qualified, target_qualified, confidence_tier FROM edges "
+        "WHERE kind = 'TESTED_BY' AND source_qualified = ? AND target_qualified = ?",
+        (add_node["qualified_name"], test_node["qualified_name"]),
+    ).fetchone()
+
+    assert call is not None
+    assert call["confidence_tier"] == "INFERRED"
+    assert json.loads(call["extra"]) == {
+        "receiver": "$calculator",
+        "receiver_resolution": "constructed_receiver",
+        "receiver_scope": "App\\Calculator",
+        "receiver_type": "Calculator",
+        "scoped_resolved": True,
+        "scoped_via": "single_match",
+    }
+    assert tested_by is not None
+    assert tested_by["confidence_tier"] == "INFERRED"
+
+
+def test_phpunit_instance_call_is_visible_through_public_tests_for(
+    tmp_path: Path,
+) -> None:
+    store = _build_phpunit_calculator(tmp_path)
+    add_qn = store._conn.execute(
+        "SELECT qualified_name FROM nodes "
+        "WHERE name = 'add' AND parent_name = 'Calculator'"
+    ).fetchone()["qualified_name"]
+
+    method_result = query_graph("tests_for", add_qn, repo_root=str(tmp_path))
+    file_result = query_graph(
+        "tests_for",
+        "src/Calculator.php",
+        repo_root=str(tmp_path),
+    )
+
+    assert method_result["status"] == "ok"
+    assert [
+        (result["name"], result["indirect"])
+        for result in method_result["results"]
+    ] == [("testItAddsTwoNumbers", False)]
+    assert file_result["status"] == "ok"
+    assert [
+        (result["name"], result["indirect"])
+        for result in file_result["results"]
+    ] == [("testItAddsTwoNumbers", False)]
+
+
+def test_php_instance_call_resolves_constructor_import_alias(
+    tmp_path: Path,
+) -> None:
+    store = _build(
+        tmp_path,
+        {
+            "src/Calculator.php": (
+                "<?php\n"
+                "namespace App;\n"
+                "class Calculator {\n"
+                "    public function add(int $a, int $b): int { return $a + $b; }\n"
+                "}\n"
+            ),
+            "tests/CalculatorTest.php": (
+                "<?php\n"
+                "namespace App\\Tests;\n"
+                "use App\\Calculator as MathCalculator;\n"
+                "class CalculatorTest {\n"
+                "    public function testAlias(): void {\n"
+                "        $calculator = new MathCalculator();\n"
+                "        $calculator->add(1, 2);\n"
+                "    }\n"
+                "}\n"
+            ),
+        },
+    )
+    target = store._conn.execute(
+        "SELECT qualified_name FROM nodes "
+        "WHERE name = 'add' AND parent_name = 'Calculator'"
+    ).fetchone()["qualified_name"]
+
+    call = store._conn.execute(
+        "SELECT extra FROM edges "
+        "WHERE kind = 'CALLS' AND target_qualified = ?",
+        (target,),
+    ).fetchone()
+
+    assert json.loads(call["extra"])["receiver_type"] == "MathCalculator"
+    assert json.loads(call["extra"])["scoped_resolved"] is True
+
+
+def test_php_reassignment_invalidates_constructed_receiver_type(
+    tmp_path: Path,
+) -> None:
+    store = _build(
+        tmp_path,
+        {
+            "src/Calculator.php": (
+                "<?php\n"
+                "class Calculator {\n"
+                "    public function add(int $a, int $b): int { return $a + $b; }\n"
+                "}\n"
+            ),
+            "tests/CalculatorTest.php": (
+                "<?php\n"
+                "class CalculatorTest {\n"
+                "    public function testReassigned(): void {\n"
+                "        $calculator = new Calculator();\n"
+                "        $calculator = makeCalculator();\n"
+                "        $calculator->add(1, 2);\n"
+                "    }\n"
+                "}\n"
+            ),
+        },
+    )
+    canonical_target = store._conn.execute(
+        "SELECT qualified_name FROM nodes "
+        "WHERE name = 'add' AND parent_name = 'Calculator'"
+    ).fetchone()["qualified_name"]
+
+    assert store._conn.execute(
+        "SELECT 1 FROM edges "
+        "WHERE kind = 'CALLS' AND target_qualified = ?",
+        (canonical_target,),
+    ).fetchone() is None
+    assert store._conn.execute(
+        "SELECT 1 FROM edges "
+        "WHERE kind = 'CALLS' AND target_qualified = 'add'",
+    ).fetchone() is not None
 
 
 def test_path_tokens_normalizes_windows_separators() -> None:
