@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import full_build
 from code_review_graph.parser import CodeParser
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1957,3 +1958,217 @@ class TestCppScopedFunctionName:
         fns = [n for n in nodes if n.kind == "Function"]
         assert len(fns) == 1
         assert fns[0].name == "get_obj_fingerprint"
+
+
+class TestJsMemberAssignedFunctions:
+    """Member-assigned function expressions in JS/TS.
+
+    ``obj.method = function () {}`` / ``Foo.prototype.bar = () => {}`` are the
+    prototype- and module-augmentation patterns that Express, Koa and many
+    older JS libraries use for their entire public API. Only ``const x = fn``
+    (variable_declarator) and class fields were captured before, so these
+    definitions produced no Function node at all.
+    """
+
+    def setup_method(self):
+        self.parser = CodeParser()
+
+    def test_js_object_method_assignment_captured(self):
+        nodes, _ = self.parser.parse_bytes(
+            Path("/test/application.js"),
+            b"app.handle = function handle(req, res, next) {\n"
+            b"  next();\n"
+            b"};\n",
+        )
+        fns = {n.name for n in nodes if n.kind == "Function"}
+        assert "app.handle" in fns
+
+    def test_js_arrow_member_assignment_captured(self):
+        nodes, _ = self.parser.parse_bytes(
+            Path("/test/router.js"),
+            b"router.dispatch = (req, res) => {\n"
+            b"  return res;\n"
+            b"};\n",
+        )
+        fns = {n.name for n in nodes if n.kind == "Function"}
+        assert "router.dispatch" in fns
+
+    def test_ts_prototype_assignment_captured(self):
+        nodes, _ = self.parser.parse_bytes(
+            Path("/test/proto.ts"),
+            b"Router.prototype.handle = function (req: Request): void {\n"
+            b"  this.stack.forEach((layer) => layer.handle(req));\n"
+            b"};\n",
+        )
+        fns = {n.name for n in nodes if n.kind == "Function"}
+        assert "Router.prototype.handle" in fns
+
+    def test_member_function_qualified_name_and_contains(self):
+        """Qualified name is ``file::obj.method`` and a CONTAINS edge links it."""
+        path = Path("/test/application.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"app.handle = function handle(req, res) {};\n",
+        )
+        contains = [
+            e for e in edges
+            if e.kind == "CONTAINS" and e.target == f"{path}::app.handle"
+        ]
+        assert len(contains) == 1
+        assert contains[0].source == str(path)
+
+    def test_non_function_member_assignment_not_captured(self):
+        """``obj.prop = <non-function>`` must not create a Function node."""
+        nodes, _ = self.parser.parse_bytes(
+            Path("/test/config.js"),
+            b"app.settings = { trust_proxy: false };\n"
+            b"app.locals = {};\n",
+        )
+        fns = {n.name for n in nodes if n.kind == "Function"}
+        assert "app.settings" not in fns
+        assert "app.locals" not in fns
+
+    def test_function_local_member_assignments_are_not_module_definitions(self):
+        """Sibling local assignments must not collide as ``file::x.run``."""
+        path = Path("/test/local_assignments.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"function a() { x.run = function () {}; }\n"
+            b"function b() { x.run = function () {}; }\n",
+        )
+        functions = [n for n in nodes if n.kind == "Function"]
+        assert {n.name for n in functions} == {"a", "b"}
+        assert all(n.name != "x.run" for n in functions)
+        assert all(
+            not (e.kind == "CONTAINS" and e.target == f"{path}::x.run")
+            for e in edges
+        )
+
+    def test_sibling_top_level_blocks_do_not_share_member_identity(self):
+        """Block-local objects must not collapse into one module definition."""
+        path = Path("/test/block_assignments.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"{ const x = {}; x.run = function () {}; }\n"
+            b"{ const x = {}; x.run = function () {}; }\n",
+        )
+        functions = [n for n in nodes if n.kind == "Function"]
+        assert all(n.name != "x.run" for n in functions)
+        assert all(
+            not (e.kind == "CONTAINS" and e.target == f"{path}::x.run")
+            for e in edges
+        )
+
+    def test_dynamic_receiver_assignment_is_not_a_stable_definition(self):
+        """A fresh object returned by a call has no stable member identity."""
+        path = Path("/test/dynamic_assignment.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"factory().handle = function () {};\n",
+        )
+        functions = [n for n in nodes if n.kind == "Function"]
+        assert all(n.name != "factory().handle" for n in functions)
+        assert all(
+            not (
+                e.kind == "CONTAINS"
+                and e.target == f"{path}::factory().handle"
+            )
+            for e in edges
+        )
+
+    def test_dynamic_receiver_call_does_not_resolve_as_static_member(self):
+        """Separate factory calls must not be linked as one member."""
+        path = Path("/test/dynamic_call.js")
+        _, edges = self.parser.parse_bytes(
+            path,
+            b"factory().handle = function () {};\n"
+            b"function start() { factory().handle(); }\n",
+        )
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path}::start"
+        ]
+        assert len(calls) == 2
+        handle_call = next(e for e in calls if e.target == "handle")
+        assert "member_call" not in handle_call.extra
+
+    def test_member_function_body_calls_still_attributed(self):
+        """Calls inside a member-assigned function attribute to that function."""
+        path = Path("/test/application.js")
+        _, edges = self.parser.parse_bytes(
+            path,
+            b"function helper() { return 1; }\n"
+            b"app.handle = function handle() {\n"
+            b"  helper();\n"
+            b"};\n",
+        )
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS"
+            and e.source == f"{path}::app.handle"
+            and e.target.endswith("helper")
+        ]
+        assert len(calls) == 1
+
+    def test_member_call_resolves_to_member_assigned_function(self):
+        """A static member call resolves to its same-file member definition."""
+        path = Path("/test/application.js")
+        _, edges = self.parser.parse_bytes(
+            path,
+            b"app.handle = function () {};\n"
+            b"function start() { app.handle(); }\n",
+        )
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path}::start"
+        ]
+        assert len(calls) == 1
+        assert calls[0].target == f"{path}::app.handle"
+
+    def test_optional_member_call_resolves_to_member_assigned_function(self):
+        """Optional chaining retains the same static member-call target."""
+        path = Path("/test/application.js")
+        _, edges = self.parser.parse_bytes(
+            path,
+            b"app.handle = function () {};\n"
+            b"function start() { app?.handle(); }\n",
+        )
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path}::start"
+        ]
+        assert len(calls) == 1
+        assert calls[0].target == f"{path}::app.handle"
+
+    def test_member_assignment_survives_full_build_with_resolved_caller(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """The definition and resolved call persist through a real graph build."""
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        source = tmp_path / "application.js"
+        source.write_text(
+            "app.handle = function () { return 1; };\n"
+            "function start() { return app.handle(); }\n",
+            encoding="utf-8",
+        )
+        member_qn = f"{source}::app.handle"
+        caller_qn = f"{source}::start"
+
+        with GraphStore(tmp_path / "graph.db") as store:
+            built = full_build(tmp_path, store)
+            assert built["errors"] == []
+
+            member = store.get_node(member_qn)
+            callers = [
+                edge
+                for edge in store.get_edges_by_target(member_qn)
+                if edge.kind == "CALLS"
+            ]
+
+        assert member is not None
+        assert member.kind == "Function"
+        assert member.name == "app.handle"
+        assert len(callers) == 1
+        assert callers[0].source_qualified == caller_qn

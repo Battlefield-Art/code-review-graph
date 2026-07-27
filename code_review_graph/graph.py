@@ -22,8 +22,13 @@ import networkx as nx
 
 from .constants import (
     BFS_ENGINE,
+    IMPACT_DEFAULT_EDGE_DIRECTION,
     IMPACT_DEFAULT_EDGE_WEIGHT,
     IMPACT_DEPTH_DECAY,
+    IMPACT_DIRECTION_INCOMING,
+    IMPACT_DIRECTION_NONE,
+    IMPACT_DIRECTION_OUTGOING,
+    IMPACT_EDGE_DIRECTIONS,
     IMPACT_EDGE_WEIGHTS,
     IMPACT_SCORE_FLOOR,
     MAX_IMPACT_DEPTH,
@@ -1236,11 +1241,16 @@ class GraphStore:
         max_depth: int = MAX_IMPACT_DEPTH,
         max_nodes: int = MAX_IMPACT_NODES,
     ) -> dict[str, Any]:
-        """BFS from changed files to find all impacted nodes within depth N.
+        """Find dependents and tests impacted by changed files within depth N.
 
         Delegates to ``get_impact_radius_sql()`` by default (faster for
         large graphs).  Set ``CRG_BFS_ENGINE=networkx`` to use the legacy
         Python-side BFS via NetworkX.
+
+        Dependency-shaped edges propagate from target to source, while
+        TESTED_BY propagates from production source to test target. CONTAINS
+        does not expand the traversal because every node in a changed file is
+        already seeded.
 
         Returns dict with:
           - changed_nodes: nodes in changed files
@@ -1323,13 +1333,24 @@ class GraphStore:
         # many paths; these three bounded temp tables contain at most one row
         # per qualified name and each iteration scans the edge table once.
         self._conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _impact_weights "
-            "(kind TEXT PRIMARY KEY, weight REAL NOT NULL)"
+            "CREATE TEMP TABLE IF NOT EXISTS _impact_policies "
+            "(kind TEXT PRIMARY KEY, weight REAL NOT NULL, "
+            "direction TEXT NOT NULL)"
         )
-        self._conn.execute("DELETE FROM _impact_weights")
+        self._conn.execute("DELETE FROM _impact_policies")
         self._conn.executemany(
-            "INSERT INTO _impact_weights (kind, weight) VALUES (?, ?)",
-            list(IMPACT_EDGE_WEIGHTS.items()),
+            "INSERT INTO _impact_policies "
+            "(kind, weight, direction) VALUES (?, ?, ?)",
+            [
+                (
+                    kind,
+                    weight,
+                    IMPACT_EDGE_DIRECTIONS.get(
+                        kind, IMPACT_DEFAULT_EDGE_DIRECTION,
+                    ),
+                )
+                for kind, weight in IMPACT_EDGE_WEIGHTS.items()
+            ],
         )
         for table in ("_impact_best", "_impact_frontier", "_impact_next"):
             self._conn.execute(
@@ -1352,16 +1373,18 @@ class GraphStore:
         SELECT node_qn, MAX(score)
         FROM (
             SELECT e.target_qualified AS node_qn,
-                   f.score * COALESCE(w.weight, ?) * ? AS score
+                   f.score * COALESCE(p.weight, ?) * ? AS score
             FROM _impact_frontier f
             JOIN edges e ON e.source_qualified = f.node_qn
-            LEFT JOIN _impact_weights w ON w.kind = e.kind
+            LEFT JOIN _impact_policies p ON p.kind = e.kind
+            WHERE COALESCE(p.direction, ?) = ?
             UNION ALL
             SELECT e.source_qualified AS node_qn,
-                   f.score * COALESCE(w.weight, ?) * ? AS score
+                   f.score * COALESCE(p.weight, ?) * ? AS score
             FROM _impact_frontier f
             JOIN edges e ON e.target_qualified = f.node_qn
-            LEFT JOIN _impact_weights w ON w.kind = e.kind
+            LEFT JOIN _impact_policies p ON p.kind = e.kind
+            WHERE COALESCE(p.direction, ?) = ?
         ) candidates
         WHERE score > ?
         GROUP BY node_qn
@@ -1369,8 +1392,12 @@ class GraphStore:
         candidate_params = (
             IMPACT_DEFAULT_EDGE_WEIGHT,
             IMPACT_DEPTH_DECAY,
+            IMPACT_DEFAULT_EDGE_DIRECTION,
+            IMPACT_DIRECTION_OUTGOING,
             IMPACT_DEFAULT_EDGE_WEIGHT,
             IMPACT_DEPTH_DECAY,
+            IMPACT_DEFAULT_EDGE_DIRECTION,
+            IMPACT_DIRECTION_INCOMING,
             IMPACT_SCORE_FLOOR,
         )
         for _ in range(max_depth):
@@ -1487,16 +1514,15 @@ class GraphStore:
                 if qn not in nxg:
                     continue
                 neighbors = [
-                    (target, data)
+                    (target, data["impact_outgoing_weight"])
                     for _, target, data in nxg.out_edges(qn, data=True)
+                    if "impact_outgoing_weight" in data
                 ] + [
-                    (source, data)
+                    (source, data["impact_incoming_weight"])
                     for source, _, data in nxg.in_edges(qn, data=True)
+                    if "impact_incoming_weight" in data
                 ]
-                for other_qn, data in neighbors:
-                    weight = IMPACT_EDGE_WEIGHTS.get(
-                        data.get("kind", ""), IMPACT_DEFAULT_EDGE_WEIGHT,
-                    )
+                for other_qn, weight in neighbors:
                     new_score = score * weight * IMPACT_DEPTH_DECAY
                     if new_score <= IMPACT_SCORE_FLOOR:
                         continue
@@ -2020,7 +2046,7 @@ class GraphStore:
     # --- Internal helpers ---
 
     def _build_networkx_graph(self) -> nx.DiGraph:
-        """Build a directed graph, retaining the strongest parallel edge."""
+        """Build a directed graph with impact weights for both policies."""
         with self._cache_lock:
             if self._nxg_cache is not None:
                 return self._nxg_cache
@@ -2030,17 +2056,26 @@ class GraphStore:
                 source = r["source_qualified"]
                 target = r["target_qualified"]
                 kind = r["kind"]
-                if g.has_edge(source, target):
-                    existing = g[source][target].get("kind", "")
-                    existing_weight = IMPACT_EDGE_WEIGHTS.get(
-                        existing, IMPACT_DEFAULT_EDGE_WEIGHT,
+                candidate_weight = IMPACT_EDGE_WEIGHTS.get(
+                    kind, IMPACT_DEFAULT_EDGE_WEIGHT,
+                )
+                if not g.has_edge(source, target):
+                    g.add_edge(source, target, kind=kind)
+                data = g[source][target]
+                existing_weight = IMPACT_EDGE_WEIGHTS.get(
+                    data.get("kind", ""), IMPACT_DEFAULT_EDGE_WEIGHT,
+                )
+                if candidate_weight > existing_weight:
+                    data["kind"] = kind
+
+                direction = IMPACT_EDGE_DIRECTIONS.get(
+                    kind, IMPACT_DEFAULT_EDGE_DIRECTION,
+                )
+                if direction != IMPACT_DIRECTION_NONE:
+                    weight_key = f"impact_{direction}_weight"
+                    data[weight_key] = max(
+                        data.get(weight_key, 0.0), candidate_weight,
                     )
-                    candidate_weight = IMPACT_EDGE_WEIGHTS.get(
-                        kind, IMPACT_DEFAULT_EDGE_WEIGHT,
-                    )
-                    if candidate_weight <= existing_weight:
-                        continue
-                g.add_edge(source, target, kind=kind)
             self._nxg_cache = g
             return g
 

@@ -4457,6 +4457,26 @@ class CodeParser:
                 continue
             receiver = edge.extra.get("receiver")
             has_receiver = bool(receiver)
+            if edge.kind in ("CALLS", "REFERENCES") and "::" not in edge.target:
+                # JS/TS calls retain their full member expression as evidence
+                # (``app.handle``) while keeping the method name (``handle``)
+                # as the fallback target for external calls. Prefer the full
+                # expression when it identifies a same-file member-assigned
+                # function; otherwise preserve the existing bare-name
+                # resolution behavior.
+                member_call = edge.extra.get("member_call")
+                member_candidates = symbols.get(member_call, [])
+                if member_candidates:
+                    edge = EdgeInfo(
+                        kind=edge.kind,
+                        source=edge.source,
+                        target=member_candidates[0][0],
+                        file_path=edge.file_path,
+                        line=edge.line,
+                        extra=edge.extra,
+                    )
+                    resolved.append(edge)
+                    continue
             cpp_lexical_receiver = is_cpp and receiver == "this"
             if (
                 is_cpp
@@ -6064,6 +6084,18 @@ class CodeParser:
                 language in ("javascript", "typescript", "tsx")
                 and node_type == "public_field_definition"
                 and self._extract_js_field_function(
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
+                )
+            ):
+                continue
+
+            # --- JS/TS member-assigned functions (app.handle = function () {}) ---
+            if (
+                language in ("javascript", "typescript", "tsx")
+                and node_type == "expression_statement"
+                and self._extract_js_member_functions(
                     child, source, language, file_path, nodes, edges,
                     enclosing_class, enclosing_func,
                     import_map, defined_names, _depth,
@@ -8378,6 +8410,148 @@ class CodeParser:
         )
         return True
 
+    def _extract_js_member_functions(
+        self,
+        child,
+        source: bytes,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Handle JS/TS member-assigned functions.
+
+        Patterns handled (LHS is a ``member_expression``, RHS is a function):
+          app.handle = function handle(req, res) {}
+          Router.prototype.dispatch = (req) => {}
+          exports.render = function () {}
+
+        These prototype- and module-augmentation patterns carry the entire
+        public API of Express, Koa and many older JS modules, but were
+        previously invisible to the graph: only ``const x = fn``
+        (:func:`_extract_js_var_functions`) and class fields
+        (:func:`_extract_js_field_function`) produced Function nodes. The node
+        is qualified by its full member path (``file::app.handle``), matching
+        the ``file::Class.method`` shape used elsewhere.
+
+        Returns True if a function was extracted, so the caller can skip
+        generic recursion.
+        """
+        # ``child`` is the expression_statement wrapping the assignment.
+        assign = None
+        if child.type == "assignment_expression":
+            assign = child
+        else:
+            for sub in child.children:
+                if sub.type == "assignment_expression":
+                    assign = sub
+                    break
+        if assign is None:
+            return False
+
+        left = assign.child_by_field_name("left")
+        right = assign.child_by_field_name("right")
+        if left is None or right is None:
+            return False
+        if left.type != "member_expression":
+            return False
+        if right.type not in self._JS_FUNC_VALUE_TYPES:
+            return False
+
+        # An assignment nested in a function belongs to that function's
+        # runtime scope, not to the module-level object namespace.  Without
+        # lexical scope in the member name, identical assignments in sibling
+        # functions would both become ``file::obj.method`` and produce
+        # duplicate CONTAINS targets. Top-level lexical blocks have the same
+        # problem, so only direct program statements have a stable identity.
+        if (
+            enclosing_func
+            or child.parent is None
+            or child.parent.type != "program"
+        ):
+            return False
+
+        member_name = self._get_js_static_member_path(left)
+        if member_name is None:
+            return False
+
+        is_test = _is_test_function(member_name, file_path)
+        kind = "Test" if is_test else "Function"
+        qualified = self._qualify(member_name, file_path, enclosing_class)
+        params = self._get_params(right, language, source)
+        ret_type = self._get_return_type(right, language, source)
+
+        nodes.append(NodeInfo(
+            kind=kind,
+            name=member_name,
+            file_path=file_path,
+            line_start=child.start_point[0] + 1,
+            line_end=child.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+            params=params,
+            return_type=ret_type,
+            is_test=is_test,
+        ))
+        container = (
+            self._qualify(enclosing_class, file_path, None)
+            if enclosing_class else file_path
+        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=container,
+            target=qualified,
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
+
+        # Recurse into the function body for calls, attributing them to the
+        # member function.
+        self._extract_from_tree(
+            right, source, language, file_path, nodes, edges,
+            enclosing_class=enclosing_class,
+            enclosing_func=member_name,
+            import_map=import_map,
+            defined_names=defined_names,
+            _depth=_depth + 1,
+        )
+        return True
+
+    @staticmethod
+    def _get_js_static_member_path(node) -> Optional[str]:
+        """Return a stable identifier-only JS/TS member path."""
+        if node.type != "member_expression":
+            return None
+        text = node.text.decode("utf-8", errors="replace")
+        if not text or "[" in text or "\n" in text:
+            return None
+
+        parts: list[str] = []
+        current = node
+        while current.type == "member_expression":
+            object_node = current.child_by_field_name("object")
+            property_node = current.child_by_field_name("property")
+            if (
+                object_node is None
+                or property_node is None
+                or property_node.type not in ("identifier", "property_identifier")
+            ):
+                return None
+            parts.append(
+                property_node.text.decode("utf-8", errors="replace"),
+            )
+            current = object_node
+
+        if current.type not in ("identifier", "this"):
+            return None
+        parts.append(current.text.decode("utf-8", errors="replace"))
+        return ".".join(reversed(parts))
+
     @staticmethod
     def _get_java_annotations(class_node) -> list[str]:
         """Return annotation names from the modifiers child of a Java class/method node."""
@@ -10220,6 +10394,10 @@ class CodeParser:
             # uses this evidence during parsing, and the Spring DI resolver
             # consumes the same metadata for Java injected fields.
             call_extra: dict = {}
+            if language in ("javascript", "typescript", "tsx"):
+                member_call = self._get_js_member_call_name(child)
+                if member_call:
+                    call_extra["member_call"] = member_call
             if (
                 language in self._TYPED_CALL_LANGUAGES
                 or language in ("cpp", "rust")
@@ -10312,6 +10490,23 @@ class CodeParser:
             ))
 
         return False
+
+    @staticmethod
+    def _get_js_member_call_name(node) -> Optional[str]:
+        """Return a static JS/TS member-call expression, if present.
+
+        ``_get_call_name`` intentionally reduces ``app.handle()`` to
+        ``handle`` for general method-call handling. Retain ``app.handle`` as
+        supplemental evidence so the same-file resolver can link it to a
+        member-assigned definition without changing unresolved external calls.
+        Computed and multiline expressions are intentionally excluded.
+        """
+        callee = node.child_by_field_name("function")
+        if callee is None and node.children:
+            callee = node.children[0]
+        if callee is None or callee.type != "member_expression":
+            return None
+        return CodeParser._get_js_static_member_path(callee)
 
     def _get_member_call_receiver_method(
         self,

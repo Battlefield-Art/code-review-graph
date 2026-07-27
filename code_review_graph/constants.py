@@ -66,6 +66,31 @@ IMPACT_EDGE_WEIGHTS: dict[str, float] = {
     "CONTAINS": 0.3,
 }
 IMPACT_DEFAULT_EDGE_WEIGHT = 0.5
+
+# Stored dependency edges point from the dependent to its dependency, so impact
+# normally propagates against the stored edge (target -> source). TESTED_BY is
+# intentionally stored in the opposite orientation (production -> test).
+# CONTAINS is not traversed: changing a file already seeds every node in it, and
+# following containment can bridge into unrelated structure through stale edges.
+IMPACT_DIRECTION_INCOMING = "incoming"
+IMPACT_DIRECTION_OUTGOING = "outgoing"
+IMPACT_DIRECTION_NONE = "none"
+IMPACT_EDGE_DIRECTIONS: dict[str, str] = {
+    "CALLS": IMPACT_DIRECTION_INCOMING,
+    "INHERITS": IMPACT_DIRECTION_INCOMING,
+    "OVERRIDES": IMPACT_DIRECTION_INCOMING,
+    "IMPLEMENTS": IMPACT_DIRECTION_INCOMING,
+    "TESTED_BY": IMPACT_DIRECTION_OUTGOING,
+    "REFERENCES": IMPACT_DIRECTION_INCOMING,
+    "DEPENDS_ON": IMPACT_DIRECTION_INCOMING,
+    "IMPORTS_FROM": IMPACT_DIRECTION_INCOMING,
+    "CONTAINS": IMPACT_DIRECTION_NONE,
+}
+# Unknown relationships conservatively follow the dominant graph convention:
+# source depends on target. This includes possible dependents without claiming
+# that a changed node's own unclassified dependency is impacted.
+IMPACT_DEFAULT_EDGE_DIRECTION = IMPACT_DIRECTION_INCOMING
+
 IMPACT_DEPTH_DECAY = _bounded_float_env(
     "CRG_IMPACT_DEPTH_DECAY", 0.6, lower=0.0, upper=1.0,
 )

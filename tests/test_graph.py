@@ -10,6 +10,7 @@ import pytest
 
 import code_review_graph.constants as constants_module
 from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import full_build
 from code_review_graph.parser import EdgeInfo, NodeInfo
 
 
@@ -422,14 +423,14 @@ class TestGraphStore:
         assert "python" in stats.languages
 
     def test_impact_radius(self):
-        # Create a chain: file_a -> func_a -> (calls) -> func_b in file_b
+        # func_b depends on the changed func_a, so func_b is impacted.
         self.store.upsert_node(self._make_file_node("/a.py"))
         self.store.upsert_node(self._make_func_node("func_a", "/a.py"))
         self.store.upsert_node(self._make_file_node("/b.py"))
         self.store.upsert_node(self._make_func_node("func_b", "/b.py"))
         self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/a.py::func_a",
-            target="/b.py::func_b", file_path="/a.py", line=10,
+            kind="CALLS", source="/b.py::func_b",
+            target="/a.py::func_a", file_path="/b.py", line=10,
         ))
         self.store.commit()
 
@@ -620,7 +621,7 @@ class TestImpactRadiusSql:
         Path(self.tmp.name).unlink(missing_ok=True)
 
     def _build_chain(self):
-        """Build A -> B -> C -> D chain for testing."""
+        """Build D -> C -> B -> A dependency chain for testing."""
         for name, path in [
             ("func_a", "/a.py"), ("func_b", "/b.py"),
             ("func_c", "/c.py"), ("func_d", "/d.py"),
@@ -634,16 +635,16 @@ class TestImpactRadiusSql:
                 line_start=5, line_end=20, language="python",
             ))
         self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/a.py::func_a",
-            target="/b.py::func_b", file_path="/a.py", line=10,
-        ))
-        self.store.upsert_edge(EdgeInfo(
             kind="CALLS", source="/b.py::func_b",
-            target="/c.py::func_c", file_path="/b.py", line=10,
+            target="/a.py::func_a", file_path="/b.py", line=10,
         ))
         self.store.upsert_edge(EdgeInfo(
             kind="CALLS", source="/c.py::func_c",
-            target="/d.py::func_d", file_path="/c.py", line=10,
+            target="/b.py::func_b", file_path="/c.py", line=10,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="/d.py::func_d",
+            target="/c.py::func_c", file_path="/d.py", line=10,
         ))
         self.store.commit()
 
@@ -654,6 +655,7 @@ class TestImpactRadiusSql:
 
         sql_qns = {n.qualified_name for n in sql_result["impacted_nodes"]}
         nx_qns = {n.qualified_name for n in nx_result["impacted_nodes"]}
+        assert sql_qns == {"/b.py::func_b", "/c.py::func_c"}
         assert sql_qns == nx_qns
 
     def test_max_nodes_truncation(self):
@@ -661,14 +663,55 @@ class TestImpactRadiusSql:
         result = self.store.get_impact_radius_sql(
             ["/a.py"], max_depth=3, max_nodes=2,
         )
-        # With 4 files in chain + file nodes, max_nodes=2 should limit
-        assert result["total_impacted"] <= 2 or result["truncated"]
+        assert result["truncated"] is True
+        assert result["total_impacted"] == 3
+        assert len(result["impacted_nodes"]) == 2
 
     def test_empty_changed_files(self):
         result = self.store.get_impact_radius_sql([], max_depth=2)
         assert result["changed_nodes"] == []
         assert result["impacted_nodes"] == []
         assert result["total_impacted"] == 0
+
+
+def test_impact_radius_real_build_includes_importer_not_imported_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real parsed import graph follows impact toward dependents only."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    dependency = tmp_path / "dependency.py"
+    changed = tmp_path / "changed.py"
+    importer = tmp_path / "importer.py"
+    dependency.write_text("VALUE = 1\n", encoding="utf-8")
+    changed.write_text(
+        "from dependency import VALUE\n\n"
+        "def changed_value():\n"
+        "    return VALUE\n",
+        encoding="utf-8",
+    )
+    importer.write_text(
+        "from changed import changed_value\n\n"
+        "def consume():\n"
+        "    return changed_value()\n",
+        encoding="utf-8",
+    )
+
+    with GraphStore(tmp_path / "graph.db") as store:
+        built = full_build(tmp_path, store)
+        assert built["errors"] == []
+
+        sql = store.get_impact_radius_sql([str(changed)], max_depth=1)
+        networkx = store._get_impact_radius_networkx(
+            [str(changed)],
+            max_depth=1,
+        )
+
+    expected = {str(importer)}
+    assert set(sql["impacted_files"]) == expected
+    assert set(networkx["impacted_files"]) == expected
+    assert str(dependency) not in sql["impacted_files"]
+    assert sql["impact_scores"] == networkx["impact_scores"]
 
 
 @pytest.mark.parametrize(
@@ -725,14 +768,60 @@ class TestWeightedImpactScoring:
     def _ordered_qns(result) -> list[str]:
         return [node.qualified_name for node in result["impacted_nodes"]]
 
-    def test_edge_weights_rank_best_path_and_engines_match(self):
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            "CALLS",
+            "IMPORTS_FROM",
+            "DEPENDS_ON",
+            "REFERENCES",
+            "INHERITS",
+            "OVERRIDES",
+            "IMPLEMENTS",
+        ],
+    )
+    def test_dependency_edges_include_dependents_not_dependencies(self, kind):
         seed = self._add_func("seed", "/seed.py")
-        called = self._add_func("called", "/called.py")
-        imported = self._add_func("imported", "/imported.py")
-        indirect = self._add_func("indirect", "/indirect.py")
-        self._add_edge("CALLS", seed, called)
-        self._add_edge("IMPORTS_FROM", seed, imported)
-        self._add_edge("CALLS", called, indirect)
+        dependent = self._add_func("dependent", "/dependent.py")
+        dependency = self._add_func("dependency", "/dependency.py")
+        self._add_edge(kind, dependent, seed)
+        self._add_edge(kind, seed, dependency, line=2)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=1,
+        )
+
+        assert self._ordered_qns(sql) == [dependent]
+        assert self._ordered_qns(nx_result) == [dependent]
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_tested_by_traverses_from_production_to_test_only(self):
+        seed = self._add_func("seed", "/seed.py")
+        test = self._add_func("test_seed", "/test_seed.py")
+        unrelated_production = self._add_func(
+            "unrelated_production", "/unrelated.py",
+        )
+        self._add_edge("TESTED_BY", seed, test)
+        self._add_edge("TESTED_BY", unrelated_production, seed, line=2)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=1,
+        )
+
+        assert self._ordered_qns(sql) == [test]
+        assert self._ordered_qns(nx_result) == [test]
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_contains_edge_cannot_bridge_impact(self):
+        seed = self._add_func("seed", "/seed.py")
+        stale_container = "stale.py::Container"
+        dependent = self._add_func("dependent", "/dependent.py")
+        self._add_edge("CONTAINS", stale_container, seed)
+        self._add_edge("CALLS", dependent, stale_container, line=2)
         self.store.commit()
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=2)
@@ -740,10 +829,51 @@ class TestWeightedImpactScoring:
             ["/seed.py"], max_depth=2,
         )
 
-        assert sql["impact_scores"][called] == pytest.approx(0.6)
-        assert sql["impact_scores"][indirect] == pytest.approx(0.36)
-        assert sql["impact_scores"][imported] == pytest.approx(0.3)
-        assert self._ordered_qns(sql) == [called, indirect, imported]
+        assert self._ordered_qns(sql) == []
+        assert self._ordered_qns(nx_result) == []
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_unknown_edge_kind_defaults_to_incoming_dependency_direction(self):
+        seed = self._add_func("seed", "/seed.py")
+        dependent = self._add_func("dependent", "/dependent.py")
+        dependency = self._add_func("dependency", "/dependency.py")
+        self._add_edge("UNKNOWN_KIND", dependent, seed)
+        self._add_edge("UNKNOWN_KIND", seed, dependency, line=2)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=1,
+        )
+
+        assert self._ordered_qns(sql) == [dependent]
+        assert sql["impact_scores"][dependent] == pytest.approx(0.3)
+        assert self._ordered_qns(nx_result) == [dependent]
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_edge_weights_rank_best_path_and_engines_match(self):
+        seed = self._add_func("seed", "/seed.py")
+        caller = self._add_func("caller", "/caller.py")
+        importer = self._add_func("importer", "/importer.py")
+        indirect_caller = self._add_func(
+            "indirect_caller", "/indirect_caller.py",
+        )
+        self._add_edge("CALLS", caller, seed)
+        self._add_edge("IMPORTS_FROM", importer, seed)
+        self._add_edge("CALLS", indirect_caller, caller)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=2)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=2,
+        )
+
+        assert sql["impact_scores"][caller] == pytest.approx(0.6)
+        assert sql["impact_scores"][indirect_caller] == pytest.approx(0.36)
+        assert sql["impact_scores"][importer] == pytest.approx(0.3)
+        assert self._ordered_qns(sql) == [
+            caller, indirect_caller, importer,
+        ]
         assert sql["impact_scores"] == nx_result["impact_scores"]
         assert self._ordered_qns(sql) == self._ordered_qns(nx_result)
 
@@ -751,9 +881,9 @@ class TestWeightedImpactScoring:
         seed = self._add_func("seed", "/seed.py")
         middle = self._add_func("middle", "/middle.py")
         target = self._add_func("target", "/target.py")
-        self._add_edge("CONTAINS", seed, target)
-        self._add_edge("CALLS", seed, middle, line=2)
-        self._add_edge("CALLS", middle, target, line=3)
+        self._add_edge("IMPORTS_FROM", target, seed)
+        self._add_edge("CALLS", middle, seed, line=2)
+        self._add_edge("CALLS", target, middle, line=3)
         self.store.commit()
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=2)
@@ -769,7 +899,7 @@ class TestWeightedImpactScoring:
             self._add_func(f"node_{index}", f"/node_{index}.py")
             for index in range(8)
         ]
-        for index, (source, target) in enumerate(zip(qns, qns[1:])):
+        for index, (source, target) in enumerate(zip(qns[1:], qns)):
             self._add_edge("CALLS", source, target, line=index + 1)
         self.store.commit()
 
@@ -787,7 +917,7 @@ class TestWeightedImpactScoring:
     def test_unknown_edge_kind_uses_default_weight(self):
         seed = self._add_func("seed", "/seed.py")
         target = self._add_func("target", "/target.py")
-        self._add_edge("UNKNOWN_KIND", seed, target)
+        self._add_edge("UNKNOWN_KIND", target, seed)
         self.store.commit()
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
@@ -805,7 +935,7 @@ class TestWeightedImpactScoring:
             for index in range(3)
         ]
         for index, target in enumerate(targets):
-            self._add_edge("CALLS", seed, target, line=index + 1)
+            self._add_edge("CALLS", target, seed, line=index + 1)
         self.store.commit()
 
         exact = self.store.get_impact_radius_sql(
@@ -825,8 +955,8 @@ class TestWeightedImpactScoring:
         seed = self._add_func("seed", "/seed.py")
         target = self._add_func("target", "/target.py")
         ghost = "external.package::ghost"
-        self._add_edge("CALLS", seed, ghost)
-        self._add_edge("CALLS", ghost, target, line=2)
+        self._add_edge("CALLS", ghost, seed)
+        self._add_edge("CALLS", target, ghost, line=2)
         self.store.commit()
 
         result = self.store.get_impact_radius_sql(
@@ -840,8 +970,8 @@ class TestWeightedImpactScoring:
     def test_parallel_edges_use_strongest_weight_in_both_engines(self):
         seed = self._add_func("seed", "/seed.py")
         target = self._add_func("target", "/target.py")
-        self._add_edge("CALLS", seed, target, line=1)
-        self._add_edge("CONTAINS", seed, target, line=2)
+        self._add_edge("CALLS", target, seed, line=1)
+        self._add_edge("IMPORTS_FROM", target, seed, line=2)
         self.store.commit()
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
@@ -850,6 +980,28 @@ class TestWeightedImpactScoring:
         )
         assert sql["impact_scores"][target] == pytest.approx(0.6)
         assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_parallel_edges_preserve_each_direction_in_both_engines(self):
+        source = self._add_func("source", "/source.py")
+        target = self._add_func("target", "/target.py")
+        self._add_edge("CALLS", source, target, line=1)
+        self._add_edge("TESTED_BY", source, target, line=2)
+        self.store.commit()
+
+        for path, expected_qn, expected_score in (
+            ("/source.py", target, 0.42),
+            ("/target.py", source, 0.6),
+        ):
+            sql = self.store.get_impact_radius_sql([path], max_depth=1)
+            nx_result = self.store._get_impact_radius_networkx(
+                [path], max_depth=1,
+            )
+
+            assert self._ordered_qns(sql) == [expected_qn]
+            assert sql["impact_scores"][expected_qn] == pytest.approx(
+                expected_score,
+            )
+            assert sql["impact_scores"] == nx_result["impact_scores"]
 
     def test_dense_mixed_cycle_is_bounded(self):
         qns = [self._add_func(f"node_{i}", f"/node_{i}.py") for i in range(12)]
