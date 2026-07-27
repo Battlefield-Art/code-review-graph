@@ -853,12 +853,13 @@ def _reconcile_stale_files(
 ) -> list[str]:
     """Remove graph files absent from the current parseable repository inventory."""
     stored_files = set(store.get_all_files())
+    current_paths: set[str]
     if current_files is not None:
         current_paths = {str(repo_root / file_path) for file_path in current_files}
     else:
         ignore_patterns = _load_ignore_patterns(repo_root)
         parser = CodeParser(repo_root)
-        current_paths: set[str] = set()
+        current_paths = set()
         for stored_file in stored_files:
             path = Path(stored_file)
             try:
