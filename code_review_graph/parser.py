@@ -440,6 +440,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PARSER_LOAD_TIMEOUT_SECONDS = 5.0
 _PARSER_PROBE_RESULTS: dict[str, bool] = {}
+_PARSER_PROBE_FAILURE_DETAILS: dict[str, str] = {}
 _PARSER_PROBE_LOCK = threading.Lock()
 _EXPECTED_PARSER_LOAD_ERRORS = (ImportError, LookupError, OSError, ValueError)
 
@@ -468,17 +469,32 @@ def _run_parser_load_probe(grammar: str, timeout_seconds: float) -> bool:
     )
     try:
         completed = subprocess.run(
-            [sys.executable, "-I", "-c", code, grammar],
+            [sys.executable, "-c", code, grammar],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             timeout=timeout_seconds,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
+        _PARSER_PROBE_FAILURE_DETAILS[grammar] = str(exc)
         logger.debug("tree-sitter parser probe failed for %s: %s", grammar, exc)
         return False
-    return completed.returncode == 0
+    if completed.returncode == 0:
+        _PARSER_PROBE_FAILURE_DETAILS.pop(grammar, None)
+        return True
+
+    raw_stderr = getattr(completed, "stderr", b"")
+    if isinstance(raw_stderr, bytes):
+        stderr = raw_stderr.decode("utf-8", errors="replace")
+    else:
+        stderr = str(raw_stderr)
+    detail = next(
+        (line.strip() for line in reversed(stderr.splitlines()) if line.strip()),
+        f"probe exited with status {completed.returncode}",
+    )
+    _PARSER_PROBE_FAILURE_DETAILS[grammar] = detail[:500]
+    return False
 
 
 def _parser_load_probe_succeeds(
@@ -503,10 +519,18 @@ def _parser_load_probe_succeeds(
         result = _run_parser_load_probe(grammar, timeout)
         _PARSER_PROBE_RESULTS[grammar] = result
         if not result:
-            logger.warning(
-                "Skipping unavailable tree-sitter parser for %s",
-                grammar,
-            )
+            detail = _PARSER_PROBE_FAILURE_DETAILS.get(grammar)
+            if detail:
+                logger.warning(
+                    "Skipping unavailable tree-sitter parser for %s: %s",
+                    grammar,
+                    detail,
+                )
+            else:
+                logger.warning(
+                    "Skipping unavailable tree-sitter parser for %s",
+                    grammar,
+                )
         return result
 
 
@@ -520,6 +544,7 @@ def _clear_parser_probe_cache() -> None:
     """Clear process-level probe state (used by focused tests)."""
     with _PARSER_PROBE_LOCK:
         _PARSER_PROBE_RESULTS.clear()
+        _PARSER_PROBE_FAILURE_DETAILS.clear()
 
 
 def _load_tree_sitter_parser(grammar: str):
