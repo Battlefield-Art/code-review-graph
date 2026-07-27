@@ -19,6 +19,7 @@ from code_review_graph import skills as skills_module
 from code_review_graph.skills import (
     _CLAUDE_MD_SECTION_MARKER,
     PLATFORMS,
+    _copilot_vscode_detected,
     _cursor_hook_scripts,
     _detect_serve_command,
     _in_poetry_project,
@@ -1669,14 +1670,58 @@ class TestCopilotPlatform:
         assert not (tmp_path / "QODER.md").exists()
 
     def test_copilot_included_in_all_when_detected(self, tmp_path):
-        """install_platform_configs with target='all' includes Copilot when ~/.vscode exists."""
+        """Auto-detection requires the Copilot extension, not only VS Code."""
         fake_home = tmp_path / "fakehome"
-        (fake_home / ".vscode").mkdir(parents=True)
-        with patch("code_review_graph.skills.Path.home", return_value=fake_home):
+        (fake_home / ".vscode" / "extensions" / "github.copilot-1.2.3").mkdir(
+            parents=True
+        )
+        with (
+            patch("code_review_graph.skills.Path.home", return_value=fake_home),
+            patch("code_review_graph.skills.platform.system", return_value="Unknown"),
+            patch("code_review_graph.skills.shutil.which", return_value=None),
+        ):
             configured = install_platform_configs(tmp_path, target="all")
         assert "GitHub Copilot" in configured
         config_path = tmp_path / ".vscode" / "mcp.json"
         assert config_path.exists()
+
+    def test_copilot_detects_vscode_bundled_extension(self, tmp_path):
+        """Current VS Code bundles Copilot under its application extensions."""
+        fake_home = tmp_path / "fakehome"
+        app_root = tmp_path / "vscode" / "resources" / "app"
+        code_cli = app_root / "bin" / "code"
+        code_cli.parent.mkdir(parents=True)
+        code_cli.write_text("", encoding="utf-8")
+        manifest = app_root / "extensions" / "copilot" / "package.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            json.dumps({"publisher": "GitHub", "name": "copilot-chat"}),
+            encoding="utf-8",
+        )
+
+        def _which(command):
+            return str(code_cli) if command == "code" else None
+
+        with (
+            patch("code_review_graph.skills.Path.home", return_value=fake_home),
+            patch("code_review_graph.skills.shutil.which", side_effect=_which),
+        ):
+            assert _copilot_vscode_detected() is True
+
+    def test_copilot_not_detected_from_vscode_alone(self, tmp_path):
+        """An unrelated VS Code install must not trigger Copilot configuration."""
+        fake_home = tmp_path / "fakehome"
+        (fake_home / ".vscode" / "extensions" / "ms-python.python-1.0.0").mkdir(
+            parents=True
+        )
+        with (
+            patch("code_review_graph.skills.Path.home", return_value=fake_home),
+            patch("code_review_graph.skills.platform.system", return_value="Unknown"),
+            patch("code_review_graph.skills.shutil.which", return_value=None),
+        ):
+            configured = install_platform_configs(tmp_path, target="all")
+        assert "GitHub Copilot" not in configured
+        assert not (tmp_path / ".vscode" / "mcp.json").exists()
 
 
 class TestCopilotCLIPlatform:
