@@ -11,10 +11,10 @@ rebuild without that file would produce:
 
 ``forget_files`` therefore removes the files, re-parses the surviving referrers
 so their cross-file edges are re-derived exactly as a build would, re-runs the
-shared post-processing pipeline (which fully recomputes flows, communities,
-signatures, and FTS and re-resolves bare endpoints), and purges embedding
-vectors whose node is gone. The result is equivalent to building the graph
-without the forgotten files.
+repository-wide Python import resolver and shared post-processing pipeline
+(which fully recomputes flows, communities, signatures, and FTS and re-resolves
+bare endpoints), and purges embedding vectors whose node is gone. The result is
+equivalent to building the graph without the forgotten files.
 """
 
 from __future__ import annotations
@@ -100,6 +100,7 @@ def forget_files(
     """
     from .parser import CodeParser
     from .postprocessing import run_post_processing
+    from .python_resolver import resolve_python_imports
 
     forgotten = set(targets)
 
@@ -148,13 +149,22 @@ def forget_files(
         except Exception as exc:  # noqa: BLE001 - a parser failure is non-fatal
             logger.warning("Error re-parsing referrer %s: %s", file_path, exc)
 
-    # 4. Re-run the shared post-processing pipeline. store_flows and
+    # 4. Re-run repository-wide Python import resolution. A forgotten file can
+    #    turn an ambiguous module suffix into a unique survivor even when the
+    #    import edge did not directly target the forgotten node, so referrer
+    #    re-parsing alone cannot discover this transition.
+    try:
+        resolve_python_imports(store)
+    except Exception as exc:  # noqa: BLE001 - resolver failure is non-fatal
+        logger.warning("Python import resolver failed after forget: %s", exc)
+
+    # 5. Re-run the shared post-processing pipeline. store_flows and
     #    store_communities clear their tables first, so flows and communities
     #    are fully recomputed; signatures and FTS are rebuilt; and any edge
     #    left bare by the re-parse is re-resolved.
     run_post_processing(store)
 
-    # 5. Drop embedding vectors that now reference a deleted node.
+    # 6. Drop embedding vectors that now reference a deleted node.
     purged = _purge_orphan_embeddings(store)
 
     return {

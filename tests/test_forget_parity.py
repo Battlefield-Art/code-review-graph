@@ -10,6 +10,8 @@ that never contained the file.
 
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -28,6 +30,16 @@ _FILES = {
         "from shared import shared_fn\n\n"
         "def run():\n"
         "    return helper() + shared_fn()\n"
+    ),
+}
+
+_AMBIGUOUS_IMPORT_FILES = {
+    "src_one/pkg/util.py": "def helper():\n    return 1\n",
+    "src_two/pkg/util.py": "def helper():\n    return 2\n",
+    "main.py": (
+        "from pkg.util import helper\n\n"
+        "def run():\n"
+        "    return helper()\n"
     ),
 }
 
@@ -55,7 +67,9 @@ def _make_repo(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
     repo = tmp_path / name
     repo.mkdir()
     for rel, content in files.items():
-        (repo / rel).write_text(content)
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
     _git_init(repo)
     return repo
 
@@ -67,38 +81,133 @@ def _build(repo: Path) -> GraphStore:
     return store
 
 
+def _seed_embeddings(store: GraphStore) -> None:
+    """Add deterministic vectors so parity includes embedding cleanup."""
+    store._conn.execute(_EMBEDDINGS_DDL)
+    qualified_names = store._conn.execute(
+        "SELECT qualified_name FROM nodes ORDER BY qualified_name"
+    ).fetchall()
+    for row in qualified_names:
+        qualified_name = row["qualified_name"]
+        store._conn.execute(
+            "INSERT OR REPLACE INTO embeddings VALUES (?, ?, ?, ?)",
+            (
+                qualified_name,
+                b"\x00\x00\x00\x00",
+                f"hash:{qualified_name}",
+                "test",
+            ),
+        )
+    store.commit()
+
+
 def _snapshot(store: GraphStore, repo: Path) -> dict:
     """A repo-relative snapshot of the layers a rebuild fully determines."""
     root = str(repo)
 
-    def norm(value: str | None) -> str | None:
-        if value is None:
-            return None
-        return value.replace(root + "/", "").replace(root, "")
+    def norm(value):
+        if isinstance(value, str):
+            return value.replace(root + "/", "").replace(root, "")
+        return value
 
     nodes = store._conn.execute(
-        "SELECT kind, name, qualified_name FROM nodes "
-        "WHERE kind != 'File' ORDER BY 1, 2, 3"
+        "SELECT n.kind, n.name, n.qualified_name, n.file_path, "
+        "n.line_start, n.line_end, n.language, n.parent_name, n.params, "
+        "n.return_type, n.modifiers, n.is_test, n.file_hash, n.extra, "
+        "n.signature, c.name AS community_name "
+        "FROM nodes n LEFT JOIN communities c ON c.id = n.community_id "
+        "ORDER BY n.qualified_name"
     ).fetchall()
     edges = store._conn.execute(
-        "SELECT kind, source_qualified, target_qualified FROM edges ORDER BY 1, 2, 3"
+        "SELECT kind, source_qualified, target_qualified, file_path, line, "
+        "extra, confidence, confidence_tier FROM edges "
+        "ORDER BY kind, source_qualified, target_qualified, file_path, line, extra"
     ).fetchall()
-    flows = store._conn.execute(
-        "SELECT name, node_count FROM flows ORDER BY 1, 2"
+    flow_rows = store._conn.execute(
+        "SELECT id, name, entry_point_id, depth, node_count, file_count, "
+        "criticality, path_json FROM flows ORDER BY name, id"
     ).fetchall()
-    comms = store._conn.execute(
-        "SELECT name, size FROM communities ORDER BY 1, 2"
+    node_names_by_id = {
+        row["id"]: row["qualified_name"]
+        for row in store._conn.execute(
+            "SELECT id, qualified_name FROM nodes ORDER BY id"
+        ).fetchall()
+    }
+    flows = []
+    for row in flow_rows:
+        path = tuple(
+            norm(node_names_by_id[node_id])
+            for node_id in json.loads(row["path_json"])
+        )
+        memberships = store._conn.execute(
+            "SELECT fm.position, n.qualified_name "
+            "FROM flow_memberships fm JOIN nodes n ON n.id = fm.node_id "
+            "WHERE fm.flow_id = ? ORDER BY fm.position, n.qualified_name",
+            (row["id"],),
+        ).fetchall()
+        flows.append(
+            (
+                norm(row["name"]),
+                norm(node_names_by_id[row["entry_point_id"]]),
+                row["depth"],
+                row["node_count"],
+                row["file_count"],
+                row["criticality"],
+                path,
+                tuple(
+                    (membership["position"], norm(membership["qualified_name"]))
+                    for membership in memberships
+                ),
+            )
+        )
+    communities = store._conn.execute(
+        "SELECT c.name, c.level, p.name AS parent_name, c.cohesion, c.size, "
+        "c.dominant_language, c.description FROM communities c "
+        "LEFT JOIN communities p ON p.id = c.parent_id "
+        "ORDER BY c.name, c.level"
     ).fetchall()
+    community_summaries = store._conn.execute(
+        "SELECT c.name AS community_name, cs.name, cs.purpose, "
+        "cs.key_symbols, cs.risk, cs.size, cs.dominant_language "
+        "FROM community_summaries cs "
+        "JOIN communities c ON c.id = cs.community_id "
+        "ORDER BY c.name, cs.name"
+    ).fetchall()
+    flow_snapshots = store._conn.execute(
+        "SELECT f.name AS flow_name, fs.name, fs.entry_point, "
+        "fs.critical_path, fs.criticality, fs.node_count, fs.file_count "
+        "FROM flow_snapshots fs JOIN flows f ON f.id = fs.flow_id "
+        "ORDER BY f.name, fs.name"
+    ).fetchall()
+    risk_index = store._conn.execute(
+        "SELECT qualified_name, risk_score, caller_count, test_coverage, "
+        "security_relevant FROM risk_index "
+        "ORDER BY qualified_name"
+    ).fetchall()
+    embeddings = store._conn.execute(
+        "SELECT qualified_name, vector, text_hash, provider "
+        "FROM embeddings ORDER BY qualified_name"
+    ).fetchall()
+
     return {
-        "nodes": [
-            (r["kind"], norm(r["name"]), norm(r["qualified_name"])) for r in nodes
+        "nodes": [tuple(norm(value) for value in row) for row in nodes],
+        "edges": [tuple(norm(value) for value in row) for row in edges],
+        "flows": flows,
+        "communities": [
+            tuple(norm(value) for value in row) for row in communities
         ],
-        "edges": [
-            (r["kind"], norm(r["source_qualified"]), norm(r["target_qualified"]))
-            for r in edges
+        "community_summaries": [
+            tuple(norm(value) for value in row) for row in community_summaries
         ],
-        "flows": [(r["name"], r["node_count"]) for r in flows],
-        "communities": [(norm(r["name"]), r["size"]) for r in comms],
+        "flow_snapshots": [
+            tuple(norm(value) for value in row) for row in flow_snapshots
+        ],
+        "risk_index": [
+            tuple(norm(value) for value in row) for row in risk_index
+        ],
+        "embeddings": [
+            tuple(norm(value) for value in row) for row in embeddings
+        ],
     }
 
 
@@ -112,26 +221,70 @@ def _calls_targets(store: GraphStore) -> set[str]:
 
 
 def test_forget_matches_full_rebuild_without_file(tmp_path):
-    repo_a = _make_repo(tmp_path, "a", _FILES)
-    store_a = _build(repo_a)
+    repo = _make_repo(tmp_path, "same-root", _FILES)
+    store = _build(repo)
     try:
-        forget_files(store_a, repo_a, [str(repo_a / "util.py")])
-        after_forget = _snapshot(store_a, repo_a)
+        _seed_embeddings(store)
+        forgotten_qns = {
+            row["qualified_name"]
+            for row in store._conn.execute(
+                "SELECT qualified_name FROM nodes WHERE file_path = ?",
+                (str(repo / "util.py"),),
+            ).fetchall()
+        }
+        summary = forget_files(store, repo, [str(repo / "util.py")])
+        after_forget = _snapshot(store, repo)
     finally:
-        store_a.close()
+        store.close()
 
-    without_util = {k: v for k, v in _FILES.items() if k != "util.py"}
-    repo_b = _make_repo(tmp_path, "b", without_util)
-    store_b = _build(repo_b)
+    assert forgotten_qns
+    assert summary["embeddings_purged"] == len(forgotten_qns)
+    assert not forgotten_qns.intersection(
+        row[0] for row in after_forget["embeddings"]
+    )
+
+    # Rebuild at the same root so repository-derived community names remain
+    # comparable. The forgotten file stays on disk during forget itself, then
+    # is removed only for the clean-rebuild baseline.
+    (repo / "util.py").unlink()
+    shutil.rmtree(get_db_path(repo).parent)
+
+    rebuilt_store = _build(repo)
     try:
-        rebuilt = _snapshot(store_b, repo_b)
+        _seed_embeddings(rebuilt_store)
+        rebuilt = _snapshot(rebuilt_store, repo)
     finally:
-        store_b.close()
+        rebuilt_store.close()
 
     assert after_forget == rebuilt
     # Guard against a vacuous pass: the surviving graph still has real content.
     assert after_forget["nodes"]
     assert after_forget["edges"]
+
+
+def test_forget_recomputes_python_import_after_candidate_is_removed(tmp_path):
+    """Removing one ambiguous module must expose the unique survivor."""
+    repo = _make_repo(tmp_path, "python-import", _AMBIGUOUS_IMPORT_FILES)
+    forgotten_path = repo / "src_two" / "pkg" / "util.py"
+    store = _build(repo)
+    try:
+        _seed_embeddings(store)
+        forget_files(store, repo, [str(forgotten_path)])
+        after_forget = _snapshot(store, repo)
+    finally:
+        store.close()
+
+    forgotten_path.unlink()
+    shutil.rmtree(get_db_path(repo).parent)
+
+    rebuilt_store = _build(repo)
+    try:
+        _seed_embeddings(rebuilt_store)
+        rebuilt = _snapshot(rebuilt_store, repo)
+    finally:
+        rebuilt_store.close()
+
+    assert after_forget == rebuilt
 
 
 def test_forget_rebares_incoming_edge_but_keeps_surviving_one(tmp_path):
