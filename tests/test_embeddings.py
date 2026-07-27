@@ -16,6 +16,7 @@ from code_review_graph.embeddings import (
     LocalEmbeddingProvider,
     MiniMaxEmbeddingProvider,
     OpenAIEmbeddingProvider,
+    VoyageEmbeddingProvider,
     _cosine_similarity,
     _decode_vector,
     _encode_vector,
@@ -237,17 +238,17 @@ class TestGoogleEmbeddingProviderRetryLogging:
 class TestGetProviderValidation:
     """Unknown provider names must raise instead of silently using local."""
 
-    @pytest.mark.parametrize("name", ["voyage", "opnai", "cohere", "VoYage"])
+    @pytest.mark.parametrize("name", ["opnai", "cohere", "moonbase", "MoOnBase"])
     def test_unknown_provider_raises(self, name):
         with pytest.raises(ValueError, match="Unknown embedding provider"):
             get_provider(name)
 
     def test_unknown_provider_message_lists_valid_names(self):
         with pytest.raises(ValueError) as exc_info:
-            get_provider("voyage")
+            get_provider("moonbase")
         msg = str(exc_info.value)
-        assert "voyage" in msg
-        assert "Valid: local, openai, google, minimax" in msg
+        assert "moonbase" in msg
+        assert "Valid: local, openai, google, minimax, voyage" in msg
 
     def test_case_and_whitespace_normalized_for_openai(self):
         """'  OPENAI ' must route to the openai branch (and fail on its
@@ -544,6 +545,156 @@ class TestGetProviderMiniMax:
         with patch.dict("os.environ", {}, clear=True):
             with pytest.raises(ValueError, match="MINIMAX_API_KEY"):
                 get_provider("minimax")
+
+
+def _make_voyage_response(vectors: list[list[float]]) -> MagicMock:
+    body = json.dumps({
+        "data": [{"embedding": v, "index": i} for i, v in enumerate(vectors)],
+        "model": "voyage-code-3",
+        "object": "list",
+        "usage": {"total_tokens": 5},
+    }).encode("utf-8")
+    mock = MagicMock()
+    mock.read.return_value = body
+    mock.__enter__ = MagicMock(return_value=mock)
+    mock.__exit__ = MagicMock(return_value=False)
+    return mock
+
+
+class TestVoyageEmbeddingProvider:
+    """Unit tests for VoyageEmbeddingProvider."""
+
+    def test_name_includes_model_dimension_dtype_and_endpoint(self):
+        provider = VoyageEmbeddingProvider(
+            api_key="k",
+            base_url="https://api.voyageai.com/v1/",
+            model="voyage-code-3",
+            output_dimension=1024,
+            output_dtype="float",
+        )
+
+        assert (
+            provider.name
+            == "voyage:voyage-code-3:dim1024:float@https://api.voyageai.com/v1"
+        )
+
+    def test_default_dimension_before_call(self):
+        provider = VoyageEmbeddingProvider(api_key="k")
+        assert provider.dimension == 1024
+
+    def test_embed_calls_api_with_document_input_type(self):
+        provider = VoyageEmbeddingProvider(api_key="secret-key")
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_make_voyage_response([[0.1] * 1024, [0.2] * 1024]),
+        ) as mock_urlopen:
+            result = provider.embed(["hello", "world"])
+
+        assert len(result) == 2
+        assert len(result[0]) == 1024
+
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["model"] == "voyage-code-3"
+        assert payload["input"] == ["hello", "world"]
+        assert payload["input_type"] == "document"
+        assert payload["output_dimension"] == 1024
+        assert payload["output_dtype"] == "float"
+        assert req.headers["Authorization"] == "Bearer secret-key"
+        assert req.full_url == "https://api.voyageai.com/v1/embeddings"
+
+    def test_embed_query_calls_api_with_query_input_type(self):
+        provider = VoyageEmbeddingProvider(api_key="k")
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_make_voyage_response([[0.5] * 1024]),
+        ) as mock_urlopen:
+            result = provider.embed_query("search term")
+
+        assert len(result) == 1024
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode("utf-8"))
+        assert payload["input_type"] == "query"
+
+    def test_custom_output_dimension_and_dtype_forwarded(self):
+        provider = VoyageEmbeddingProvider(
+            api_key="k",
+            model="voyage-code-3",
+            output_dimension=512,
+            output_dtype="float",
+        )
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_make_voyage_response([[0.1] * 512]),
+        ) as mock_urlopen:
+            provider.embed_query("x")
+
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode("utf-8"))
+        assert payload["output_dimension"] == 512
+        assert provider.dimension == 512
+
+    def test_response_without_index_field_falls_back_to_server_order(self):
+        provider = VoyageEmbeddingProvider(api_key="k")
+        body = json.dumps({
+            "data": [
+                {"embedding": [1.0]},
+                {"embedding": [2.0]},
+            ],
+        }).encode("utf-8")
+        mock = MagicMock()
+        mock.read.return_value = body
+        mock.__enter__ = MagicMock(return_value=mock)
+        mock.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock):
+            assert provider.embed(["a", "b"]) == [[1.0], [2.0]]
+
+    def test_response_length_mismatch_raises(self):
+        provider = VoyageEmbeddingProvider(api_key="k")
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_make_voyage_response([[0.1]]),
+        ):
+            with pytest.raises(RuntimeError, match="refusing to misalign"):
+                provider.embed(["a", "b"])
+
+
+class TestGetProviderVoyage:
+    """Tests for get_provider() with Voyage."""
+
+    def test_get_provider_voyage_with_key(self):
+        env = {
+            "VOYAGE_API_KEY": "test-key",
+            "CRG_ACCEPT_CLOUD_EMBEDDINGS": "1",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            provider = get_provider("voyage")
+
+        assert isinstance(provider, VoyageEmbeddingProvider)
+        assert provider.name == (
+            "voyage:voyage-code-3:dim1024:float@https://api.voyageai.com/v1"
+        )
+
+    def test_get_provider_voyage_without_key_raises(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(ValueError, match="VOYAGE_API_KEY"):
+                get_provider("voyage")
+
+    def test_get_provider_voyage_respects_env_configuration(self):
+        env = {
+            "VOYAGE_API_KEY": "test-key",
+            "CRG_VOYAGE_MODEL": "voyage-code-3",
+            "CRG_VOYAGE_BASE_URL": "https://voyage.example.test/v1",
+            "CRG_VOYAGE_OUTPUT_DIMENSION": "512",
+            "CRG_VOYAGE_OUTPUT_DTYPE": "float",
+            "CRG_ACCEPT_CLOUD_EMBEDDINGS": "1",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            provider = get_provider("voyage")
+
+        assert isinstance(provider, VoyageEmbeddingProvider)
+        assert provider.name == (
+            "voyage:voyage-code-3:dim512:float@https://voyage.example.test/v1"
+        )
 
 
 class TestEmbeddingStoreContextManager:
