@@ -405,13 +405,16 @@ def query_graph(
                             add_result(caller_result, e)
 
         elif pattern == "references_to":
-            seen_sources: set[str] = set()
+            seen_reference_sources: set[str] = set()
             for e in store.iter_edges_by_target(qn):
-                if e.kind != "REFERENCES" or e.source_qualified in seen_sources:
+                if (
+                    e.kind != "REFERENCES"
+                    or e.source_qualified in seen_reference_sources
+                ):
                     continue
                 source = store.get_node(e.source_qualified)
                 if source:
-                    seen_sources.add(e.source_qualified)
+                    seen_reference_sources.add(e.source_qualified)
                     add_result(node_to_dict(source), e)
 
         elif pattern == "callees_of":
