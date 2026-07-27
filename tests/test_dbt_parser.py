@@ -60,8 +60,21 @@ class TestDbtModelParsing:
         imports = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
         assert imports == {
             "stg_orders",            # ref('stg_orders')
-            "dim_customers",         # ref('package', 'model') → model
+            "analytics_utils.dim_customers",  # ref('package', 'model')
             "core_db.payments",      # source() stays qualified
+        }
+
+    def test_package_qualified_refs_do_not_collide(self):
+        _, edges = self.parser.parse_bytes(
+            Path("models/package_refs.sql"),
+            b"select * from {{ ref('finance', 'dim_customers') }}\n"
+            b"union all\n"
+            b"select * from {{ ref('marketing', 'dim_customers') }}\n",
+        )
+        imports = {e.target for e in edges if e.kind == "IMPORTS_FROM"}
+        assert imports == {
+            "finance.dim_customers",
+            "marketing.dim_customers",
         }
 
     def test_cte_names_are_not_dependency_edges(self):
@@ -94,6 +107,11 @@ class TestDbtModelParsing:
 
 
 def test_full_build_links_dbt_models_by_ref(tmp_path: Path) -> None:
+    (tmp_path / "dbt_project.yml").write_text(
+        "name: analytics\n"
+        "config-version: 2\n",
+        encoding="utf-8",
+    )
     models = tmp_path / "models"
     models.mkdir()
     (models / "stg_orders.sql").write_text(
@@ -123,5 +141,47 @@ def test_full_build_links_dbt_models_by_ref(tmp_path: Path) -> None:
         }
         assert "stg_orders" in targets
         assert "orders" not in targets  # CTE name must not leak in
+    finally:
+        store.close()
+
+
+def test_full_build_includes_dbt_model_without_jinja_dependencies(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "dbt_project.yml").write_text(
+        "name: analytics\n"
+        "config-version: 2\n"
+        "model-paths: [warehouse_models]\n",
+        encoding="utf-8",
+    )
+    models = tmp_path / "warehouse_models"
+    models.mkdir()
+    base_model = models / "base_orders.sql"
+    base_model.write_text(
+        "select * from raw.orders\n",
+        encoding="utf-8",
+    )
+    outside_model_paths = tmp_path / "report.sql"
+    outside_model_paths.write_text(
+        "select * from {{ ref('base_orders') }}\n",
+        encoding="utf-8",
+    )
+
+    store = GraphStore(tmp_path / ".code-review-graph" / "graph.db")
+    try:
+        full_build(tmp_path, store)
+
+        base_nodes = store.get_nodes_by_file(str(base_model))
+        assert any(
+            node.name == "base_orders"
+            and node.kind == "Class"
+            and node.extra.get("sql_kind") == "dbt_model"
+            for node in base_nodes
+        )
+        outside_nodes = store.get_nodes_by_file(str(outside_model_paths))
+        assert not any(
+            node.extra.get("sql_kind") == "dbt_model"
+            for node in outside_nodes
+        )
     finally:
         store.close()
