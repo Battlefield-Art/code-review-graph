@@ -34,6 +34,21 @@ from .parser import EdgeInfo, NodeInfo
 
 logger = logging.getLogger(__name__)
 
+# These are the canonical language values stored for the JavaScript ecosystem.
+# JSX files are stored as ``javascript`` and Astro files as ``typescript`` by
+# ``EXTENSION_TO_LANGUAGE``; TSX keeps its own grammar name.
+_JAVASCRIPT_LANGUAGE_FAMILY = ("javascript", "typescript", "tsx")
+_JAVASCRIPT_LANGUAGE_FAMILY_SET = frozenset(_JAVASCRIPT_LANGUAGE_FAMILY)
+
+
+def _compatible_edge_languages(language: str) -> tuple[str, ...]:
+    """Return languages that can safely share unresolved bare edge targets."""
+    normalized = language.casefold()
+    if normalized in _JAVASCRIPT_LANGUAGE_FAMILY_SET:
+        return _JAVASCRIPT_LANGUAGE_FAMILY
+    return (language,)
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -405,7 +420,9 @@ class GraphStore:
             ).fetchall())
         return [self._row_to_edge(row) for row in rows]
 
-    def search_edges_by_target_name(self, name: str, kind: str = "CALLS") -> list[GraphEdge]:
+    def search_edges_by_target_name(
+        self, name: str, kind: str = "CALLS", language: str | None = None,
+    ) -> list[GraphEdge]:
         """Search for edges where target_qualified matches an unqualified name.
 
         CALLS edges often store unqualified target names (e.g. ``generateTestCode``)
@@ -413,17 +430,36 @@ class GraphStore:
         method finds those edges by exact match on the plain function name so that
         reverse call tracing (callers_of) works even when qualified-name lookup
         returns nothing.
+
+        When ``language`` is given, only edges whose source node has a compatible
+        language are returned. JavaScript, TypeScript, and TSX form one family
+        because calls and inheritance routinely cross those source types (JSX is
+        stored as JavaScript; Astro as TypeScript). Other languages require an
+        exact match. Bare names are ambiguous across the whole graph, so without
+        this filter a common method name like ``clone`` can match a same-named
+        method in an unrelated language (#708).
         """
-        return list(self.iter_edges_by_target_name(name, kind=kind))
+        return list(self.iter_edges_by_target_name(name, kind=kind, language=language))
 
     def iter_edges_by_target_name(
-        self, name: str, kind: str = "CALLS",
+        self, name: str, kind: str = "CALLS", language: str | None = None,
     ) -> Iterator[GraphEdge]:
         """Yield exact bare-target edges without materializing all matches."""
-        rows = self._conn.execute(
-            "SELECT * FROM edges WHERE target_qualified = ? AND kind = ?",
-            (name, kind),
-        )
+        if language:
+            languages = _compatible_edge_languages(language)
+            placeholders = ", ".join("?" for _ in languages)
+            rows = self._conn.execute(
+                "SELECT edges.* FROM edges "
+                "JOIN nodes ON nodes.qualified_name = edges.source_qualified "
+                "WHERE edges.target_qualified = ? AND edges.kind = ? "
+                f"AND nodes.language IN ({placeholders})",
+                (name, kind, *languages),
+            )
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM edges WHERE target_qualified = ? AND kind = ?",
+                (name, kind),
+            )
         for row in rows:
             yield self._row_to_edge(row)
 

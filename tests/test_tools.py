@@ -183,6 +183,57 @@ class TestTools:
         assert len(edges) == 1
         assert edges[0].source_qualified == "/repo/main.py::process"
 
+    def test_search_edges_by_target_name_uses_javascript_language_family(self):
+        """JS-family filtering keeps JS/JSX/TS/TSX/Astro callers, not Apex."""
+        callers = (
+            ("/repo/caller.js", "javascript"),
+            ("/repo/caller.jsx", "javascript"),
+            ("/repo/caller.ts", "typescript"),
+            ("/repo/caller.tsx", "tsx"),
+            ("/repo/caller.astro", "typescript"),
+            ("/repo/Caller.cls", "apex"),
+        )
+        for file_path, language in callers:
+            source = f"{file_path}::invoke"
+            self.store.upsert_node(NodeInfo(
+                kind="Function",
+                name="invoke",
+                file_path=file_path,
+                line_start=1,
+                line_end=3,
+                language=language,
+            ))
+            self.store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=source,
+                target="sharedHelper",
+                file_path=file_path,
+                line=2,
+            ))
+        self.store.commit()
+
+        expected_sources = {
+            "/repo/caller.js::invoke",
+            "/repo/caller.jsx::invoke",
+            "/repo/caller.ts::invoke",
+            "/repo/caller.tsx::invoke",
+            "/repo/caller.astro::invoke",
+        }
+        for target_language in ("javascript", "typescript", "tsx"):
+            edges = self.store.search_edges_by_target_name(
+                "sharedHelper",
+                language=target_language,
+            )
+            assert {edge.source_qualified for edge in edges} == expected_sources
+
+        apex_edges = self.store.search_edges_by_target_name(
+            "sharedHelper",
+            language="apex",
+        )
+        assert {edge.source_qualified for edge in apex_edges} == {
+            "/repo/Caller.cls::invoke",
+        }
+
 
 class TestQueryGraphCallTargetFallbacks:
     """Regression tests for mixed qualified and bare CALLS targets."""
@@ -287,6 +338,109 @@ class TestQueryGraphCallTargetFallbacks:
         assert edge_targets == {
             f"{self.dispatch_file}::resolved_helper",
             "external_helper",
+        }
+
+    def test_callers_of_bare_fallback_uses_js_family_without_crossing_to_apex(self):
+        """Regression for #708: JS-family callers match, unrelated Apex does not."""
+        js_file = str(self.root / "clone.js")
+        tsx_file = str(self.root / "caller.tsx")
+        apex_file = str(self.root / "Clone.cls")
+        with GraphStore(self.db_path) as store:
+            store.upsert_node(NodeInfo(
+                kind="Function", name="clone", file_path=js_file,
+                line_start=1, line_end=3, language="javascript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="tsxCaller", file_path=tsx_file,
+                line_start=1, line_end=5, language="tsx",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="apexCaller", file_path=apex_file,
+                line_start=1, line_end=5, language="apex",
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{tsx_file}::tsxCaller",
+                target="clone",
+                file_path=tsx_file,
+                line=3,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{apex_file}::apexCaller",
+                target="clone",
+                file_path=apex_file,
+                line=3,
+            ))
+            store.commit()
+
+        result = query_graph(
+            pattern="callers_of",
+            target=f"{js_file}::clone",
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        names = {r["name"] for r in result["results"]}
+        assert "tsxCaller" in names
+        assert "apexCaller" not in names
+
+    def test_inheritors_of_bare_fallback_uses_js_family_without_apex(self):
+        """Bare INHERITS/IMPLEMENTS edges stay inside the JS language family."""
+        base_file = str(self.root / "base.js")
+        ts_file = str(self.root / "child.ts")
+        jsx_file = str(self.root / "implementer.jsx")
+        apex_file = str(self.root / "Child.cls")
+        with GraphStore(self.db_path) as store:
+            store.upsert_node(NodeInfo(
+                kind="Class", name="BaseWidget", file_path=base_file,
+                line_start=1, line_end=8, language="javascript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Class", name="TsChild", file_path=ts_file,
+                line_start=1, line_end=8, language="typescript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Class", name="JsxImplementer", file_path=jsx_file,
+                line_start=1, line_end=8, language="javascript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Class", name="ApexChild", file_path=apex_file,
+                line_start=1, line_end=8, language="apex",
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="INHERITS",
+                source=f"{ts_file}::TsChild",
+                target="BaseWidget",
+                file_path=ts_file,
+                line=1,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="IMPLEMENTS",
+                source=f"{jsx_file}::JsxImplementer",
+                target="BaseWidget",
+                file_path=jsx_file,
+                line=1,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="INHERITS",
+                source=f"{apex_file}::ApexChild",
+                target="BaseWidget",
+                file_path=apex_file,
+                line=1,
+            ))
+            store.commit()
+
+        result = query_graph(
+            pattern="inheritors_of",
+            target=f"{base_file}::BaseWidget",
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        assert {item["name"] for item in result["results"]} == {
+            "TsChild",
+            "JsxImplementer",
         }
 
 
