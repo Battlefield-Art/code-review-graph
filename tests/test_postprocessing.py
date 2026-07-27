@@ -386,6 +386,84 @@ class TestToolBuildUsesSharedPipeline:
         finally:
             store.close()
 
+    def test_initial_ambiguous_python_import_has_no_claimed_caller(self, tmp_path):
+        """A graph first built with duplicate module suffixes must stay ambiguous."""
+        from code_review_graph.tools.query import query_graph
+
+        production_files = []
+        for package in ("a", "b"):
+            runner = (
+                tmp_path
+                / "packages"
+                / package
+                / "src"
+                / "mypkg"
+                / "runner.py"
+            )
+            runner.parent.mkdir(parents=True)
+            runner.write_text(
+                "def render_thing(code: str) -> str:\n"
+                "    return code.upper()\n"
+            )
+            production_files.append(runner)
+
+        test_file = tmp_path / "tests" / "test_runner.py"
+        test_file.parent.mkdir()
+        test_file.write_text(
+            "from mypkg.runner import render_thing\n\n"
+            "def test_pipeline():\n"
+            "    assert render_thing('bc') == 'BC'\n"
+        )
+        (tmp_path / ".git").mkdir()
+        graph_dir = tmp_path / ".code-review-graph"
+        graph_dir.mkdir()
+        tracked = [
+            *(str(path.relative_to(tmp_path)) for path in production_files),
+            "tests/test_runner.py",
+        ]
+
+        store = GraphStore(graph_dir / "graph.db")
+        try:
+            with patch(
+                "code_review_graph.incremental.get_all_tracked_files",
+                return_value=tracked,
+            ):
+                result = full_build(tmp_path, store)
+            assert result["python_resolution"]["imports_ambiguous"] == 1
+            run_post_processing(store)
+
+            import_edge = store._conn.execute(
+                "SELECT target_qualified, extra FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                (str(test_file),),
+            ).fetchone()
+            assert import_edge["target_qualified"] == "mypkg.runner"
+            assert '"import_resolution": "ambiguous"' in import_edge["extra"]
+
+            endpoint_edges = store._conn.execute(
+                "SELECT kind, extra FROM edges "
+                "WHERE kind IN ('CALLS', 'TESTED_BY') AND file_path = ?",
+                (str(test_file),),
+            ).fetchall()
+            assert {row["kind"] for row in endpoint_edges} == {
+                "CALLS",
+                "TESTED_BY",
+            }
+            assert all(
+                '"ambiguous_target_count": 2' in row["extra"]
+                for row in endpoint_edges
+            )
+
+            for runner in production_files:
+                callers = query_graph(
+                    pattern="callers_of",
+                    target=f"{runner}::render_thing",
+                    repo_root=str(tmp_path),
+                )
+                assert callers["results"] == []
+        finally:
+            store.close()
+
 
 class TestWatchCallbackIntegration:
     def test_watch_accepts_callback_parameter(self):

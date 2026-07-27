@@ -960,13 +960,35 @@ class GraphStore:
 
         # call-site file -> explicitly imported files
         import_targets: dict[str, set[str]] = {}
+        # Python's repository-suffix resolver keeps a raw import when multiple
+        # indexed modules match and records the candidate files in edge metadata.
+        # Carry that evidence into bare CALLS / TESTED_BY endpoints so a graph
+        # first built in the ambiguous state cannot fall back to a name-only
+        # caller match for every candidate.
+        ambiguous_import_targets: dict[str, set[str]] = {}
         for row in conn.execute(
-            "SELECT DISTINCT file_path, target_qualified FROM edges "
+            "SELECT DISTINCT file_path, target_qualified, extra FROM edges "
             "WHERE kind = 'IMPORTS_FROM'"
         ).fetchall():
             target = row["target_qualified"]
             target_file = target.split("::", 1)[0] if "::" in target else target
             import_targets.setdefault(row["file_path"], set()).add(target_file)
+            try:
+                import_extra = json.loads(row["extra"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                import_extra = {}
+            if (
+                isinstance(import_extra, dict)
+                and import_extra.get("import_resolution") == "ambiguous"
+                and isinstance(import_extra.get("import_candidates"), list)
+            ):
+                ambiguous_import_targets.setdefault(
+                    row["file_path"], set(),
+                ).update(
+                    candidate
+                    for candidate in import_extra["import_candidates"]
+                    if isinstance(candidate, str)
+                )
 
         resolved = 0
         changed = False
@@ -995,8 +1017,19 @@ class GraphStore:
                 for qualified, candidate_file in candidates
                 if candidate_file == context_file or candidate_file in imported_files
             ]
+            ambiguous_files = ambiguous_import_targets.get(context_file, set())
+            ambiguity_supported = [
+                qualified
+                for qualified, candidate_file in candidates
+                if candidate_file in ambiguous_files
+            ]
             managed = raw_key in edge_extra
-            if len(supported) != 1 and not managed and len(supported) < 2:
+            if (
+                len(supported) != 1
+                and not managed
+                and len(supported) < 2
+                and not ambiguity_supported
+            ):
                 continue
             desired_extra = dict(edge_extra)
             desired_extra[raw_key] = bare_name
@@ -1017,6 +1050,18 @@ class GraphStore:
                     resolution = "ambiguous"
                     resolution_candidates = supported
                     other = "unresolved"
+                elif ambiguity_supported:
+                    resolution = (
+                        "ambiguous"
+                        if len(ambiguity_supported) > 1
+                        else "unresolved"
+                    )
+                    resolution_candidates = ambiguity_supported
+                    other = (
+                        "unresolved"
+                        if resolution == "ambiguous"
+                        else "ambiguous"
+                    )
                 else:
                     resolution = "unresolved"
                     resolution_candidates = [
