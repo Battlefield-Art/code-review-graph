@@ -8467,15 +8467,17 @@ class CodeParser:
         # runtime scope, not to the module-level object namespace.  Without
         # lexical scope in the member name, identical assignments in sibling
         # functions would both become ``file::obj.method`` and produce
-        # duplicate CONTAINS targets.  Restrict this feature to module/class
-        # contexts, where the member path is a stable definition identity.
-        if enclosing_func:
+        # duplicate CONTAINS targets. Top-level lexical blocks have the same
+        # problem, so only direct program statements have a stable identity.
+        if (
+            enclosing_func
+            or child.parent is None
+            or child.parent.type != "program"
+        ):
             return False
 
-        member_name = left.text.decode("utf-8", errors="replace")
-        # Skip computed access (``obj[key] = fn``) and any multi-line/odd
-        # member paths that would produce a malformed qualified name.
-        if not member_name or "[" in member_name or "\n" in member_name:
+        member_name = self._get_js_static_member_path(left)
+        if member_name is None:
             return False
 
         is_test = _is_test_function(member_name, file_path)
@@ -8519,6 +8521,36 @@ class CodeParser:
             _depth=_depth + 1,
         )
         return True
+
+    @staticmethod
+    def _get_js_static_member_path(node) -> Optional[str]:
+        """Return a stable identifier-only JS/TS member path."""
+        if node.type != "member_expression":
+            return None
+        text = node.text.decode("utf-8", errors="replace")
+        if not text or "[" in text or "\n" in text:
+            return None
+
+        parts: list[str] = []
+        current = node
+        while current.type == "member_expression":
+            object_node = current.child_by_field_name("object")
+            property_node = current.child_by_field_name("property")
+            if (
+                object_node is None
+                or property_node is None
+                or property_node.type not in ("identifier", "property_identifier")
+            ):
+                return None
+            parts.append(
+                property_node.text.decode("utf-8", errors="replace"),
+            )
+            current = object_node
+
+        if current.type not in ("identifier", "this"):
+            return None
+        parts.append(current.text.decode("utf-8", errors="replace"))
+        return ".".join(reversed(parts))
 
     @staticmethod
     def _get_java_annotations(class_node) -> list[str]:
@@ -10474,13 +10506,7 @@ class CodeParser:
             callee = node.children[0]
         if callee is None or callee.type != "member_expression":
             return None
-        member_call = callee.text.decode("utf-8", errors="replace")
-        if not member_call or "[" in member_call or "\n" in member_call:
-            return None
-        # Optional property access has the same static member path as regular
-        # access: ``app?.handle()`` can target ``app.handle = fn`` whenever
-        # the receiver is present at runtime.
-        return member_call.replace("?.", ".")
+        return CodeParser._get_js_static_member_path(callee)
 
     def _get_member_call_receiver_method(
         self,

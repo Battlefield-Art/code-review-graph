@@ -2043,6 +2043,54 @@ class TestJsMemberAssignedFunctions:
             for e in edges
         )
 
+    def test_sibling_top_level_blocks_do_not_share_member_identity(self):
+        """Block-local objects must not collapse into one module definition."""
+        path = Path("/test/block_assignments.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"{ const x = {}; x.run = function () {}; }\n"
+            b"{ const x = {}; x.run = function () {}; }\n",
+        )
+        functions = [n for n in nodes if n.kind == "Function"]
+        assert all(n.name != "x.run" for n in functions)
+        assert all(
+            not (e.kind == "CONTAINS" and e.target == f"{path}::x.run")
+            for e in edges
+        )
+
+    def test_dynamic_receiver_assignment_is_not_a_stable_definition(self):
+        """A fresh object returned by a call has no stable member identity."""
+        path = Path("/test/dynamic_assignment.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"factory().handle = function () {};\n",
+        )
+        functions = [n for n in nodes if n.kind == "Function"]
+        assert all(n.name != "factory().handle" for n in functions)
+        assert all(
+            not (
+                e.kind == "CONTAINS"
+                and e.target == f"{path}::factory().handle"
+            )
+            for e in edges
+        )
+
+    def test_dynamic_receiver_call_does_not_resolve_as_static_member(self):
+        """Separate factory calls must not be linked as one member."""
+        path = Path("/test/dynamic_call.js")
+        _, edges = self.parser.parse_bytes(
+            path,
+            b"factory().handle = function () {};\n"
+            b"function start() { factory().handle(); }\n",
+        )
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path}::start"
+        ]
+        assert len(calls) == 2
+        handle_call = next(e for e in calls if e.target == "handle")
+        assert "member_call" not in handle_call.extra
+
     def test_member_function_body_calls_still_attributed(self):
         """Calls inside a member-assigned function attribute to that function."""
         path = Path("/test/application.js")
