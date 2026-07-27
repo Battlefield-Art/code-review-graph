@@ -56,6 +56,16 @@ _SQL_TABLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# dbt model dependencies: {{ ref('model') }}, {{ ref('package', 'model') }}
+# and {{ source('source_name', 'table') }}. String-literal arguments only —
+# dynamic ref() calls cannot be resolved statically.
+_DBT_REF_RE = re.compile(
+    r"\{\{-?\s*(ref|source)\s*\(\s*"
+    r"['\"]([^'\"]+)['\"]"
+    r"(?:\s*,\s*['\"]([^'\"]+)['\"])?"
+    r"\s*\)",
+)
+
 _PYTHON_STAR_CACHE_MAX = 15_000
 _PYTHON_STAR_EXPORT_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
 _PYTHON_STAR_EXPORT_CACHE_LOCK = threading.RLock()
@@ -2318,6 +2328,7 @@ class CodeParser:
 
     def __init__(self, repo_root: Optional[Path] = None) -> None:
         self._repo_root = Path(repo_root).resolve() if repo_root is not None else None
+        self._dbt_model_paths_cache: dict[Path, tuple[Path, ...]] = {}
         self._parsers: dict[str, object] = {}
         self._module_file_cache: dict[str, Optional[str]] = {}
         self._export_symbol_cache: dict[str, Optional[str]] = {}
@@ -4082,6 +4093,12 @@ class CodeParser:
 
         Data dependencies (FROM/JOIN table references) are recorded as
         IMPORTS_FROM edges so the impact-radius query can follow them.
+
+        dbt models use a dedicated extraction instead: one Class node per
+        model, named after the file stem, with IMPORTS_FROM edges from the
+        Jinja dependency calls. Within a dbt project, model membership comes
+        from ``model-paths`` in ``dbt_project.yml``; without project context,
+        a ``ref()`` / ``source()`` call remains a best-effort content signal.
         """
         text = source.decode("utf-8", errors="replace")
         file_path_str = str(path)
@@ -4099,6 +4116,19 @@ class CodeParser:
             language="sql",
             is_test=test_file,
         ))
+
+        # --- dbt model pass ---
+        # A dbt model has no DDL (dbt wraps the SELECT at build time), its
+        # dependencies live in Jinja calls the FROM/JOIN regex cannot see,
+        # and the plain-SQL passes below would only pick up CTE names as
+        # phantom IMPORTS_FROM targets. Handle it separately and skip them.
+        dbt_refs = list(_DBT_REF_RE.finditer(text))
+        dbt_model_path = self._is_dbt_model_path(path)
+        if dbt_model_path is True or (dbt_model_path is None and dbt_refs):
+            self._extract_dbt_model(
+                path, text, dbt_refs, file_path_str, test_file, nodes, edges,
+            )
+            return nodes, edges
 
         # --- tree-sitter pass ---
         parser = self._get_parser("sql")
@@ -4148,6 +4178,126 @@ class CodeParser:
                 ))
 
         return nodes, edges
+
+    def _is_dbt_model_path(self, path: Path) -> Optional[bool]:
+        """Return whether *path* belongs to a configured dbt model directory.
+
+        ``None`` means there is no enclosing dbt project in this parser's
+        repository context, so callers may use content sniffing as a fallback.
+        """
+        if self._repo_root is None:
+            return None
+
+        resolved_path = path.resolve()
+        try:
+            resolved_path.relative_to(self._repo_root)
+        except ValueError:
+            return None
+
+        directory = resolved_path.parent
+        while True:
+            project_file = directory / "dbt_project.yml"
+            if project_file.is_file():
+                return any(
+                    resolved_path.is_relative_to(model_path)
+                    for model_path in self._dbt_model_paths(project_file)
+                )
+            if directory == self._repo_root:
+                return None
+            parent = directory.parent
+            if parent == directory or not parent.is_relative_to(self._repo_root):
+                return None
+            directory = parent
+
+    def _dbt_model_paths(self, project_file: Path) -> tuple[Path, ...]:
+        """Read and cache the model directories for one dbt project."""
+        cached = self._dbt_model_paths_cache.get(project_file)
+        if cached is not None:
+            return cached
+
+        configured_paths: object = ["models"]
+        if _yaml is not None:
+            try:
+                config = _yaml.safe_load(project_file.read_text(encoding="utf-8"))
+                if isinstance(config, dict):
+                    configured_paths = config.get("model-paths", ["models"])
+            except (OSError, _yaml.YAMLError):
+                configured_paths = ["models"]
+
+        if isinstance(configured_paths, str):
+            configured_paths = [configured_paths]
+        if not isinstance(configured_paths, list):
+            configured_paths = ["models"]
+
+        model_paths = tuple(
+            (project_file.parent / configured_path).resolve()
+            for configured_path in configured_paths
+            if isinstance(configured_path, str) and configured_path
+        )
+        self._dbt_model_paths_cache[project_file] = model_paths
+        return model_paths
+
+    def _extract_dbt_model(
+        self,
+        path: Path,
+        text: str,
+        dbt_refs: list[re.Match],
+        file_path_str: str,
+        test_file: bool,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Extract a dbt model file: one Class node plus its Jinja deps.
+
+        dbt materializes each model file as a table or view named after the
+        file stem, so the stem is the node name.
+
+        - `{{ ref('m') }}` → IMPORTS_FROM target `m`
+        - `{{ ref('pkg', 'm') }}` → IMPORTS_FROM target `pkg.m`
+        - `{{ source('src', 'tbl') }}` → IMPORTS_FROM target `src.tbl`
+          (kept qualified: sources are external tables, not project models,
+          so the target must not collide with a model node of the same name)
+        """
+        model_name = path.stem
+        qualified = f"{file_path_str}::{model_name}"
+        nodes.append(NodeInfo(
+            kind="Class",
+            name=model_name,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=text.count("\n") + 1,
+            language="sql",
+            is_test=test_file,
+            extra={"sql_kind": "dbt_model"},
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=file_path_str,
+            target=qualified,
+            file_path=file_path_str,
+            line=1,
+        ))
+
+        seen_targets: set[str] = set()
+        for m in dbt_refs:
+            func, first_arg, second_arg = m.group(1), m.group(2), m.group(3)
+            if func == "source":
+                if second_arg is None:
+                    continue  # source() requires two args; malformed call
+                target = f"{first_arg}.{second_arg}"
+            elif second_arg is not None:
+                target = f"{first_arg}.{second_arg}"
+            else:
+                target = first_arg
+            if target and target != model_name and target not in seen_targets:
+                seen_targets.add(target)
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path_str,
+                    target=target,
+                    file_path=file_path_str,
+                    line=text[: m.start()].count("\n") + 1,
+                ))
 
     def _walk_sql_tree(
         self,
