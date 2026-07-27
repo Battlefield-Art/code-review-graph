@@ -131,6 +131,17 @@ def _run_hcl_resolver(store: GraphStore) -> Optional[dict]:
         logger.warning("Terraform/HCL resolver failed: %s", exc)
         return None
 
+
+def _run_scoped_resolver(store: GraphStore) -> Optional[dict]:
+    """Resolve static/scoped ``Class::method`` calls without failing a build."""
+    try:
+        from .scoped_resolver import resolve_scoped_calls
+        return resolve_scoped_calls(store)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Scoped call resolver failed: %s", exc)
+        return None
+
+
 # Default ignore patterns (in addition to .gitignore).
 #
 # ``**/<dir>/**`` patterns are safe-anywhere directory exclusions.  A leading
@@ -302,7 +313,7 @@ def _write_data_dir_gitignore(data_dir: Path) -> None:
             pass
 
 
-def get_data_dir(repo_root: Path) -> Path:
+def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
     """Return the directory where this project's graph data lives.
 
     Resolution priority:
@@ -315,19 +326,25 @@ def get_data_dir(repo_root: Path) -> Path:
     instead — letting you keep graphs outside the working tree (useful
     for ephemeral workspaces, Docker volumes, or shared caches). See: #155
 
-    The directory is created if it does not already exist; an inner
-    ``.gitignore`` (with ``*``) is written so any accidentally-nested
-    files never get committed. Both are idempotent.
+    By default the directory is created if it does not already exist; an
+    inner ``.gitignore`` (with ``*``) is written so any accidentally-nested
+    files never get committed. Both are idempotent. Pass ``create=False``
+    when resolving the path for a read-only existence check.
     """
     # Check registry first
     try:
-        from .registry import Registry
-        registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
-        if registry_data_dir:
-            data_dir = Path(registry_data_dir).resolve()
-            data_dir.mkdir(parents=True, exist_ok=True)
-            _write_data_dir_gitignore(data_dir)
-            return data_dir
+        from .registry import Registry, default_registry_path
+
+        # Registry construction creates its parent directory. A read-only
+        # lookup must skip it entirely when no registry file exists.
+        if create or default_registry_path().is_file():
+            registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
+            if registry_data_dir:
+                data_dir = Path(registry_data_dir).resolve()
+                if create:
+                    data_dir.mkdir(parents=True, exist_ok=True)
+                    _write_data_dir_gitignore(data_dir)
+                return data_dir
     except Exception as exc:
         # If registry lookup fails, log and fall through to other methods
         logger.debug("Registry lookup failed for %s: %s", repo_root, exc)
@@ -339,21 +356,27 @@ def get_data_dir(repo_root: Path) -> Path:
     else:
         data_dir = repo_root / ".code-review-graph"
 
-    data_dir.mkdir(parents=True, exist_ok=True)
-    _write_data_dir_gitignore(data_dir)
+    if create:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _write_data_dir_gitignore(data_dir)
 
     return data_dir
 
 
-def get_db_path(repo_root: Path) -> Path:
+def get_db_path(repo_root: Path, *, read_only: bool = False) -> Path:
     """Determine the database path for a repository.
 
     Respects ``CRG_DATA_DIR`` (see :func:`get_data_dir`). Migrates a
     legacy top-level ``.code-review-graph.db`` file into the new
-    directory when it exists (WAL/SHM side-files are discarded).
+    directory when it exists (WAL/SHM side-files are discarded). Pass
+    ``read_only=True`` to resolve the current path without creating a data
+    directory, migrating a legacy database, or deleting side-files.
     """
-    crg_dir = get_data_dir(repo_root)
+    crg_dir = get_data_dir(repo_root, create=not read_only)
     new_db = crg_dir / "graph.db"
+
+    if read_only:
+        return new_db
 
     # Migrate legacy database if present (only meaningful when the
     # legacy file sits at the repo root — if CRG_DATA_DIR is set we
@@ -543,9 +566,29 @@ _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
 
 
-def _decode_nul_paths(output: bytes) -> list[str]:
-    """Decode Git's NUL-delimited path output without quote mangling."""
-    return [os.fsdecode(path) for path in output.split(b"\0") if path]
+def _decode_name_status_paths(output: bytes) -> list[str]:
+    """Decode ``git diff --name-status -z`` output into a list of paths.
+
+    Renames and copies (``R<score>``/``C<score>`` records) carry two paths —
+    the old and the new one.  Both are emitted so the old path flows through
+    the purge loop in :func:`incremental_update`; otherwise a rename leaves
+    the old path's nodes and edges in the graph and the incremental result
+    diverges from a full rebuild.
+    """
+    fields = [os.fsdecode(f) for f in output.split(b"\0") if f]
+    paths: list[str] = []
+    seen: set[str] = set()
+    i = 0
+    while i < len(fields):
+        status = fields[i]
+        takes_two = status[:1] in ("R", "C")
+        entry = fields[i + 1 : i + (3 if takes_two else 2)]
+        i += 3 if takes_two else 2
+        for path in entry:
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return paths
 
 
 def _store_vcs_metadata(repo_root: Path, store: "GraphStore") -> None:
@@ -580,8 +623,10 @@ def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
         logger.warning("Invalid git ref rejected: %s", base)
         return []
     try:
+        # --name-status (not --name-only): renames/copies must report BOTH
+        # paths, or the old path never reaches the purge loop (issue #684).
         result = subprocess.run(
-            ["git", "diff", "--name-only", "-z", base, "--"],
+            ["git", "diff", "--name-status", "-z", base, "--"],
             capture_output=True,
             cwd=str(repo_root),
             timeout=_GIT_TIMEOUT,
@@ -590,7 +635,7 @@ def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
         if result.returncode != 0:
             # Fallback: try diff against empty tree (initial commit)
             result = subprocess.run(
-                ["git", "diff", "--name-only", "-z", "--cached"],
+                ["git", "diff", "--name-status", "-z", "--cached"],
                 capture_output=True,
                 cwd=str(repo_root),
                 timeout=_GIT_TIMEOUT,
@@ -599,7 +644,7 @@ def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
         if result.returncode != 0:
             logger.warning("git diff failed while discovering changed files")
             return []
-        return _decode_nul_paths(result.stdout)
+        return _decode_name_status_paths(result.stdout)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
 
@@ -1009,6 +1054,7 @@ def full_build(
     spring_event_stats = _run_spring_event_resolver(store)
     temporal_stats = _run_temporal_resolver(store)
     hcl_stats = _run_hcl_resolver(store)
+    scoped_stats = _run_scoped_resolver(store)
 
     return {
         "files_parsed": len(files),
@@ -1020,6 +1066,7 @@ def full_build(
         "event_resolution": spring_event_stats,
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
+        "scoped_resolution": scoped_stats,
     }
 
 
@@ -1178,6 +1225,8 @@ def incremental_update(
     temporal_stats = _run_temporal_resolver(store) if spring_changed else None
     hcl_changed = any(rp.endswith((".tf", ".hcl")) for rp in all_files)
     hcl_stats = _run_hcl_resolver(store) if hcl_changed else None
+    scoped_changed = any(rp.endswith((".php", ".rs")) for rp in all_files)
+    scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
 
     return {
         "files_updated": len(all_files),
@@ -1191,6 +1240,7 @@ def incremental_update(
         "event_resolution": spring_event_stats,
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
+        "scoped_resolution": scoped_stats,
     }
 
 
