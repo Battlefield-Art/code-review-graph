@@ -18,6 +18,8 @@
 
 ### Fixed
 
+- GitHub Copilot auto-detection now requires the Copilot extension and also
+  recognizes the extension bundled with released VS Code installations.
 - Added a post-index Python import resolver using unique module suffixes, so
   `src/` layouts produce canonical `CALLS` and `TESTED_BY` edges while duplicate
   package candidates remain explicitly unresolved (#720).
