@@ -1804,6 +1804,109 @@ class TestGetMinimalContext:
         assert "summary" in result
         assert "next_tool_suggestions" in result
 
+    def test_missing_graph_returns_not_ready_without_creating_database(self, tmp_path):
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "cold-worktree"
+        repo.mkdir()
+        # Linked worktrees use a .git pointer file instead of a directory.
+        (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
+        db_path = repo / ".code-review-graph" / "graph.db"
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert result["next_tool_suggestions"] == ["build_or_update_graph"]
+        assert not db_path.exists()
+        assert not db_path.parent.exists()
+
+    def test_mcp_wrapper_reports_missing_graph_without_creating_state(self, tmp_path):
+        from code_review_graph.main import get_minimal_context_tool
+
+        repo = tmp_path / "cold-worktree"
+        repo.mkdir()
+        (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
+
+        result = get_minimal_context_tool(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert not (repo / ".code-review-graph").exists()
+
+    def test_missing_graph_does_not_create_external_data_dir(self, tmp_path, monkeypatch):
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        external_data = tmp_path / "external-data"
+        monkeypatch.setenv("CRG_DATA_DIR", str(external_data))
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert not external_data.exists()
+
+    def test_missing_registered_graph_does_not_create_registered_data_dir(
+        self, tmp_path, monkeypatch,
+    ):
+        import json
+
+        import code_review_graph.registry as registry_module
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        external_data = tmp_path / "registered-data"
+        registry_path = tmp_path / "registry" / "registry.json"
+        registry_path.parent.mkdir()
+        registry_path.write_text(json.dumps({
+            "repos": [{"path": str(repo.resolve()), "data_dir": str(external_data)}],
+        }))
+        monkeypatch.setattr(registry_module, "_REGISTRY_PATH", registry_path)
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert not external_data.exists()
+
+    def test_empty_graph_returns_not_ready(self, tmp_path):
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "empty-graph"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        graph_dir = repo / ".code-review-graph"
+        graph_dir.mkdir()
+        store = GraphStore(graph_dir / "graph.db")
+        store.close()
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "empty_graph"
+        assert result["next_tool_suggestions"] == ["build_or_update_graph"]
+
+    def test_graph_built_at_another_commit_returns_not_ready(self, monkeypatch):
+        from code_review_graph.tools.context import get_minimal_context
+
+        db_path = self.root / ".code-review-graph" / "graph.db"
+        store = GraphStore(db_path)
+        store.set_metadata("git_head_sha", "built-sha")
+        store.commit()
+        store.close()
+        monkeypatch.setattr(common_module, "_read_live_git_head", lambda _root: "live-sha")
+
+        result = get_minimal_context(repo_root=str(self.root))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "stale_graph"
+        assert result["next_tool_suggestions"] == ["build_or_update_graph"]
+
     def test_output_is_compact(self):
         import json
 
@@ -1991,6 +2094,7 @@ class TestGraphProvenance:
         repo.mkdir()
         (repo / ".git").mkdir()
         assert common_module.graph_provenance(str(repo)) is None
+        assert not (repo / ".code-review-graph").exists()
 
     def test_corrupt_graph_database_has_no_envelope(self, tmp_path):
         repo = tmp_path / "repo"
