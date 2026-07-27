@@ -194,7 +194,9 @@ def get_minimal_context_tool(
 
     Returns graph stats, risk score, top communities/flows, and suggested
     next tools in a single compact response. Use this as the entry point
-    before any other graph tool to minimize token usage.
+    before any other graph tool to minimize token usage. Returns
+    ``status: not_ready`` with a build suggestion when the graph is missing,
+    empty, or known to have been built at a different Git commit.
 
     Args:
         task: What you are doing (e.g. "review PR #42", "debug login timeout").

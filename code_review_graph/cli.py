@@ -441,6 +441,30 @@ _GRAPH_TOOL_COMMANDS = {
 }
 
 
+def _find_explicit_repo_root(start: Path) -> "Path | None":
+    """Resolve an explicit --repo for graph-tool commands.
+
+    Walks upward from ``start``, stopping at the nearest directory that
+    contains a ``.code-review-graph``, ``.git``, or ``.svn`` marker. Unlike
+    ``find_repo_root``, a registered subproject (``.code-review-graph``)
+    counts as a boundary, so a monorepo subdirectory built with
+    ``build --repo mono/module`` resolves to the module — not to the
+    monorepo's top-level ``.git`` (#697).
+    """
+    current = start.resolve()
+    if not current.is_dir():
+        return None
+    while True:
+        if any(
+            (current / marker).exists()
+            for marker in (".code-review-graph", ".git", ".svn")
+        ):
+            return current
+        if current == current.parent:
+            return None
+        current = current.parent
+
+
 def _run_graph_tool_command(args, repo_root: Path) -> None:
     """Run one graph-tool CLI wrapper and emit exactly one JSON value."""
     from . import tools
@@ -840,6 +864,28 @@ def main() -> None:
     eval_cmd.add_argument("--all", action="store_true", dest="run_all", help="Run all benchmarks")
     eval_cmd.add_argument("--report", action="store_true", help="Generate report from results")
     eval_cmd.add_argument("--output-dir", default=None, help="Output directory for results")
+    eval_cmd.add_argument(
+        "--embed",
+        action="store_true",
+        help=(
+            "Build the vector index after each graph build. Required by the "
+            "agent_baseline, search_quality and multi_hop_retrieval "
+            "benchmarks: without it their natural-language questions hit "
+            "FTS5 only and return zero results (default: disabled)"
+        ),
+    )
+    eval_cmd.add_argument(
+        "--embed-provider",
+        choices=["local", "openai", "google", "minimax"],
+        default=None,
+        help="Provider for --embed (default: local, needs "
+             "code-review-graph[embeddings])",
+    )
+    eval_cmd.add_argument(
+        "--embed-model",
+        default=None,
+        help="Model for --embed (default: the provider's own default)",
+    )
 
     # detect-changes
     detect_cmd = sub.add_parser(
@@ -1161,8 +1207,22 @@ def main() -> None:
     if args.command in _GRAPH_TOOL_COMMANDS:
         from .incremental import find_project_root, get_db_path
 
-        requested_root = Path(args.repo).expanduser() if args.repo else None
-        repo_root = find_project_root(requested_root)
+        if args.repo:
+            # For an explicit --repo the walk must treat .code-review-graph
+            # as a project boundary too: the plain .git/.svn walk resolves a
+            # registered monorepo subdirectory to the monorepo root and the
+            # graph built at the --repo path is never found (#697). Nearest
+            # marker wins, so pointing inside a repo still works.
+            repo_root = _find_explicit_repo_root(Path(args.repo).expanduser())
+            if repo_root is None:
+                print(
+                    f"--repo does not look like a project root (no .git, .svn, "
+                    f"or .code-review-graph found at or above): {args.repo}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+        else:
+            repo_root = find_project_root()
         db_path = get_db_path(repo_root)
         if not db_path.exists():
             print(
@@ -1262,6 +1322,9 @@ def main() -> None:
                 repos=repos,
                 benchmarks=benchmarks,
                 output_dir=getattr(args, "output_dir", None),
+                embed=getattr(args, "embed", False),
+                embedding_provider=getattr(args, "embed_provider", None),
+                embedding_model=getattr(args, "embed_model", None),
             )
             print(f"\nCompleted {len(results)} benchmark(s).")
             print("Run 'code-review-graph eval --report' to generate tables.")

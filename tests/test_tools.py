@@ -183,6 +183,57 @@ class TestTools:
         assert len(edges) == 1
         assert edges[0].source_qualified == "/repo/main.py::process"
 
+    def test_search_edges_by_target_name_uses_javascript_language_family(self):
+        """JS-family filtering keeps JS/JSX/TS/TSX/Astro callers, not Apex."""
+        callers = (
+            ("/repo/caller.js", "javascript"),
+            ("/repo/caller.jsx", "javascript"),
+            ("/repo/caller.ts", "typescript"),
+            ("/repo/caller.tsx", "tsx"),
+            ("/repo/caller.astro", "typescript"),
+            ("/repo/Caller.cls", "apex"),
+        )
+        for file_path, language in callers:
+            source = f"{file_path}::invoke"
+            self.store.upsert_node(NodeInfo(
+                kind="Function",
+                name="invoke",
+                file_path=file_path,
+                line_start=1,
+                line_end=3,
+                language=language,
+            ))
+            self.store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=source,
+                target="sharedHelper",
+                file_path=file_path,
+                line=2,
+            ))
+        self.store.commit()
+
+        expected_sources = {
+            "/repo/caller.js::invoke",
+            "/repo/caller.jsx::invoke",
+            "/repo/caller.ts::invoke",
+            "/repo/caller.tsx::invoke",
+            "/repo/caller.astro::invoke",
+        }
+        for target_language in ("javascript", "typescript", "tsx"):
+            edges = self.store.search_edges_by_target_name(
+                "sharedHelper",
+                language=target_language,
+            )
+            assert {edge.source_qualified for edge in edges} == expected_sources
+
+        apex_edges = self.store.search_edges_by_target_name(
+            "sharedHelper",
+            language="apex",
+        )
+        assert {edge.source_qualified for edge in apex_edges} == {
+            "/repo/Caller.cls::invoke",
+        }
+
 
 class TestQueryGraphCallTargetFallbacks:
     """Regression tests for mixed qualified and bare CALLS targets."""
@@ -287,6 +338,109 @@ class TestQueryGraphCallTargetFallbacks:
         assert edge_targets == {
             f"{self.dispatch_file}::resolved_helper",
             "external_helper",
+        }
+
+    def test_callers_of_bare_fallback_uses_js_family_without_crossing_to_apex(self):
+        """Regression for #708: JS-family callers match, unrelated Apex does not."""
+        js_file = str(self.root / "clone.js")
+        tsx_file = str(self.root / "caller.tsx")
+        apex_file = str(self.root / "Clone.cls")
+        with GraphStore(self.db_path) as store:
+            store.upsert_node(NodeInfo(
+                kind="Function", name="clone", file_path=js_file,
+                line_start=1, line_end=3, language="javascript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="tsxCaller", file_path=tsx_file,
+                line_start=1, line_end=5, language="tsx",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="apexCaller", file_path=apex_file,
+                line_start=1, line_end=5, language="apex",
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{tsx_file}::tsxCaller",
+                target="clone",
+                file_path=tsx_file,
+                line=3,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{apex_file}::apexCaller",
+                target="clone",
+                file_path=apex_file,
+                line=3,
+            ))
+            store.commit()
+
+        result = query_graph(
+            pattern="callers_of",
+            target=f"{js_file}::clone",
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        names = {r["name"] for r in result["results"]}
+        assert "tsxCaller" in names
+        assert "apexCaller" not in names
+
+    def test_inheritors_of_bare_fallback_uses_js_family_without_apex(self):
+        """Bare INHERITS/IMPLEMENTS edges stay inside the JS language family."""
+        base_file = str(self.root / "base.js")
+        ts_file = str(self.root / "child.ts")
+        jsx_file = str(self.root / "implementer.jsx")
+        apex_file = str(self.root / "Child.cls")
+        with GraphStore(self.db_path) as store:
+            store.upsert_node(NodeInfo(
+                kind="Class", name="BaseWidget", file_path=base_file,
+                line_start=1, line_end=8, language="javascript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Class", name="TsChild", file_path=ts_file,
+                line_start=1, line_end=8, language="typescript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Class", name="JsxImplementer", file_path=jsx_file,
+                line_start=1, line_end=8, language="javascript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Class", name="ApexChild", file_path=apex_file,
+                line_start=1, line_end=8, language="apex",
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="INHERITS",
+                source=f"{ts_file}::TsChild",
+                target="BaseWidget",
+                file_path=ts_file,
+                line=1,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="IMPLEMENTS",
+                source=f"{jsx_file}::JsxImplementer",
+                target="BaseWidget",
+                file_path=jsx_file,
+                line=1,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="INHERITS",
+                source=f"{apex_file}::ApexChild",
+                target="BaseWidget",
+                file_path=apex_file,
+                line=1,
+            ))
+            store.commit()
+
+        result = query_graph(
+            pattern="inheritors_of",
+            target=f"{base_file}::BaseWidget",
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        assert {item["name"] for item in result["results"]} == {
+            "TsChild",
+            "JsxImplementer",
         }
 
 
@@ -1804,6 +1958,108 @@ class TestGetMinimalContext:
         assert "summary" in result
         assert "next_tool_suggestions" in result
 
+    def test_missing_graph_returns_not_ready_without_creating_database(self, tmp_path):
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "cold-worktree"
+        repo.mkdir()
+        # Linked worktrees use a .git pointer file instead of a directory.
+        (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
+        db_path = repo / ".code-review-graph" / "graph.db"
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert result["next_tool_suggestions"] == ["build_or_update_graph"]
+        assert not db_path.exists()
+        assert not db_path.parent.exists()
+
+    def test_mcp_wrapper_reports_missing_graph_without_creating_state(self, tmp_path):
+        from code_review_graph.main import get_minimal_context_tool
+
+        repo = tmp_path / "cold-worktree"
+        repo.mkdir()
+        (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
+
+        result = get_minimal_context_tool(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert not (repo / ".code-review-graph").exists()
+
+    def test_missing_graph_does_not_create_external_data_dir(self, tmp_path, monkeypatch):
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        external_data = tmp_path / "external-data"
+        monkeypatch.setenv("CRG_DATA_DIR", str(external_data))
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert not external_data.exists()
+
+    def test_missing_registered_graph_does_not_create_registered_data_dir(
+        self, tmp_path, monkeypatch,
+    ):
+        import json
+
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        external_data = tmp_path / "registered-data"
+        registry_path = tmp_path / "registry" / "registry.json"
+        registry_path.parent.mkdir()
+        registry_path.write_text(json.dumps({
+            "repos": [{"path": str(repo.resolve()), "data_dir": str(external_data)}],
+        }))
+        monkeypatch.setenv("CRG_HOME", str(registry_path.parent))
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert not external_data.exists()
+
+    def test_empty_graph_returns_not_ready(self, tmp_path):
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "empty-graph"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        graph_dir = repo / ".code-review-graph"
+        graph_dir.mkdir()
+        store = GraphStore(graph_dir / "graph.db")
+        store.close()
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "empty_graph"
+        assert result["next_tool_suggestions"] == ["build_or_update_graph"]
+
+    def test_graph_built_at_another_commit_returns_not_ready(self, monkeypatch):
+        from code_review_graph.tools.context import get_minimal_context
+
+        db_path = self.root / ".code-review-graph" / "graph.db"
+        store = GraphStore(db_path)
+        store.set_metadata("git_head_sha", "built-sha")
+        store.commit()
+        store.close()
+        monkeypatch.setattr(common_module, "_read_live_git_head", lambda _root: "live-sha")
+
+        result = get_minimal_context(repo_root=str(self.root))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "stale_graph"
+        assert result["next_tool_suggestions"] == ["build_or_update_graph"]
+
     def test_output_is_compact(self):
         import json
 
@@ -1991,6 +2247,7 @@ class TestGraphProvenance:
         repo.mkdir()
         (repo / ".git").mkdir()
         assert common_module.graph_provenance(str(repo)) is None
+        assert not (repo / ".code-review-graph").exists()
 
     def test_corrupt_graph_database_has_no_envelope(self, tmp_path):
         repo = tmp_path / "repo"
