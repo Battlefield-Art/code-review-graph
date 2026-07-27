@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _QUERY_PATTERNS = {
     "callers_of": "Find all functions that call a given function",
+    "references_to": "Find all nodes that reference a given symbol",
     "callees_of": "Find all functions called by a given function",
     "imports_of": "Find all imports of a given file or module",
     "importers_of": "Find all files that import a given file or module",
@@ -234,8 +235,8 @@ def query_graph(
     """Run a predefined graph query.
 
     Args:
-        pattern: Query pattern. One of: callers_of, callees_of, imports_of,
-                 importers_of, children_of, tests_for, inheritors_of,
+        pattern: Query pattern. One of: callers_of, references_to, callees_of,
+                 imports_of, importers_of, children_of, tests_for, inheritors_of,
                  triggers_of, triggered_by, publishers_of, listeners_of,
                  handlers_of, endpoints_for, consumers_of, file_summary.
         target: The node name, qualified name, or file path to query about.
@@ -402,6 +403,16 @@ def query_graph(
                             caller_result = node_to_dict(caller)
                             caller_result["target_resolution"] = "unresolved"
                             add_result(caller_result, e)
+
+        elif pattern == "references_to":
+            seen_sources: set[str] = set()
+            for e in store.iter_edges_by_target(qn):
+                if e.kind != "REFERENCES" or e.source_qualified in seen_sources:
+                    continue
+                source = store.get_node(e.source_qualified)
+                if source:
+                    seen_sources.add(e.source_qualified)
+                    add_result(node_to_dict(source), e)
 
         elif pattern == "callees_of":
             seen_targets: set[str] = set()

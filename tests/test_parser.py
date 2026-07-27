@@ -2242,6 +2242,35 @@ class TestTypeScriptTypeDeclarations:
             assert (f"{use}::summarize", f"{types.resolve()}::Finding") in refs
             assert (f"{use}::summarize", f"{types.resolve()}::Verdict") in refs
 
+    def test_aliased_type_import_resolves_to_exported_symbol(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            types, _ = self._project(root)
+            use = root / "aliased.ts"
+            use.write_text(
+                "import type { Finding as ImportedFinding } from './types';\n\n"
+                "export function summarize(item: ImportedFinding): string {\n"
+                "  return item.id;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            _, edges = self.parser.parse_file(use)
+
+            refs = {
+                (edge.source, edge.target)
+                for edge in edges
+                if edge.kind == "REFERENCES"
+            }
+            assert (
+                f"{use}::summarize",
+                f"{types.resolve()}::Finding",
+            ) in refs
+            assert not any(
+                target == f"{types.resolve()}::ImportedFinding"
+                for _, target in refs
+            )
+
     def test_type_argument_inside_a_generic_is_a_reference(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -2358,6 +2387,44 @@ class TestTypeScriptTypeDeclarations:
 
             bare = {e.target.split("::")[-1] for e in edges if e.kind == "REFERENCES"}
             assert "Findable" not in bare
+
+    def test_generic_heritage_does_not_double_emit_a_reference(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            base = root / "base.ts"
+            base.write_text(
+                "export interface Box<T> { value: T }\n"
+                "export interface Payload { value: string }\n",
+                encoding="utf-8",
+            )
+            wrapper = root / "wrapper.ts"
+            wrapper.write_text(
+                "import { Box, Payload } from './base';\n\n"
+                "export class BoxImpl implements Box<Payload> {\n"
+                "  value = { value: 'x' };\n"
+                "}\n\n"
+                "export interface StringBox extends Box<string> {}\n",
+                encoding="utf-8",
+            )
+
+            _, edges = self.parser.parse_file(wrapper)
+
+            inherits = [
+                edge for edge in edges
+                if edge.kind == "INHERITS" and edge.target == "Box"
+            ]
+            references = [
+                edge for edge in edges
+                if edge.kind == "REFERENCES"
+                and edge.target == f"{base.resolve()}::Box"
+            ]
+            assert len(inherits) == 2
+            assert references == []
+            assert any(
+                edge.kind == "REFERENCES"
+                and edge.target == f"{base.resolve()}::Payload"
+                for edge in edges
+            )
 
     def test_tsx_type_positions_are_also_covered(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

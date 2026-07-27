@@ -255,6 +255,7 @@ def query_graph_tool(
 
     Available patterns:
     - callers_of: Find functions that call the target
+    - references_to: Find nodes that reference the target
     - callees_of: Find functions called by the target
     - imports_of: Find what the target imports
     - importers_of: Find files that import the target

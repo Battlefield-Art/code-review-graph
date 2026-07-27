@@ -1238,6 +1238,7 @@ _SPRING_EVENT_LISTENER_ANNOTATIONS = frozenset({"EventListener"})
 _SPRING_EVENT_PUBLISH_METHODS = frozenset({"publishEvent"})
 _JAVA_PACKAGE_KEY = "__crg_java_package__"
 _SPRING_REQUEST_PREFIX_KEY = "__crg_spring_request_prefix__:"
+_JS_IMPORT_ORIGINAL_PREFIX_KEY = "__crg_js_import_original__:"
 _SPRING_REQUEST_MAPPINGS = {
     "DeleteMapping": ("DELETE",),
     "GetMapping": ("GET",),
@@ -5175,7 +5176,7 @@ class CodeParser:
             return None
         if base_type in import_map:
             resolved = self._resolve_imported_symbol(
-                base_type,
+                self._js_imported_symbol_name(base_type, import_map),
                 import_map[base_type],
                 file_path,
                 language,
@@ -11588,9 +11589,22 @@ class CodeParser:
                     and name_node.end_byte == child.end_byte
                 ):
                     return
-            # extends/implements are already covered by INHERITS edges.
-            if parent.type in _TS_HERITAGE_CLAUSES:
-                return
+            # extends/implements are already covered by INHERITS edges. Generic
+            # bases add a ``generic_type`` wrapper, so walk up to the clause.
+            # Do not suppress a separate imported type used as a type argument:
+            # ``extends Base<Dependency>`` inherits Base but references Dependency.
+            ancestor = parent
+            inside_type_arguments = False
+            while ancestor is not None:
+                if ancestor.type == "type_arguments":
+                    inside_type_arguments = True
+                if ancestor.type in _TS_HERITAGE_CLAUSES:
+                    if not inside_type_arguments:
+                        return
+                    break
+                if ancestor.type in _TS_TYPE_DECLARATIONS:
+                    break
+                ancestor = ancestor.parent
 
         # Attribute to the enclosing function, else the enclosing type, else the
         # file — so `interface Wrapper { nested: Verdict }` names Wrapper as the
@@ -13053,6 +13067,8 @@ class CodeParser:
                 for spec in child.children:
                     if spec.type == "import_specifier":
                         # Could be: name or name as alias
+                        imported_node = spec.child_by_field_name("name")
+                        alias_node = spec.child_by_field_name("alias")
                         names = [
                             s.text.decode("utf-8", errors="replace")
                             for s in spec.children
@@ -13060,7 +13076,30 @@ class CodeParser:
                         ]
                         # Last identifier is the local name
                         if names:
-                            import_map[names[-1]] = module
+                            local_name = names[-1]
+                            import_map[local_name] = module
+                            imported_name = (
+                                imported_node.text.decode(
+                                    "utf-8", errors="replace",
+                                )
+                                if imported_node is not None
+                                else names[0]
+                            )
+                            if alias_node is not None and imported_name != local_name:
+                                import_map[
+                                    f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}"
+                                ] = imported_name
+
+    @staticmethod
+    def _js_imported_symbol_name(
+        local_name: str,
+        import_map: dict[str, str],
+    ) -> str:
+        """Return the exported name behind a local JS/TS import alias."""
+        return import_map.get(
+            f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}",
+            local_name,
+        )
 
     def exclude_files(self, paths: set[str]) -> None:
         """Treat these files as absent when resolving imports.
@@ -13718,7 +13757,10 @@ class CodeParser:
             if language == "julia":
                 return import_map[call_name]
             resolved = self._resolve_imported_symbol(
-                call_name, import_map[call_name], file_path, language,
+                self._js_imported_symbol_name(call_name, import_map),
+                import_map[call_name],
+                file_path,
+                language,
             )
             if resolved:
                 return resolved
