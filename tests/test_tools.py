@@ -1854,7 +1854,6 @@ class TestGetMinimalContext:
     ):
         import json
 
-        import code_review_graph.registry as registry_module
         from code_review_graph.tools.context import get_minimal_context
 
         repo = tmp_path / "repo"
@@ -1866,7 +1865,7 @@ class TestGetMinimalContext:
         registry_path.write_text(json.dumps({
             "repos": [{"path": str(repo.resolve()), "data_dir": str(external_data)}],
         }))
-        monkeypatch.setattr(registry_module, "_REGISTRY_PATH", registry_path)
+        monkeypatch.setenv("CRG_HOME", str(registry_path.parent))
 
         result = get_minimal_context(repo_root=str(repo))
 

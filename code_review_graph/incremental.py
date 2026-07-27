@@ -322,11 +322,11 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
     """
     # Check registry first
     try:
-        from .registry import _REGISTRY_PATH, Registry
+        from .registry import Registry, default_registry_path
 
         # Registry construction creates its parent directory. A read-only
         # lookup must skip it entirely when no registry file exists.
-        if create or _REGISTRY_PATH.is_file():
+        if create or default_registry_path().is_file():
             registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
             if registry_data_dir:
                 data_dir = Path(registry_data_dir).resolve()
