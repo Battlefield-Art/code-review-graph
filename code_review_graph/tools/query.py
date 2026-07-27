@@ -312,6 +312,16 @@ def query_graph(
                     if java_candidates is not None
                     else store.search_nodes(target, limit=20)
                 )
+                if pattern == "inheritors_of" and "::" not in target:
+                    exact_type_candidates = [
+                        candidate
+                        for candidate in candidates
+                        if candidate.name == target
+                        and candidate.kind
+                        in {"Class", "Interface", "Type", "Struct", "Enum", "Trait"}
+                    ]
+                    if exact_type_candidates:
+                        candidates = exact_type_candidates
                 if len(candidates) == 1:
                     node = candidates[0]
                     target = node.qualified_name
