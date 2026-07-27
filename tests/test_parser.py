@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import full_build
 from code_review_graph.parser import CodeParser
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -2138,3 +2139,36 @@ class TestJsMemberAssignedFunctions:
         ]
         assert len(calls) == 1
         assert calls[0].target == f"{path}::app.handle"
+
+    def test_member_assignment_survives_full_build_with_resolved_caller(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """The definition and resolved call persist through a real graph build."""
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        source = tmp_path / "application.js"
+        source.write_text(
+            "app.handle = function () { return 1; };\n"
+            "function start() { return app.handle(); }\n",
+            encoding="utf-8",
+        )
+        member_qn = f"{source}::app.handle"
+        caller_qn = f"{source}::start"
+
+        with GraphStore(tmp_path / "graph.db") as store:
+            built = full_build(tmp_path, store)
+            assert built["errors"] == []
+
+            member = store.get_node(member_qn)
+            callers = [
+                edge
+                for edge in store.get_edges_by_target(member_qn)
+                if edge.kind == "CALLS"
+            ]
+
+        assert member is not None
+        assert member.kind == "Function"
+        assert member.name == "app.handle"
+        assert len(callers) == 1
+        assert callers[0].source_qualified == caller_qn
