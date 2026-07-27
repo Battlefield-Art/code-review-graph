@@ -101,6 +101,216 @@ class TestGraphStore:
         assert self.store.get_node("/test/file.py") is None
         assert self.store.get_node("/test/file.py::my_func") is None
 
+    def test_remove_file_permanently_removes_references_and_same_db_embeddings(self):
+        deleted_path = "/test/deleted.py"
+        survivor_path = "/test/survivor.py"
+        deleted_qn = f"{deleted_path}::removed"
+        survivor_qn = f"{survivor_path}::caller"
+        self.store.store_file_nodes_edges(
+            deleted_path,
+            [
+                self._make_file_node(deleted_path),
+                self._make_func_node("removed", deleted_path),
+            ],
+            [],
+        )
+        self.store.store_file_nodes_edges(
+            survivor_path,
+            [
+                self._make_file_node(survivor_path),
+                self._make_func_node("caller", survivor_path),
+            ],
+            [
+                EdgeInfo(
+                    kind="CALLS",
+                    source=survivor_qn,
+                    target=deleted_qn,
+                    file_path=survivor_path,
+                ),
+            ],
+        )
+        self.store._conn.execute(
+            "CREATE TABLE embeddings ("
+            "qualified_name TEXT PRIMARY KEY, vector BLOB NOT NULL, "
+            "text_hash TEXT NOT NULL, provider TEXT NOT NULL)"
+        )
+        self.store._conn.executemany(
+            "INSERT INTO embeddings VALUES (?, ?, ?, ?)",
+            [
+                (deleted_qn, b"deleted", "deleted", "test"),
+                (survivor_qn, b"survivor", "survivor", "test"),
+                ("unrelated::orphan", b"orphan", "orphan", "test"),
+            ],
+        )
+        self.store.commit()
+
+        self.store.remove_file_permanently(deleted_path)
+        self.store.commit()
+
+        assert self.store.get_nodes_by_file(deleted_path) == []
+        assert self.store.get_node(survivor_qn) is not None
+        assert self.store.get_edges_by_source(survivor_qn) == []
+        embeddings = self.store._conn.execute(
+            "SELECT qualified_name FROM embeddings ORDER BY qualified_name"
+        ).fetchall()
+        assert [row["qualified_name"] for row in embeddings] == [
+            survivor_qn,
+            "unrelated::orphan",
+        ]
+
+    def test_remove_file_permanently_handles_more_than_sqlite_variable_limit(self):
+        deleted_path = "/test/large.py"
+        rows = [
+            (
+                "Function",
+                f"node_{index}",
+                f"{deleted_path}::node_{index}",
+                deleted_path,
+                index + 1,
+                index + 1,
+                "python",
+                0,
+                0.0,
+            )
+            for index in range(16_384)
+        ]
+        self.store._conn.executemany(
+            "INSERT INTO nodes "
+            "(kind, name, qualified_name, file_path, line_start, line_end, language, "
+            "is_test, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        self.store.commit()
+
+        changed = self.store.remove_file_permanently(deleted_path)
+
+        assert changed == 1
+        assert self.store.get_nodes_by_file(deleted_path) == []
+
+    def test_remove_files_permanently_rolls_back_every_table_on_failure(self):
+        deleted_path = "/test/deleted.py"
+        survivor_path = "/test/survivor.py"
+        deleted_qn = f"{deleted_path}::removed"
+        survivor_qn = f"{survivor_path}::caller"
+        self.store.store_file_nodes_edges(
+            deleted_path,
+            [self._make_file_node(deleted_path), self._make_func_node("removed", deleted_path)],
+            [
+                EdgeInfo(
+                    kind="CONTAINS",
+                    source=deleted_path,
+                    target=deleted_qn,
+                    file_path=deleted_path,
+                )
+            ],
+        )
+        self.store.store_file_nodes_edges(
+            survivor_path,
+            [self._make_file_node(survivor_path), self._make_func_node("caller", survivor_path)],
+            [
+                EdgeInfo(
+                    kind="CALLS",
+                    source=survivor_qn,
+                    target=deleted_qn,
+                    file_path=survivor_path,
+                )
+            ],
+        )
+        self.store._conn.execute(
+            "CREATE TABLE embeddings (qualified_name TEXT PRIMARY KEY, vector BLOB NOT NULL, "
+            "text_hash TEXT NOT NULL, provider TEXT NOT NULL)"
+        )
+        self.store._conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, ?)",
+            (deleted_qn, b"deleted", "deleted", "test"),
+        )
+        self.store.commit()
+        before = {
+            "nodes": self.store._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
+            "edges": self.store._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+            "embeddings": self.store._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
+        }
+
+        self.store._conn.execute(
+            "CREATE TRIGGER fail_deleted_node BEFORE DELETE ON nodes "
+            f"WHEN OLD.file_path = '{deleted_path}' "
+            "BEGIN SELECT RAISE(ABORT, 'injected deletion failure'); END"
+        )
+        self.store.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="injected deletion failure"):
+            self.store.remove_files_permanently([deleted_path])
+
+        after = {
+            "nodes": self.store._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
+            "edges": self.store._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+            "embeddings": self.store._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
+        }
+        assert after == before
+
+    def test_remove_files_permanently_counts_changed_paths_and_commits_once(self):
+        paths = ["/test/first.py", "/test/second.py", "/test/missing.py"]
+        for path in paths[:2]:
+            self.store.store_file_nodes_edges(path, [self._make_file_node(path)], [])
+
+        commits = 0
+
+        def count_commits() -> int:
+            nonlocal commits
+            commits += 1
+            return 0
+
+        self.store._conn.set_trace_callback(
+            lambda statement: count_commits() if statement == "COMMIT" else None
+        )
+        changed = self.store.remove_files_permanently(paths)
+
+        assert changed == 2
+        assert commits == 1
+
+    def test_replacement_preserves_incoming_edges_from_other_files(self):
+        target_path = "/test/target.py"
+        caller_path = "/test/caller.py"
+        target_qn = f"{target_path}::target"
+        caller_qn = f"{caller_path}::caller"
+        self.store.store_file_nodes_edges(
+            target_path,
+            [
+                self._make_file_node(target_path),
+                self._make_func_node("target", target_path),
+            ],
+            [],
+        )
+        self.store.store_file_nodes_edges(
+            caller_path,
+            [
+                self._make_file_node(caller_path),
+                self._make_func_node("caller", caller_path),
+            ],
+            [
+                EdgeInfo(
+                    kind="CALLS",
+                    source=caller_qn,
+                    target=target_qn,
+                    file_path=caller_path,
+                ),
+            ],
+        )
+
+        self.store.store_file_nodes_edges(
+            target_path,
+            [
+                self._make_file_node(target_path),
+                self._make_func_node("target", target_path),
+            ],
+            [],
+        )
+
+        incoming = self.store.get_edges_by_target(target_qn)
+        assert [(edge.source_qualified, edge.file_path) for edge in incoming] == [
+            (caller_qn, caller_path),
+        ]
+
     def test_store_file_nodes_edges(self):
         nodes = [self._make_file_node(), self._make_func_node()]
         edges = [
