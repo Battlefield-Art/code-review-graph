@@ -14597,6 +14597,11 @@ class CodeParser:
         if declarator is None:
             return None
         if declarator.type in ("function_declarator", "abstract_function_declarator"):
+            nested = self._cpp_find_function_declarator(
+                declarator.child_by_field_name("declarator"),
+            )
+            if nested is not None:
+                return nested
             return declarator
         for child in declarator.named_children:
             if child.type in ("parameter_list", "template_argument_list"):

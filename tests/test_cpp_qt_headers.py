@@ -234,6 +234,9 @@ void (*factory())(int);
 
     function_names = [node.name for node in nodes if node.kind == "Function"]
     assert function_names == ["run", "free_function", "factory"]
+    factory = next(node for node in nodes if node.name == "factory")
+    assert factory.identity_name == "factory()"
+    assert factory.params == "()"
 
 
 def test_cpp_local_function_prototypes_are_not_indexed(tmp_path: Path) -> None:
