@@ -765,13 +765,12 @@ _CPP_HEADER_EVIDENCE_TYPES = frozenset({
     "lambda_expression",
     "namespace_definition",
     "noexcept",
-    "placeholder_type_specifier",
     "template_declaration",
     "trailing_return_type",
     "using_declaration",
 })
 
-_CPP_HEADER_EVIDENCE_QUALIFIERS = frozenset({b"constexpr", b"consteval", b"constinit"})
+_CPP_HEADER_EVIDENCE_QUALIFIERS = frozenset({b"consteval", b"constinit"})
 
 _CPP_QT_STRUCTURAL_MACRO_REPLACEMENTS = {
     b"QT_BEGIN_NAMESPACE": b" " * len(b"QT_BEGIN_NAMESPACE"),

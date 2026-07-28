@@ -133,6 +133,21 @@ typedef int value;
         assert _file_language(nodes) == "c", name
 
 
+def test_c_auto_and_c23_constexpr_are_not_cpp_evidence(tmp_path: Path) -> None:
+    sources = {
+        "auto_storage.h": "auto int value;\n",
+        "c23_constexpr.h": """constexpr int limit = 16;
+typedef struct item {
+  int value;
+} item;
+""",
+    }
+
+    for name, source in sources.items():
+        _, nodes, _ = _parse(tmp_path, name, source)
+        assert _file_language(nodes) == "c", name
+
+
 def test_qt_structural_macros_do_not_hide_classes_or_become_functions(
     tmp_path: Path,
 ) -> None:
