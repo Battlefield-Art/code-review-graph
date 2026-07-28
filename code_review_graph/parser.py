@@ -752,6 +752,21 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".yaml": "yaml",
 }
 
+# ``.h`` is shared by C and C++. Keep C as the extension default, then promote
+# a header only when the C++ grammar finds syntax that C cannot express. Weak
+# compatibility markers such as ``__cplusplus`` and ``extern "C"`` are
+# deliberately excluded because they are common in otherwise-C headers.
+_CPP_HEADER_EVIDENCE_TYPES = frozenset({
+    "access_specifier",
+    "alias_declaration",
+    "base_class_clause",
+    "class_specifier",
+    "concept_definition",
+    "namespace_definition",
+    "template_declaration",
+    "using_declaration",
+})
+
 # Shebang interpreter → language mapping for extension-less Unix scripts.
 # Each key is the **basename** of the interpreter path as it appears after
 # ``#!`` (or after ``#!/usr/bin/env``).  Only languages already registered
@@ -2522,6 +2537,17 @@ class CodeParser:
         if not language:
             return [], []
 
+        parser = None
+        tree = None
+        if language == "c" and path.suffix.lower() == ".h":
+            cpp_parser = self._get_parser("cpp")
+            if cpp_parser is not None:
+                cpp_tree = cpp_parser.parse(source)
+                if self._has_cpp_header_evidence(cpp_tree.root_node):
+                    language = "cpp"
+                    parser = cpp_parser
+                    tree = cpp_tree
+
         if language == "blade":
             return self._parse_blade(path, source)
 
@@ -2592,11 +2618,13 @@ class CodeParser:
         if language == "yaml":
             return [], []
 
-        parser = self._get_parser(language)
+        if parser is None:
+            parser = self._get_parser(language)
         if not parser:
             return [], []
 
-        tree = parser.parse(source)
+        if tree is None:
+            tree = parser.parse(source)
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
         file_path_str = str(path)
@@ -2683,6 +2711,17 @@ class CodeParser:
                     ))
 
         return nodes, edges
+
+    @staticmethod
+    def _has_cpp_header_evidence(root) -> bool:
+        """Return whether a parsed ``.h`` tree contains C++-only syntax."""
+        pending = [root]
+        while pending:
+            node = pending.pop()
+            if node.type in _CPP_HEADER_EVIDENCE_TYPES:
+                return True
+            pending.extend(node.named_children)
+        return False
 
     @classmethod
     def _mask_blade_comments(cls, text: str) -> str:
