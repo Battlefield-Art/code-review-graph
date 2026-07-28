@@ -236,6 +236,21 @@ void (*factory())(int);
     assert function_names == ["run", "free_function", "factory"]
 
 
+def test_cpp_local_function_prototypes_are_not_indexed(tmp_path: Path) -> None:
+    _, nodes, _ = _parse(
+        tmp_path,
+        "LocalPrototype.cpp",
+        """void outer() {
+  void local_prototype(int value);
+  local_prototype(1);
+}
+""",
+    )
+
+    function_names = [node.name for node in nodes if node.kind == "Function"]
+    assert function_names == ["outer"]
+
+
 def test_qt_member_declarations_survive_macro_shielding(tmp_path: Path) -> None:
     _, nodes, _ = _parse(tmp_path, "MyWidget.hpp", QT_HEADER)
 

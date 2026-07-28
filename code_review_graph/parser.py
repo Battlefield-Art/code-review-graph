@@ -14229,7 +14229,10 @@ class CodeParser:
         if language == "cpp" and kind == "function":
             declarator = node.child_by_field_name("declarator")
             if node.type in ("declaration", "field_declaration"):
-                if not self._cpp_is_callable_declaration(declarator):
+                if (
+                    not self._cpp_declaration_has_callable_scope(node)
+                    or not self._cpp_is_callable_declaration(declarator)
+                ):
                     return None
                 return self._cpp_callable_name(declarator)
             cpp_name = self._cpp_callable_name(declarator)
@@ -14620,6 +14623,26 @@ class CodeParser:
         # the parentheses.  A real function returning a function pointer,
         # such as ``void (*factory())(int)``, does.
         return self._cpp_find_function_declarator(callable_declarator) is not None
+
+    @staticmethod
+    def _cpp_declaration_has_callable_scope(declaration) -> bool:
+        """Limit callable declarations to file, namespace, and class scopes."""
+        scope = declaration.parent
+        while scope is not None:
+            if scope.type in (
+                "translation_unit",
+                "namespace_definition",
+                "field_declaration_list",
+            ):
+                return not _is_in_static_dead_guard(declaration)
+            if scope.type in (
+                "compound_statement",
+                "function_definition",
+                "lambda_expression",
+            ):
+                return False
+            scope = scope.parent
+        return False
 
     def _cpp_find_qualified_identifier(self, declarator):
         """Find the callable's qualified identifier outside its parameters."""
