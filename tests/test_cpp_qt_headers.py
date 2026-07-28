@@ -4,6 +4,31 @@ from pathlib import Path
 
 from code_review_graph.parser import CodeParser
 
+QT_HEADER = """#pragma once
+#include <QMainWindow>
+
+QT_BEGIN_NAMESPACE namespace Ui { class MyWidgetClass; };
+QT_END_NAMESPACE
+
+class MyWidget : public QMainWindow {
+  Q_OBJECT
+
+ public:
+  MyWidget(QWidget* parent = nullptr);
+  ~MyWidget();
+
+ protected Q_SLOTS:
+  void onButtonClicked();
+
+ public Q_SLOTS:
+  void onReset();
+
+ Q_SIGNALS:
+  void dataReady(int result);
+  void errorOccurred(const QString& msg);
+};
+"""
+
 
 def _parse(tmp_path: Path, name: str, source: str):
     path = tmp_path / name
@@ -68,3 +93,30 @@ int library_version(void);
     )
 
     assert _file_language(nodes) == "c"
+
+
+def test_qt_structural_macros_do_not_hide_classes_or_become_functions(
+    tmp_path: Path,
+) -> None:
+    _, nodes, _ = _parse(tmp_path, "MyWidget.hpp", QT_HEADER)
+
+    class_names = {node.name for node in nodes if node.kind == "Class"}
+    function_names = {node.name for node in nodes if node.kind == "Function"}
+
+    assert {"MyWidget", "MyWidgetClass"} <= class_names
+    assert function_names.isdisjoint({
+        "QT_BEGIN_NAMESPACE",
+        "QT_END_NAMESPACE",
+        "Q_OBJECT",
+        "Q_SLOTS",
+        "Q_SIGNALS",
+    })
+
+
+def test_qt_macro_shielding_preserves_class_source_span(tmp_path: Path) -> None:
+    _, nodes, _ = _parse(tmp_path, "MyWidget.hpp", QT_HEADER)
+
+    widget = next(
+        node for node in nodes if node.kind == "Class" and node.name == "MyWidget"
+    )
+    assert (widget.line_start, widget.line_end) == (7, 23)

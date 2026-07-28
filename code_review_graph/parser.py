@@ -767,6 +767,10 @@ _CPP_HEADER_EVIDENCE_TYPES = frozenset({
     "using_declaration",
 })
 
+_CPP_QT_STRUCTURAL_MACRO_RE = re.compile(
+    rb"\b(?:QT_BEGIN_NAMESPACE|QT_END_NAMESPACE|Q_OBJECT|Q_SIGNALS|Q_SLOTS|Q_EMIT)\b",
+)
+
 # Shebang interpreter → language mapping for extension-less Unix scripts.
 # Each key is the **basename** of the interpreter path as it appears after
 # ``#!`` (or after ``#!/usr/bin/env``).  Only languages already registered
@@ -2539,14 +2543,19 @@ class CodeParser:
 
         parser = None
         tree = None
+        parse_source = source
         if language == "c" and path.suffix.lower() == ".h":
             cpp_parser = self._get_parser("cpp")
             if cpp_parser is not None:
-                cpp_tree = cpp_parser.parse(source)
+                cpp_source = self._mask_cpp_qt_macros(source)
+                cpp_tree = cpp_parser.parse(cpp_source)
                 if self._has_cpp_header_evidence(cpp_tree.root_node):
                     language = "cpp"
                     parser = cpp_parser
                     tree = cpp_tree
+                    parse_source = cpp_source
+        elif language == "cpp":
+            parse_source = self._mask_cpp_qt_macros(source)
 
         if language == "blade":
             return self._parse_blade(path, source)
@@ -2624,7 +2633,7 @@ class CodeParser:
             return [], []
 
         if tree is None:
-            tree = parser.parse(source)
+            tree = parser.parse(parse_source)
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
         file_path_str = str(path)
@@ -2722,6 +2731,17 @@ class CodeParser:
                 return True
             pending.extend(node.named_children)
         return False
+
+    @staticmethod
+    def _mask_cpp_qt_macros(source: bytes) -> bytes:
+        """Shield structural Qt macros without changing byte or line offsets."""
+        def replacement(match: re.Match[bytes]) -> bytes:
+            token = match.group(0)
+            if token == b"Q_SIGNALS":
+                return b"public" + b" " * (len(token) - len(b"public"))
+            return b" " * len(token)
+
+        return _CPP_QT_STRUCTURAL_MACRO_RE.sub(replacement, source)
 
     @classmethod
     def _mask_blade_comments(cls, text: str) -> str:
