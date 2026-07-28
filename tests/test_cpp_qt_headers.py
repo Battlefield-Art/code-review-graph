@@ -127,6 +127,35 @@ def test_qt_macro_shielding_preserves_class_source_span(tmp_path: Path) -> None:
     assert (widget.line_start, widget.line_end) == (7, 23)
 
 
+def test_qt_macro_shielding_leaves_literals_comments_and_directives_unchanged(
+    tmp_path: Path,
+) -> None:
+    source = b'''#define Q_OBJECT custom_object
+#include "Q_OBJECT"
+constexpr auto marker = R"tag(Q_SIGNALS \" Q_EMIT)tag";
+// Q_SLOTS
+/* QT_BEGIN_NAMESPACE */
+class Widget {
+  Q_OBJECT
+ Q_SIGNALS:
+  void ready();
+};
+'''
+
+    masked = CodeParser._mask_cpp_qt_macros(source)
+
+    assert len(masked) == len(source)
+    assert masked.splitlines()[:5] == source.splitlines()[:5]
+    assert b"  Q_OBJECT\n" not in masked
+    assert b" Q_SIGNALS:\n" not in masked
+
+    path = tmp_path / "Widget.hpp"
+    nodes, edges = CodeParser().parse_bytes(path, source)
+    imports = [edge.target for edge in edges if edge.kind == "IMPORTS_FROM"]
+    assert imports == ["Q_OBJECT"]
+    assert any(node.kind == "Class" and node.name == "Widget" for node in nodes)
+
+
 def test_cpp_callable_declarations_are_indexed_without_variables(tmp_path: Path) -> None:
     _, nodes, _ = _parse(
         tmp_path,

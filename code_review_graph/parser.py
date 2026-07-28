@@ -767,9 +767,14 @@ _CPP_HEADER_EVIDENCE_TYPES = frozenset({
     "using_declaration",
 })
 
-_CPP_QT_STRUCTURAL_MACRO_RE = re.compile(
-    rb"\b(?:QT_BEGIN_NAMESPACE|QT_END_NAMESPACE|Q_OBJECT|Q_SIGNALS|Q_SLOTS|Q_EMIT)\b",
-)
+_CPP_QT_STRUCTURAL_MACRO_REPLACEMENTS = {
+    b"QT_BEGIN_NAMESPACE": b" " * len(b"QT_BEGIN_NAMESPACE"),
+    b"QT_END_NAMESPACE": b" " * len(b"QT_END_NAMESPACE"),
+    b"Q_OBJECT": b" " * len(b"Q_OBJECT"),
+    b"Q_SIGNALS": b"public" + b" " * (len(b"Q_SIGNALS") - len(b"public")),
+    b"Q_SLOTS": b" " * len(b"Q_SLOTS"),
+    b"Q_EMIT": b" " * len(b"Q_EMIT"),
+}
 
 # Shebang interpreter → language mapping for extension-less Unix scripts.
 # Each key is the **basename** of the interpreter path as it appears after
@@ -2735,13 +2740,95 @@ class CodeParser:
     @staticmethod
     def _mask_cpp_qt_macros(source: bytes) -> bytes:
         """Shield structural Qt macros without changing byte or line offsets."""
-        def replacement(match: re.Match[bytes]) -> bytes:
-            token = match.group(0)
-            if token == b"Q_SIGNALS":
-                return b"public" + b" " * (len(token) - len(b"public"))
-            return b" " * len(token)
+        masked = bytearray(source)
+        length = len(source)
+        index = 0
+        line_start = 0
 
-        return _CPP_QT_STRUCTURAL_MACRO_RE.sub(replacement, source)
+        def skip_quoted(start: int, quote: int) -> int:
+            cursor = start + 1
+            while cursor < length:
+                if source[cursor] == ord("\\"):
+                    cursor += 2
+                elif source[cursor] == quote:
+                    return cursor + 1
+                else:
+                    cursor += 1
+            return length
+
+        def raw_string_end(start: int) -> Optional[int]:
+            for prefix in (b'u8R"', b'LR"', b'UR"', b'uR"', b'R"'):
+                if not source.startswith(prefix, start):
+                    continue
+                delimiter_start = start + len(prefix)
+                opening = source.find(b"(", delimiter_start, delimiter_start + 17)
+                if opening == -1:
+                    return None
+                delimiter = source[delimiter_start:opening]
+                if any(byte in b" ()\\\t\r\n" for byte in delimiter):
+                    return None
+                closing = source.find(b")" + delimiter + b'"', opening + 1)
+                return length if closing == -1 else closing + len(delimiter) + 2
+            return None
+
+        while index < length:
+            byte = source[index]
+            if byte == ord("\n"):
+                line_start = index + 1
+                index += 1
+                continue
+
+            if source.startswith(b"//", index):
+                newline = source.find(b"\n", index + 2)
+                index = length if newline == -1 else newline
+                continue
+            if source.startswith(b"/*", index):
+                closing = source.find(b"*/", index + 2)
+                index = length if closing == -1 else closing + 2
+                continue
+
+            if byte == ord("#") and not source[line_start:index].strip(b" \t\v\f\r"):
+                cursor = index
+                while cursor < length:
+                    newline = source.find(b"\n", cursor)
+                    if newline == -1:
+                        cursor = length
+                        break
+                    previous = newline - 1
+                    if previous >= cursor and source[previous] == ord("\r"):
+                        previous -= 1
+                    if previous < cursor or source[previous] != ord("\\"):
+                        cursor = newline
+                        break
+                    cursor = newline + 1
+                index = cursor
+                continue
+
+            raw_end = raw_string_end(index)
+            if raw_end is not None:
+                index = raw_end
+                continue
+            if byte in (ord('"'), ord("'")):
+                index = skip_quoted(index, byte)
+                continue
+
+            if byte == ord("_") or chr(byte).isalpha():
+                end = index + 1
+                while end < length:
+                    candidate = source[end]
+                    if candidate != ord("_") and not chr(candidate).isalnum():
+                        break
+                    end += 1
+                token = source[index:end]
+                replacement = _CPP_QT_STRUCTURAL_MACRO_REPLACEMENTS.get(token)
+                if replacement is not None:
+                    masked[index:end] = replacement
+                index = end
+                continue
+
+            index += 1
+
+        return bytes(masked)
 
     @classmethod
     def _mask_blade_comments(cls, text: str) -> str:
