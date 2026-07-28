@@ -762,10 +762,16 @@ _CPP_HEADER_EVIDENCE_TYPES = frozenset({
     "base_class_clause",
     "class_specifier",
     "concept_definition",
+    "lambda_expression",
     "namespace_definition",
+    "noexcept",
+    "placeholder_type_specifier",
     "template_declaration",
+    "trailing_return_type",
     "using_declaration",
 })
+
+_CPP_HEADER_EVIDENCE_QUALIFIERS = frozenset({b"constexpr", b"consteval", b"constinit"})
 
 _CPP_QT_STRUCTURAL_MACRO_REPLACEMENTS = {
     b"QT_BEGIN_NAMESPACE": b" " * len(b"QT_BEGIN_NAMESPACE"),
@@ -2732,7 +2738,29 @@ class CodeParser:
         pending = [root]
         while pending:
             node = pending.pop()
+            if node.type == "ERROR" or _is_in_static_dead_guard(node):
+                continue
+
+            previous = node.prev_named_sibling
+            recovered_after_error = (
+                previous is not None
+                and previous.type == "ERROR"
+                and previous.end_byte == node.start_byte
+            )
+            if recovered_after_error:
+                continue
+
             if node.type in _CPP_HEADER_EVIDENCE_TYPES:
+                return True
+            if (
+                node.type == "enum_specifier"
+                and any(child.type in ("class", "struct") for child in node.children)
+            ):
+                return True
+            if (
+                node.type == "type_qualifier"
+                and node.text in _CPP_HEADER_EVIDENCE_QUALIFIERS
+            ):
                 return True
             pending.extend(node.named_children)
         return False

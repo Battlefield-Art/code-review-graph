@@ -100,6 +100,39 @@ int library_version(void);
     assert _file_language(nodes) == "c"
 
 
+def test_h_file_uses_cpp_for_scoped_enums_and_modern_function_syntax(
+    tmp_path: Path,
+) -> None:
+    sources = {
+        "ScopedEnum.h": "enum class Color { Red, Blue };\n",
+        "Constexpr.h": "constexpr int answer() noexcept;\n",
+        "TrailingReturn.h": "auto answer() -> int;\n",
+    }
+
+    for name, source in sources.items():
+        _, nodes, _ = _parse(tmp_path, name, source)
+        assert _file_language(nodes) == "cpp", name
+
+
+def test_inactive_or_recovered_cpp_syntax_does_not_promote_c_headers(
+    tmp_path: Path,
+) -> None:
+    sources = {
+        "disabled.h": """#if 0
+class Disabled {};
+#endif
+typedef int value;
+""",
+        "objective_c.h": """@class Forward;
+typedef int value;
+""",
+    }
+
+    for name, source in sources.items():
+        _, nodes, _ = _parse(tmp_path, name, source)
+        assert _file_language(nodes) == "c", name
+
+
 def test_qt_structural_macros_do_not_hide_classes_or_become_functions(
     tmp_path: Path,
 ) -> None:
