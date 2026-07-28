@@ -2770,7 +2770,7 @@ class CodeParser:
         masked = bytearray(source)
         length = len(source)
         index = 0
-        line_start = 0
+        line_has_code = False
 
         def skip_quoted(start: int, quote: int) -> int:
             cursor = start + 1
@@ -2801,7 +2801,7 @@ class CodeParser:
         while index < length:
             byte = source[index]
             if byte == ord("\n"):
-                line_start = index + 1
+                line_has_code = False
                 index += 1
                 continue
 
@@ -2811,10 +2811,13 @@ class CodeParser:
                 continue
             if source.startswith(b"/*", index):
                 closing = source.find(b"*/", index + 2)
-                index = length if closing == -1 else closing + 2
+                comment_end = length if closing == -1 else closing + 2
+                if b"\n" in source[index:comment_end]:
+                    line_has_code = False
+                index = comment_end
                 continue
 
-            if byte == ord("#") and not source[line_start:index].strip(b" \t\v\f\r"):
+            if byte == ord("#") and not line_has_code:
                 cursor = index
                 while cursor < length:
                     newline = source.find(b"\n", cursor)
@@ -2833,9 +2836,11 @@ class CodeParser:
 
             raw_end = raw_string_end(index)
             if raw_end is not None:
+                line_has_code = True
                 index = raw_end
                 continue
             if byte in (ord('"'), ord("'")):
+                line_has_code = True
                 index = skip_quoted(index, byte)
                 continue
 
@@ -2850,9 +2855,12 @@ class CodeParser:
                 replacement = _CPP_QT_STRUCTURAL_MACRO_REPLACEMENTS.get(token)
                 if replacement is not None:
                     masked[index:end] = replacement
+                line_has_code = True
                 index = end
                 continue
 
+            if byte not in b" \t\v\f\r":
+                line_has_code = True
             index += 1
 
         return bytes(masked)

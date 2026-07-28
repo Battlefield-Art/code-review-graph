@@ -183,6 +183,8 @@ def test_qt_macro_shielding_leaves_literals_comments_and_directives_unchanged(
 constexpr auto marker = R"tag(Q_SIGNALS \" Q_EMIT)tag";
 // Q_SLOTS
 /* QT_BEGIN_NAMESPACE */
+/* multiline comment
+*/#define Q_SIGNALS custom_signals
 class Widget {
   Q_OBJECT
  Q_SIGNALS:
@@ -194,6 +196,7 @@ class Widget {
 
     assert len(masked) == len(source)
     assert masked.splitlines()[:5] == source.splitlines()[:5]
+    assert b"*/#define Q_SIGNALS custom_signals" in masked
     assert b"  Q_OBJECT\n" not in masked
     assert b" Q_SIGNALS:\n" not in masked
 
