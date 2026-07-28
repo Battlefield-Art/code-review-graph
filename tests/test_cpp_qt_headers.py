@@ -1,8 +1,13 @@
 """Regression coverage for C++ and Qt header indexing (issue #463)."""
 
+import shutil
 from pathlib import Path
 
+from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import full_build
 from code_review_graph.parser import CodeParser
+
+FIXTURES = Path(__file__).parent / "fixtures" / "cpp_qt_headers"
 
 QT_HEADER = """#pragma once
 #include <QMainWindow>
@@ -158,3 +163,80 @@ def test_qt_member_declarations_survive_macro_shielding(tmp_path: Path) -> None:
         "dataReady",
         "errorOccurred",
     } <= function_names
+
+
+def test_four_file_cpp_qt_fixture_survives_full_build(tmp_path: Path) -> None:
+    for fixture in FIXTURES.iterdir():
+        shutil.copy2(fixture, tmp_path / fixture.name)
+
+    expected_functions = {
+        "MyWidgetPlain.h": {
+            "MyWidgetPlain",
+            "~MyWidgetPlain",
+            "doSomething",
+            "calculateValue",
+            "onButtonClicked",
+            "onDataReceived",
+            "onReset",
+        },
+        "MyWidgetPlain.cpp": {
+            "MyWidgetPlain",
+            "~MyWidgetPlain",
+            "doSomething",
+            "calculateValue",
+            "onButtonClicked",
+            "onDataReceived",
+            "onReset",
+        },
+        "MyWidget.h": {
+            "MyWidget",
+            "~MyWidget",
+            "doSomething",
+            "calculateValue",
+            "onButtonClicked",
+            "onDataReceived",
+            "onReset",
+            "dataReady",
+            "errorOccurred",
+        },
+        "MyWidget.cpp": {
+            "MyWidget",
+            "~MyWidget",
+            "doSomething",
+            "calculateValue",
+            "onButtonClicked",
+            "onDataReceived",
+            "onReset",
+        },
+    }
+
+    with GraphStore(":memory:") as store:
+        result = full_build(tmp_path, store)
+
+        assert result["errors"] == []
+        assert result["files_parsed"] == 4
+        for filename, expected in expected_functions.items():
+            path = tmp_path / filename
+            stored = store.get_nodes_by_file(str(path))
+            assert {node.name for node in stored if node.kind == "Function"} == expected
+            assert all(node.language == "cpp" for node in stored)
+
+        qt_header_nodes = store.get_nodes_by_file(str(tmp_path / "MyWidget.h"))
+        widget = next(
+            node
+            for node in qt_header_nodes
+            if node.kind == "Class" and node.name == "MyWidget"
+        )
+        assert (widget.line_start, widget.line_end) == (7, 26)
+        assert all(
+            node.name
+            not in {
+                "QT_BEGIN_NAMESPACE",
+                "QT_END_NAMESPACE",
+                "Q_OBJECT",
+                "Q_SLOTS",
+                "Q_SIGNALS",
+                "Q_EMIT",
+            }
+            for node in store.get_all_nodes()
+        )
