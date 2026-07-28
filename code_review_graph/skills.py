@@ -381,10 +381,12 @@ def _build_server_entry(
 
     entry: dict[str, Any] = {"command": command, "args": args}
     if key == "hermes":
-        # Hermes' mcp_servers schema has no ``cwd``; the repo root must be
-        # passed to the server itself so it finds the right graph database.
-        if repo_root is not None:
-            entry["args"] = [*args, "--repo", str(repo_root)]
+        # No repo is pinned here, deliberately. Hermes Agent is a long-lived
+        # assistant that moves between projects, and its stdio schema has no
+        # ``cwd``, so a baked-in ``--repo`` would silently answer every
+        # question about whichever repo happened to be installed from. Every
+        # tool takes an explicit ``repo_root``; without a default, omitting it
+        # fails loudly instead of returning another project's graph.
         return entry
     # Include cwd so the MCP server can find the graph database
     if repo_root is not None:

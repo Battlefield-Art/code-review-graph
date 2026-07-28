@@ -123,8 +123,13 @@ class TestInstall:
         entry = _entry(hermes_home / "config.yaml")
         expected_command, expected_args = _detect_serve_command()
         assert entry["command"] == expected_command
-        # Hermes has no ``cwd``: the repo root must ride along in args.
-        assert entry["args"] == [*expected_args, "--repo", str(repo)]
+        # No repo is pinned. Hermes has no ``cwd`` and outlives any single
+        # project, so a baked-in default would answer questions about the
+        # wrong repo without saying so. Callers pass ``repo_root`` per tool
+        # call; omitting it must fail loudly instead.
+        assert entry["args"] == expected_args
+        assert "--repo" not in entry["args"]
+        assert str(repo) not in entry["args"]
         assert "cwd" not in entry
         assert "type" not in entry
 
