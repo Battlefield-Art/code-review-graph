@@ -962,7 +962,7 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     "rust": ["function_item", "function_signature_item"],
     "java": ["method_declaration", "constructor_declaration"],
     "c": ["function_definition"],
-    "cpp": ["function_definition"],
+    "cpp": ["function_definition", "declaration", "field_declaration"],
     "csharp": ["method_declaration", "constructor_declaration"],
     "ruby": ["method", "singleton_method"],
     "r": ["function_definition"],
@@ -14113,6 +14113,10 @@ class CodeParser:
 
         if language == "cpp" and kind == "function":
             declarator = node.child_by_field_name("declarator")
+            if node.type in ("declaration", "field_declaration"):
+                if self._cpp_find_function_declarator(declarator) is None:
+                    return None
+                return self._cpp_callable_name(declarator)
             cpp_name = self._cpp_callable_name(declarator)
             if cpp_name:
                 return cpp_name

@@ -120,3 +120,41 @@ def test_qt_macro_shielding_preserves_class_source_span(tmp_path: Path) -> None:
         node for node in nodes if node.kind == "Class" and node.name == "MyWidget"
     )
     assert (widget.line_start, widget.line_end) == (7, 23)
+
+
+def test_cpp_callable_declarations_are_indexed_without_variables(tmp_path: Path) -> None:
+    _, nodes, _ = _parse(
+        tmp_path,
+        "Widget.hpp",
+        """class Widget {
+ public:
+  Widget();
+  ~Widget();
+  void reset();
+  int value() const;
+  int count;
+};
+
+void top_level(int value);
+extern int global_value;
+""",
+    )
+
+    function_names = [node.name for node in nodes if node.kind == "Function"]
+    assert function_names == ["Widget", "~Widget", "reset", "value", "top_level"]
+    assert "count" not in function_names
+    assert "global_value" not in function_names
+
+
+def test_qt_member_declarations_survive_macro_shielding(tmp_path: Path) -> None:
+    _, nodes, _ = _parse(tmp_path, "MyWidget.hpp", QT_HEADER)
+
+    function_names = {node.name for node in nodes if node.kind == "Function"}
+    assert {
+        "MyWidget",
+        "~MyWidget",
+        "onButtonClicked",
+        "onReset",
+        "dataReady",
+        "errorOccurred",
+    } <= function_names
