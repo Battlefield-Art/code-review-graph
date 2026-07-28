@@ -14114,7 +14114,7 @@ class CodeParser:
         if language == "cpp" and kind == "function":
             declarator = node.child_by_field_name("declarator")
             if node.type in ("declaration", "field_declaration"):
-                if self._cpp_find_function_declarator(declarator) is None:
+                if not self._cpp_is_callable_declaration(declarator):
                     return None
                 return self._cpp_callable_name(declarator)
             cpp_name = self._cpp_callable_name(declarator)
@@ -14487,6 +14487,24 @@ class CodeParser:
             if found is not None:
                 return found
         return None
+
+    def _cpp_is_callable_declaration(self, declarator) -> bool:
+        """Return whether a declaration names a function, not a function pointer."""
+        function_declarator = self._cpp_find_function_declarator(declarator)
+        if function_declarator is None:
+            return False
+
+        callable_declarator = function_declarator.child_by_field_name("declarator")
+        if (
+            callable_declarator is None
+            or callable_declarator.type != "parenthesized_declarator"
+        ):
+            return True
+
+        # ``void (*callback)(int)`` has no nested function declarator inside
+        # the parentheses.  A real function returning a function pointer,
+        # such as ``void (*factory())(int)``, does.
+        return self._cpp_find_function_declarator(callable_declarator) is not None
 
     def _cpp_find_qualified_identifier(self, declarator):
         """Find the callable's qualified identifier outside its parameters."""

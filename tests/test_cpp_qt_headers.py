@@ -151,6 +151,29 @@ extern int global_value;
     assert "global_value" not in function_names
 
 
+def test_cpp_function_pointer_variables_are_not_indexed_as_functions(
+    tmp_path: Path,
+) -> None:
+    _, nodes, _ = _parse(
+        tmp_path,
+        "Callbacks.hpp",
+        """class Callbacks {
+ public:
+  void run(int value);
+  void (*callback)(int);
+  void (Callbacks::*handler)(int);
+};
+
+void free_function(int value);
+void (*global_callback)(int);
+void (*factory())(int);
+""",
+    )
+
+    function_names = [node.name for node in nodes if node.kind == "Function"]
+    assert function_names == ["run", "free_function", "factory"]
+
+
 def test_qt_member_declarations_survive_macro_shielding(tmp_path: Path) -> None:
     _, nodes, _ = _parse(tmp_path, "MyWidget.hpp", QT_HEADER)
 
