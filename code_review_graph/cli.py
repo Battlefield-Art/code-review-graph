@@ -1606,8 +1606,8 @@ def main() -> None:
     if args.command in _data_dir_cmds:
         _handle_data_dir_option(args, repo_root)
 
-    db_path = get_db_path(repo_root)
-    if args.command in ("dead-code", "forget") and not db_path.exists():
+    db_path = get_db_path(repo_root, read_only=args.command == "status")
+    if args.command in ("dead-code", "forget", "status") and not db_path.exists():
         print(
             f"No graph found at {db_path}. Run `code-review-graph build` first.",
             file=sys.stderr,

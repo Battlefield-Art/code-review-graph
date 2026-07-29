@@ -131,6 +131,25 @@ def test_status_quiet_prints_nothing(capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_status_missing_graph_exits_without_creating_data_tree(
+    tmp_path, monkeypatch, capsys,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    data_dir = tmp_path / "missing-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(data_dir))
+    argv = ["code-review-graph", "status", "--repo", str(repo)]
+
+    with patch.object(sys, "argv", argv):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main()
+
+    assert exc_info.value.code == 1
+    assert "No graph found" in capsys.readouterr().err
+    assert not data_dir.exists()
+
+
 def test_enrich_command_reads_stdin_and_respects_external_data_dir(
     tmp_path, monkeypatch, capsys,
 ):
