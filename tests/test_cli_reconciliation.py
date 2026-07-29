@@ -237,6 +237,36 @@ def test_status_data_dir_option_is_read_only(tmp_path, monkeypatch, capsys):
     assert not registry_path.exists()
 
 
+def test_status_default_data_dir_override_does_not_migrate_legacy_graph(
+    tmp_path, monkeypatch, capsys,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    legacy_db = repo / ".code-review-graph.db"
+    with code_review_graph.graph.GraphStore(legacy_db):
+        pass
+    data_dir = repo / ".code-review-graph"
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    argv = [
+        "code-review-graph",
+        "status",
+        "--repo",
+        str(repo),
+        "--data-dir",
+        str(data_dir),
+    ]
+
+    with patch.object(sys, "argv", argv):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main()
+
+    assert exc_info.value.code == 1
+    assert "No graph found" in capsys.readouterr().err
+    assert legacy_db.exists()
+    assert not data_dir.exists()
+
+
 def test_enrich_command_reads_stdin_and_respects_external_data_dir(
     tmp_path, monkeypatch, capsys,
 ):

@@ -1617,7 +1617,8 @@ def main() -> None:
         legacy_db = repo_root / ".code-review-graph.db"
         default_db = repo_root / ".code-review-graph" / "graph.db"
         if (
-            not db_path.exists()
+            not status_data_dir
+            and not db_path.exists()
             and db_path.resolve() == default_db.resolve()
             and legacy_db.exists()
         ):
