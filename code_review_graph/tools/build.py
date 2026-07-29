@@ -9,10 +9,11 @@ from typing import Any
 
 from ..incremental import (
     full_build,
+    get_db_path,
     incremental_update,
     resolve_incremental_base,
 )
-from ._common import _get_store
+from ._common import _get_store, _resolve_root
 
 logger = logging.getLogger(__name__)
 
@@ -500,8 +501,13 @@ def build_or_update_graph(
     Returns:
         Summary with files_parsed/updated, node/edge counts, and errors.
     """
-    store, root = _get_store(repo_root)
+    root = _resolve_root(repo_root)
+    graph_exists = get_db_path(root, read_only=True).exists()
+    store, root = _get_store(str(root))
     try:
+        if not full_rebuild and not graph_exists:
+            full_rebuild = True
+
         # An automatic (base is None) incremental update resolves its diff base
         # to the last-synced commit. When no usable anchor exists, fall back to
         # a full rebuild rather than a wrong HEAD~1 diff that could report the
