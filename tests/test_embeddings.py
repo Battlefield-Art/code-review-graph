@@ -111,6 +111,24 @@ class TestNodeToText:
 
 
 class TestEmbeddingStore:
+    def _make_node(self, index: int) -> GraphNode:
+        return GraphNode(
+            id=index,
+            kind="Function",
+            name=f"func_{index}",
+            qualified_name=f"file.py::func_{index}",
+            file_path="file.py",
+            line_start=index,
+            line_end=index + 1,
+            language="python",
+            parent_name=None,
+            params=None,
+            return_type=None,
+            is_test=False,
+            file_hash=None,
+            extra={},
+        )
+
     def test_store_initializes(self, tmp_path):
         db = tmp_path / "embeddings.db"
         with patch("code_review_graph.embeddings.get_provider", return_value=None):
@@ -147,6 +165,69 @@ class TestEmbeddingStore:
             store = EmbeddingStore(db)
             # Should not raise even if node doesn't exist
             store.remove_node("nonexistent::func")
+            store.close()
+
+    def test_embed_nodes_commits_each_batch(self, tmp_path):
+        db = tmp_path / "embeddings.db"
+
+        class Provider:
+            name = "test:provider"
+
+            def __init__(self):
+                self.calls = []
+
+            def embed(self, texts):
+                self.calls.append(list(texts))
+                return [[float(len(self.calls)), 0.0] for _ in texts]
+
+            def embed_query(self, text):
+                return [0.0, 0.0]
+
+            @property
+            def dimension(self):
+                return 2
+
+        provider = Provider()
+        nodes = [self._make_node(i) for i in range(5)]
+
+        with patch("code_review_graph.embeddings.get_provider", return_value=provider):
+            store = EmbeddingStore(db)
+            embedded = store.embed_nodes(nodes, batch_size=2)
+            assert embedded == 5
+            assert [len(call) for call in provider.calls] == [2, 2, 1]
+            assert store.count() == 5
+            store.close()
+
+    def test_embed_nodes_preserves_completed_batches_on_later_failure(self, tmp_path):
+        db = tmp_path / "embeddings.db"
+
+        class Provider:
+            name = "test:provider"
+
+            def __init__(self):
+                self.calls = 0
+
+            def embed(self, texts):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("rate limited")
+                return [[1.0, 0.0] for _ in texts]
+
+            def embed_query(self, text):
+                return [0.0, 0.0]
+
+            @property
+            def dimension(self):
+                return 2
+
+        provider = Provider()
+        nodes = [self._make_node(i) for i in range(5)]
+
+        with patch("code_review_graph.embeddings.get_provider", return_value=provider):
+            store = EmbeddingStore(db)
+            with pytest.raises(RuntimeError, match="rate limited"):
+                store.embed_nodes(nodes, batch_size=2)
+            assert store.count() == 2
             store.close()
 
 

@@ -1204,20 +1204,27 @@ class EmbeddingStore:
         if not to_embed:
             return 0
 
-        # Encode in batches
-        texts = [t for _, t, _ in to_embed]
-        vectors = self.provider.embed(texts)
+        embedded = 0
+        for i in range(0, len(to_embed), batch_size):
+            batch = to_embed[i:i + batch_size]
+            texts = [t for _, t, _ in batch]
+            vectors = self.provider.embed(texts)
 
-        for (node, _text, text_hash), vec in zip(to_embed, vectors):
-            blob = _encode_vector(vec)
-            self._conn.execute(
-                """INSERT OR REPLACE INTO embeddings (qualified_name, vector, text_hash, provider)
-                   VALUES (?, ?, ?, ?)""",
-                (node.qualified_name, blob, text_hash, provider_name),
-            )
+            for (node, _text, text_hash), vec in zip(batch, vectors):
+                blob = _encode_vector(vec)
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO embeddings
+                        (qualified_name, vector, text_hash, provider)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (node.qualified_name, blob, text_hash, provider_name),
+                )
+                embedded += 1
 
-        self._conn.commit()
-        return len(to_embed)
+            self._conn.commit()
+
+        return embedded
 
     def search(self, query: str, limit: int = 20) -> list[tuple[str, float]]:
         """Search for nodes by semantic similarity."""
