@@ -1603,11 +1603,17 @@ def main() -> None:
         "wiki",
         "dead-code",
     )
-    if args.command in _data_dir_cmds:
+    status_data_dir = (
+        args.command == "status" and bool(getattr(args, "data_dir", None))
+    )
+    if args.command in _data_dir_cmds and not status_data_dir:
         _handle_data_dir_option(args, repo_root)
 
     if args.command == "status":
-        db_path = get_db_path(repo_root, read_only=True)
+        if status_data_dir:
+            db_path = Path(args.data_dir).expanduser().resolve() / "graph.db"
+        else:
+            db_path = get_db_path(repo_root, read_only=True)
         legacy_db = repo_root / ".code-review-graph.db"
         default_db = repo_root / ".code-review-graph" / "graph.db"
         if (
