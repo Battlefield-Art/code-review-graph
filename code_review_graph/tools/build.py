@@ -505,7 +505,10 @@ def build_or_update_graph(
     graph_exists = get_db_path(root, read_only=True).exists()
     store, root = _get_store(str(root))
     try:
-        if not full_rebuild and not graph_exists:
+        if (
+            not full_rebuild
+            and (not graph_exists or store.get_stats().total_nodes == 0)
+        ):
             full_rebuild = True
 
         # An automatic (base is None) incremental update resolves its diff base

@@ -585,6 +585,30 @@ def test_update_missing_graph_ignores_explicit_incremental_base(
         assert store.get_nodes_by_file(str(repo / "beta.py"))
 
 
+def test_update_repairs_existing_empty_graph(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path)
+    graph_path = repo / ".code-review-graph" / "graph.db"
+    with GraphStore(graph_path):
+        pass
+    _commit_file(repo, "beta")
+
+    res = build_or_update_graph(
+        full_rebuild=False,
+        repo_root=str(repo),
+        base="HEAD~1",
+        postprocess="none",
+    )
+
+    assert res["build_type"] == "full"
+    assert res["base_resolved"] is None
+    assert res["files_parsed"] == 2
+    with GraphStore(graph_path) as store:
+        assert store.get_nodes_by_file(str(repo / "a.py"))
+        assert store.get_nodes_by_file(str(repo / "beta.py"))
+
+
 def test_update_explicit_base_bypasses_auto_resolution(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     build_or_update_graph(full_rebuild=True, repo_root=str(repo), postprocess="none")
