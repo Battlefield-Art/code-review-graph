@@ -172,6 +172,29 @@ def test_status_preserves_legacy_graph_migration(tmp_path, monkeypatch, capsys):
     assert (repo / ".code-review-graph" / "graph.db").exists()
 
 
+def test_status_external_data_dir_does_not_migrate_unrelated_legacy_graph(
+    tmp_path, monkeypatch, capsys,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    legacy_db = repo / ".code-review-graph.db"
+    with code_review_graph.graph.GraphStore(legacy_db):
+        pass
+    data_dir = tmp_path / "external-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(data_dir))
+    argv = ["code-review-graph", "status", "--repo", str(repo)]
+
+    with patch.object(sys, "argv", argv):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main()
+
+    assert exc_info.value.code == 1
+    assert "No graph found" in capsys.readouterr().err
+    assert legacy_db.exists()
+    assert not data_dir.exists()
+
+
 def test_enrich_command_reads_stdin_and_respects_external_data_dir(
     tmp_path, monkeypatch, capsys,
 ):

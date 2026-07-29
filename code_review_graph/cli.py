@@ -1609,7 +1609,12 @@ def main() -> None:
     if args.command == "status":
         db_path = get_db_path(repo_root, read_only=True)
         legacy_db = repo_root / ".code-review-graph.db"
-        if not db_path.exists() and legacy_db.exists():
+        default_db = repo_root / ".code-review-graph" / "graph.db"
+        if (
+            not db_path.exists()
+            and db_path.resolve() == default_db.resolve()
+            and legacy_db.exists()
+        ):
             # Preserve the established one-time legacy migration, but do not
             # materialize graph state when neither database exists.
             db_path = get_db_path(repo_root)
