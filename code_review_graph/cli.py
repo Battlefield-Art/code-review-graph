@@ -1606,7 +1606,15 @@ def main() -> None:
     if args.command in _data_dir_cmds:
         _handle_data_dir_option(args, repo_root)
 
-    db_path = get_db_path(repo_root, read_only=args.command == "status")
+    if args.command == "status":
+        db_path = get_db_path(repo_root, read_only=True)
+        legacy_db = repo_root / ".code-review-graph.db"
+        if not db_path.exists() and legacy_db.exists():
+            # Preserve the established one-time legacy migration, but do not
+            # materialize graph state when neither database exists.
+            db_path = get_db_path(repo_root)
+    else:
+        db_path = get_db_path(repo_root)
     if args.command in ("dead-code", "forget", "status") and not db_path.exists():
         print(
             f"No graph found at {db_path}. Run `code-review-graph build` first.",
