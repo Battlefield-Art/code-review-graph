@@ -9,11 +9,10 @@ from typing import Any
 
 from ..incremental import (
     full_build,
-    get_db_path,
     incremental_update,
     resolve_incremental_base,
 )
-from ._common import _get_store, _resolve_root
+from ._common import _get_store
 
 logger = logging.getLogger(__name__)
 
@@ -501,14 +500,9 @@ def build_or_update_graph(
     Returns:
         Summary with files_parsed/updated, node/edge counts, and errors.
     """
-    root = _resolve_root(repo_root)
-    graph_exists = get_db_path(root, read_only=True).exists()
-    store, root = _get_store(str(root))
+    store, root = _get_store(repo_root)
     try:
-        if (
-            not full_rebuild
-            and (not graph_exists or store.get_stats().total_nodes == 0)
-        ):
+        if not full_rebuild and not store.has_nodes():
             full_rebuild = True
 
         # An automatic (base is None) incremental update resolves its diff base
