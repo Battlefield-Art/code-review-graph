@@ -650,6 +650,7 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
         output_dtype: str | None = None,
         timeout: int = 120,
         batch_size: int | None = None,
+        min_interval_sec: float = 0.0,
     ) -> None:
         self._api_key = api_key
         self._base_url = (base_url or self._DEFAULT_BASE_URL).rstrip("/")
@@ -658,7 +659,20 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
         self._output_dtype = output_dtype or self._DEFAULT_OUTPUT_DTYPE
         self._timeout = timeout
         self._batch_size = batch_size or self._DEFAULT_BATCH_SIZE
+        self._min_interval_sec = max(0.0, min_interval_sec)
+        self._last_request_at = 0.0
         self._host_key = OpenAIEmbeddingProvider._make_host_key(self._base_url)
+
+    def _wait_for_rate_limit_slot(self) -> None:
+        if self._min_interval_sec <= 0:
+            return
+        now = time.monotonic()
+        if self._last_request_at > 0:
+            wait = self._min_interval_sec - (now - self._last_request_at)
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+        self._last_request_at = now
 
     def _call_api(self, texts: list[str], input_type: str) -> list[list[float]]:
         import http.client
@@ -693,6 +707,7 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
             try:
                 _ssl_ctx = ssl.create_default_context()
                 try:
+                    self._wait_for_rate_limit_slot()
                     with urllib.request.urlopen(  # nosec B310
                         req, timeout=self._timeout, context=_ssl_ctx,
                     ) as resp:
@@ -968,6 +983,8 @@ def get_provider(
         )
         batch_env = os.environ.get("CRG_VOYAGE_BATCH_SIZE")
         batch_size = int(batch_env) if batch_env else None
+        min_interval_env = os.environ.get("CRG_VOYAGE_MIN_INTERVAL_SEC")
+        min_interval_sec = float(min_interval_env) if min_interval_env else 0.0
         if not _is_localhost_url(base_url):
             _warn_cloud_egress("voyage")
         return VoyageEmbeddingProvider(
@@ -977,6 +994,7 @@ def get_provider(
             output_dimension=output_dimension,
             output_dtype=output_dtype,
             batch_size=batch_size,
+            min_interval_sec=min_interval_sec,
         )
 
     if name == "google":

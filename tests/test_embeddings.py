@@ -738,6 +738,31 @@ class TestVoyageEmbeddingProvider:
             with pytest.raises(RuntimeError, match="refusing to misalign"):
                 provider.embed(["a", "b"])
 
+    def test_min_interval_paces_batched_requests(self):
+        provider = VoyageEmbeddingProvider(
+            api_key="k",
+            batch_size=1,
+            min_interval_sec=2.0,
+        )
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=[
+                    _make_voyage_response([[0.1] * 1024]),
+                    _make_voyage_response([[0.2] * 1024]),
+                ],
+            ),
+            patch(
+                "code_review_graph.embeddings.time.monotonic",
+                side_effect=[100.0, 101.0, 103.0],
+            ),
+            patch("code_review_graph.embeddings.time.sleep") as sleep,
+        ):
+            result = provider.embed(["hello", "world"])
+
+        assert len(result) == 2
+        sleep.assert_called_once_with(1.0)
+
 
 class TestGetProviderVoyage:
     """Tests for get_provider() with Voyage."""
@@ -767,12 +792,14 @@ class TestGetProviderVoyage:
             "CRG_VOYAGE_BASE_URL": "https://voyage.example.test/v1",
             "CRG_VOYAGE_OUTPUT_DIMENSION": "512",
             "CRG_VOYAGE_OUTPUT_DTYPE": "float",
+            "CRG_VOYAGE_MIN_INTERVAL_SEC": "21",
             "CRG_ACCEPT_CLOUD_EMBEDDINGS": "1",
         }
         with patch.dict(os.environ, env, clear=False):
             provider = get_provider("voyage")
 
         assert isinstance(provider, VoyageEmbeddingProvider)
+        assert provider._min_interval_sec == 21.0
         assert provider.name == (
             "voyage:voyage-code-3:dim512:float@https://voyage.example.test/v1"
         )
