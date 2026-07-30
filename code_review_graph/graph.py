@@ -22,8 +22,13 @@ import networkx as nx
 
 from .constants import (
     BFS_ENGINE,
+    IMPACT_DEFAULT_EDGE_DIRECTION,
     IMPACT_DEFAULT_EDGE_WEIGHT,
     IMPACT_DEPTH_DECAY,
+    IMPACT_DIRECTION_INCOMING,
+    IMPACT_DIRECTION_NONE,
+    IMPACT_DIRECTION_OUTGOING,
+    IMPACT_EDGE_DIRECTIONS,
     IMPACT_EDGE_WEIGHTS,
     IMPACT_SCORE_FLOOR,
     MAX_IMPACT_DEPTH,
@@ -33,6 +38,21 @@ from .migrations import get_schema_version, run_migrations
 from .parser import EdgeInfo, NodeInfo
 
 logger = logging.getLogger(__name__)
+
+# These are the canonical language values stored for the JavaScript ecosystem.
+# JSX files are stored as ``javascript`` and Astro files as ``typescript`` by
+# ``EXTENSION_TO_LANGUAGE``; TSX keeps its own grammar name.
+_JAVASCRIPT_LANGUAGE_FAMILY = ("javascript", "typescript", "tsx")
+_JAVASCRIPT_LANGUAGE_FAMILY_SET = frozenset(_JAVASCRIPT_LANGUAGE_FAMILY)
+
+
+def _compatible_edge_languages(language: str) -> tuple[str, ...]:
+    """Return languages that can safely share unresolved bare edge targets."""
+    normalized = language.casefold()
+    if normalized in _JAVASCRIPT_LANGUAGE_FAMILY_SET:
+        return _JAVASCRIPT_LANGUAGE_FAMILY
+    return (language,)
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -269,6 +289,49 @@ class GraphStore:
         self._conn.execute("DELETE FROM edges WHERE file_path = ?", (file_path,))
         self._invalidate_cache()
 
+    def remove_file_permanently(self, file_path: str) -> int:
+        """Remove one deleted file and every graph reference to its nodes."""
+        return self.remove_files_permanently([file_path])
+
+    def remove_files_permanently(self, file_paths: list[str]) -> int:
+        """Atomically remove deleted files and graph references to their nodes."""
+        changed = 0
+        has_embeddings = self._conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'embeddings'",
+        ).fetchone()
+        self._begin_immediate()
+        try:
+            for file_path in dict.fromkeys(file_paths):
+                exists = self._conn.execute(
+                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE file_path = ?) OR "
+                    "EXISTS(SELECT 1 FROM edges WHERE file_path = ?)",
+                    (file_path, file_path),
+                ).fetchone()[0]
+                if not exists:
+                    continue
+                changed += 1
+                if has_embeddings is not None:
+                    self._conn.execute(
+                        "DELETE FROM embeddings WHERE qualified_name IN "
+                        "(SELECT qualified_name FROM nodes WHERE file_path = ?)",
+                        (file_path,),
+                    )
+                self._conn.execute(
+                    "DELETE FROM edges WHERE file_path = ? OR source_qualified IN "
+                    "(SELECT qualified_name FROM nodes WHERE file_path = ?) OR "
+                    "target_qualified IN "
+                    "(SELECT qualified_name FROM nodes WHERE file_path = ?)",
+                    (file_path, file_path, file_path),
+                )
+                self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._invalidate_cache()
+        return changed
+
     def _begin_immediate(self) -> None:
         """Start an IMMEDIATE transaction, rolling back any prior uncommitted
         transaction first (regression guard for #135 / #489).
@@ -322,6 +385,17 @@ class GraphStore:
     def get_metadata(self, key: str) -> Optional[str]:
         row = self._conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
+
+    def has_nodes(self) -> bool:
+        row = self._conn.execute("SELECT 1 FROM nodes LIMIT 1").fetchone()
+        return row is not None
+
+    def has_nodes_for_language(self, language: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM nodes WHERE language = ? LIMIT 1",
+            (language,),
+        ).fetchone()
+        return row is not None
 
     def commit(self) -> None:
         self._conn.commit()
@@ -398,7 +472,9 @@ class GraphStore:
             ).fetchall())
         return [self._row_to_edge(row) for row in rows]
 
-    def search_edges_by_target_name(self, name: str, kind: str = "CALLS") -> list[GraphEdge]:
+    def search_edges_by_target_name(
+        self, name: str, kind: str = "CALLS", language: str | None = None,
+    ) -> list[GraphEdge]:
         """Search for edges where target_qualified matches an unqualified name.
 
         CALLS edges often store unqualified target names (e.g. ``generateTestCode``)
@@ -406,17 +482,36 @@ class GraphStore:
         method finds those edges by exact match on the plain function name so that
         reverse call tracing (callers_of) works even when qualified-name lookup
         returns nothing.
+
+        When ``language`` is given, only edges whose source node has a compatible
+        language are returned. JavaScript, TypeScript, and TSX form one family
+        because calls and inheritance routinely cross those source types (JSX is
+        stored as JavaScript; Astro as TypeScript). Other languages require an
+        exact match. Bare names are ambiguous across the whole graph, so without
+        this filter a common method name like ``clone`` can match a same-named
+        method in an unrelated language (#708).
         """
-        return list(self.iter_edges_by_target_name(name, kind=kind))
+        return list(self.iter_edges_by_target_name(name, kind=kind, language=language))
 
     def iter_edges_by_target_name(
-        self, name: str, kind: str = "CALLS",
+        self, name: str, kind: str = "CALLS", language: str | None = None,
     ) -> Iterator[GraphEdge]:
         """Yield exact bare-target edges without materializing all matches."""
-        rows = self._conn.execute(
-            "SELECT * FROM edges WHERE target_qualified = ? AND kind = ?",
-            (name, kind),
-        )
+        if language:
+            languages = _compatible_edge_languages(language)
+            placeholders = ", ".join("?" for _ in languages)
+            rows = self._conn.execute(
+                "SELECT edges.* FROM edges "
+                "JOIN nodes ON nodes.qualified_name = edges.source_qualified "
+                "WHERE edges.target_qualified = ? AND edges.kind = ? "
+                f"AND nodes.language IN ({placeholders})",
+                (name, kind, *languages),
+            )
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM edges WHERE target_qualified = ? AND kind = ?",
+                (name, kind),
+            )
         for row in rows:
             yield self._row_to_edge(row)
 
@@ -444,10 +539,13 @@ class GraphStore:
         seen: set[str] = set()
         results: list[dict] = []
 
-        # If the input is a class, expand to its methods first.
+        # If the input is a class or file, expand to the production symbols it
+        # contains first. File targets are accepted by the public query tool,
+        # so tests_for("src/Foo.php") must cover methods nested under classes
+        # as well as top-level functions.
         input_qns = [qualified_name]
         row = conn.execute(
-            "SELECT kind FROM nodes WHERE qualified_name = ?",
+            "SELECT kind, file_path FROM nodes WHERE qualified_name = ?",
             (qualified_name,),
         ).fetchone()
         if row and row["kind"] == "Class":
@@ -457,6 +555,14 @@ class GraphStore:
                 (qualified_name,),
             ).fetchall():
                 input_qns.append(mrow["target_qualified"])
+        elif row and row["kind"] == "File":
+            for symbol in conn.execute(
+                "SELECT qualified_name FROM nodes "
+                "WHERE file_path = ? AND qualified_name != ? "
+                "AND kind IN ('Class', 'Function', 'Method')",
+                (row["file_path"], qualified_name),
+            ).fetchall():
+                input_qns.append(symbol["qualified_name"])
 
         def _node_dict(qn: str, indirect: bool) -> dict | None:
             row = conn.execute(
@@ -472,13 +578,25 @@ class GraphStore:
                 "indirect": indirect,
             }
 
+        def _has_unresolved_metadata(raw_extra: str | None) -> bool:
+            try:
+                edge_extra = json.loads(raw_extra or "{}")
+            except (TypeError, json.JSONDecodeError):
+                return False
+            return isinstance(edge_extra, dict) and (
+                "ambiguous_targets" in edge_extra
+                or "unresolved_targets" in edge_extra
+            )
+
         # Direct TESTED_BY (source=production, target=test). See: #515
         for qn in input_qns:
             for row in conn.execute(
-                "SELECT target_qualified FROM edges "
+                "SELECT target_qualified, extra FROM edges "
                 "WHERE source_qualified = ? AND kind = 'TESTED_BY'",
                 (qn,),
             ).fetchall():
+                if _has_unresolved_metadata(row["extra"]):
+                    continue
                 tgt = row["target_qualified"]
                 if tgt not in seen:
                     seen.add(tgt)
@@ -522,10 +640,12 @@ class GraphStore:
             )
 
         for row in conn.execute(
-            "SELECT target_qualified, file_path FROM edges "
+            "SELECT target_qualified, file_path, extra FROM edges "
             "WHERE source_qualified = ? AND kind = 'TESTED_BY'",
             (bare,),
         ).fetchall():
+            if _has_unresolved_metadata(row["extra"]):
+                continue
             if _candidate_for_context(bare, row["file_path"]) != qualified_name:
                 continue
             tgt = row["target_qualified"]
@@ -541,10 +661,12 @@ class GraphStore:
             next_frontier: set[str] = set()
             for qn in frontier:
                 for row in conn.execute(
-                    "SELECT target_qualified FROM edges "
+                    "SELECT target_qualified, extra FROM edges "
                     "WHERE source_qualified = ? AND kind = 'CALLS'",
                     (qn,),
                 ).fetchall():
+                    if _has_unresolved_metadata(row["extra"]):
+                        continue
                     next_frontier.add(row["target_qualified"])
             if len(next_frontier) > max_frontier:
                 next_frontier = set(list(next_frontier)[:max_frontier])
@@ -555,10 +677,12 @@ class GraphStore:
                 if "::" not in callee:
                     continue
                 for row in conn.execute(
-                    "SELECT target_qualified FROM edges "
+                    "SELECT target_qualified, extra FROM edges "
                     "WHERE source_qualified = ? AND kind = 'TESTED_BY'",
                     (callee,),
                 ).fetchall():
+                    if _has_unresolved_metadata(row["extra"]):
+                        continue
                     tgt = row["target_qualified"]
                     if tgt not in seen:
                         seen.add(tgt)
@@ -596,6 +720,213 @@ class GraphStore:
         """
         return self._resolve_bare_endpoints("CALLS", "target_qualified")
 
+    def resolve_cpp_scoped_call_targets(self) -> int:
+        """Resolve cross-file C++ ``Scope::call`` targets by stable scope identity.
+
+        An explicit C++ scope is stronger evidence than a globally unique bare
+        name. Resolve it when exactly one signature-bearing node matches; keep
+        overload sets explicit and bounded when more than one node matches.
+        """
+        rows = self._conn.execute(
+            "SELECT e.id, e.source_qualified, e.target_qualified, e.file_path, "
+            "e.line, e.extra, s.parent_name, t.id target_id "
+            "FROM edges e "
+            "JOIN nodes s ON s.qualified_name = e.source_qualified "
+            "LEFT JOIN nodes t ON t.qualified_name = e.target_qualified "
+            "WHERE e.kind = 'CALLS' AND s.language = 'cpp' "
+            "AND ((t.id IS NULL AND e.target_qualified LIKE '%::%') "
+            "OR e.extra LIKE '%\"cpp_scoped_target\"%')",
+        ).fetchall()
+        if not rows:
+            return 0
+
+        candidates_by_name: dict[str, list[sqlite3.Row]] = {}
+        for candidate in self._conn.execute(
+            "SELECT name, qualified_name, parent_name FROM nodes "
+            "WHERE language = 'cpp' AND kind IN ('Function', 'Test') "
+            "ORDER BY qualified_name",
+        ).fetchall():
+            candidates_by_name.setdefault(candidate["name"], []).append(candidate)
+
+        resolved = 0
+        changed = False
+
+        def sync_tested_by(
+            call_edge: sqlite3.Row,
+            original_target: str,
+            source_qualified: str,
+            desired_extra: dict,
+            serialized_extra: str,
+        ) -> bool:
+            """Keep parser-generated TESTED_BY mirrors aligned with CALLS."""
+            changed_mirror = False
+            mirrors = self._conn.execute(
+                "SELECT id, source_qualified, extra FROM edges "
+                "WHERE kind = 'TESTED_BY' AND target_qualified = ? "
+                "AND file_path = ? AND line = ?",
+                (
+                    call_edge["source_qualified"],
+                    call_edge["file_path"],
+                    call_edge["line"],
+                ),
+            ).fetchall()
+            for mirror in mirrors:
+                try:
+                    mirror_extra = json.loads(mirror["extra"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    mirror_extra = {}
+                mirror_original = (
+                    mirror_extra.get("cpp_scoped_target")
+                    if isinstance(mirror_extra, dict)
+                    else None
+                )
+                if (
+                    mirror["source_qualified"]
+                    not in (call_edge["target_qualified"], original_target)
+                    and mirror_original != original_target
+                ):
+                    continue
+                if (
+                    mirror["source_qualified"] == source_qualified
+                    and mirror_extra == desired_extra
+                ):
+                    continue
+                self._conn.execute(
+                    "UPDATE edges SET source_qualified = ?, extra = ? WHERE id = ?",
+                    (source_qualified, serialized_extra, mirror["id"]),
+                )
+                changed_mirror = True
+            return changed_mirror
+
+        for edge in rows:
+            try:
+                extra = json.loads(edge["extra"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+            previous_extra = dict(extra)
+
+            original_target = extra.get("cpp_scoped_target")
+            target = (
+                original_target
+                if isinstance(original_target, str)
+                else edge["target_qualified"]
+            )
+            global_scope = target.startswith("::")
+            normalized = target.lstrip(":")
+            if "::" not in normalized:
+                continue
+            explicit_scope, bare_name = normalized.rsplit("::", 1)
+            explicit_scope = explicit_scope.replace("::", ".")
+
+            preferred_scopes: list[str] = []
+            source_scope = edge["parent_name"]
+            if not global_scope:
+                while source_scope:
+                    preferred_scopes.append(f"{source_scope}.{explicit_scope}")
+                    source_scope = (
+                        source_scope.rsplit(".", 1)[0]
+                        if "." in source_scope
+                        else None
+                    )
+            preferred_scopes.append(explicit_scope)
+
+            candidates: list[str] = []
+            for preferred_scope in preferred_scopes:
+                candidates = [
+                    candidate["qualified_name"]
+                    for candidate in candidates_by_name.get(bare_name, [])
+                    if candidate["parent_name"] == preferred_scope
+                ]
+                if candidates:
+                    break
+
+            if len(candidates) == 1:
+                extra["cpp_scoped_target"] = target
+                for key in (
+                    "ambiguous_targets",
+                    "ambiguous_target_count",
+                    "ambiguous_targets_truncated",
+                    "unresolved_targets",
+                    "unresolved_target_count",
+                    "unresolved_targets_truncated",
+                ):
+                    extra.pop(key, None)
+                serialized_extra = json.dumps(extra, sort_keys=True)
+                call_changed = (
+                    edge["target_qualified"] != candidates[0]
+                    or previous_extra != extra
+                )
+                if call_changed:
+                    self._conn.execute(
+                        "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+                        (candidates[0], serialized_extra, edge["id"]),
+                    )
+                    resolved += 1
+                mirror_changed = sync_tested_by(
+                    edge, target, candidates[0], extra, serialized_extra,
+                )
+                changed = changed or call_changed or mirror_changed
+            elif len(candidates) > 1:
+                for key in (
+                    "unresolved_targets",
+                    "unresolved_target_count",
+                    "unresolved_targets_truncated",
+                ):
+                    extra.pop(key, None)
+                extra.update({
+                    "cpp_scoped_target": target,
+                    "ambiguous_targets": candidates[:20],
+                    "ambiguous_target_count": len(candidates),
+                    "ambiguous_targets_truncated": len(candidates) > 20,
+                })
+                serialized_extra = json.dumps(extra, sort_keys=True)
+                call_changed = (
+                    edge["target_qualified"] != target
+                    or previous_extra != extra
+                )
+                if call_changed:
+                    self._conn.execute(
+                        "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+                        (target, serialized_extra, edge["id"]),
+                    )
+                mirror_changed = sync_tested_by(
+                    edge, target, target, extra, serialized_extra,
+                )
+                changed = changed or call_changed or mirror_changed
+            else:
+                extra["cpp_scoped_target"] = target
+                for key in (
+                    "ambiguous_targets",
+                    "ambiguous_target_count",
+                    "ambiguous_targets_truncated",
+                ):
+                    extra.pop(key, None)
+                extra.update({
+                    "unresolved_targets": [],
+                    "unresolved_target_count": 0,
+                    "unresolved_targets_truncated": False,
+                })
+                serialized_extra = json.dumps(extra, sort_keys=True)
+                call_changed = (
+                    edge["target_qualified"] != target
+                    or previous_extra != extra
+                )
+                if call_changed:
+                    self._conn.execute(
+                        "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+                        (target, serialized_extra, edge["id"]),
+                    )
+                mirror_changed = sync_tested_by(
+                    edge, target, target, extra, serialized_extra,
+                )
+                changed = changed or call_changed or mirror_changed
+
+        if changed:
+            self._conn.commit()
+        return resolved
+
     def resolve_bare_tested_by_sources(self) -> int:
         """Resolve bare TESTED_BY sources backed by graph evidence.
 
@@ -611,19 +942,23 @@ class GraphStore:
     def _resolve_bare_endpoints(self, kind: str, endpoint: str) -> int:
         """Resolve a bare edge endpoint only when one candidate has evidence."""
         if endpoint == "target_qualified":
+            raw_key = "bare_call_target"
+            endpoint_column = "target_qualified"
             select_sql = (
-                "SELECT id, source_qualified, target_qualified, file_path "
+                "SELECT id, source_qualified, target_qualified, file_path, extra "
                 "FROM edges WHERE kind = ? "
-                "AND target_qualified NOT LIKE '%::%'"
+                "AND (target_qualified NOT LIKE '%::%' "
+                "OR extra LIKE '%\"bare_call_target\"%')"
             )
-            update_sql = "UPDATE edges SET target_qualified = ? WHERE id = ?"
         elif endpoint == "source_qualified":
+            raw_key = "bare_tested_by_source"
+            endpoint_column = "source_qualified"
             select_sql = (
-                "SELECT id, source_qualified, target_qualified, file_path "
+                "SELECT id, source_qualified, target_qualified, file_path, extra "
                 "FROM edges WHERE kind = ? "
-                "AND source_qualified NOT LIKE '%::%'"
+                "AND (source_qualified NOT LIKE '%::%' "
+                "OR extra LIKE '%\"bare_tested_by_source\"%')"
             )
-            update_sql = "UPDATE edges SET source_qualified = ? WHERE id = ?"
         else:
             raise ValueError(f"Invalid edge endpoint column: {endpoint!r}")
 
@@ -645,36 +980,145 @@ class GraphStore:
 
         # call-site file -> explicitly imported files
         import_targets: dict[str, set[str]] = {}
+        # Python's repository-suffix resolver keeps a raw import when multiple
+        # indexed modules match and records the candidate files in edge metadata.
+        # Carry that evidence into bare CALLS / TESTED_BY endpoints so a graph
+        # first built in the ambiguous state cannot fall back to a name-only
+        # caller match for every candidate.
+        ambiguous_import_targets: dict[str, set[str]] = {}
         for row in conn.execute(
-            "SELECT DISTINCT file_path, target_qualified FROM edges "
+            "SELECT DISTINCT file_path, target_qualified, extra FROM edges "
             "WHERE kind = 'IMPORTS_FROM'"
         ).fetchall():
             target = row["target_qualified"]
             target_file = target.split("::", 1)[0] if "::" in target else target
             import_targets.setdefault(row["file_path"], set()).add(target_file)
+            try:
+                import_extra = json.loads(row["extra"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                import_extra = {}
+            if (
+                isinstance(import_extra, dict)
+                and import_extra.get("import_resolution") == "ambiguous"
+                and isinstance(import_extra.get("import_candidates"), list)
+            ):
+                ambiguous_import_targets.setdefault(
+                    row["file_path"], set(),
+                ).update(
+                    candidate
+                    for candidate in import_extra["import_candidates"]
+                    if isinstance(candidate, str)
+                )
 
         resolved = 0
+        changed = False
         for edge in bare_edges:
-            bare_name = edge[endpoint]
-            candidates = node_lookup.get(bare_name, [])
-            if not candidates:
+            try:
+                edge_extra = json.loads(edge["extra"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                edge_extra = {}
+            if not isinstance(edge_extra, dict):
+                edge_extra = {}
+            if raw_key not in edge_extra and (
+                "ambiguous_targets" in edge_extra
+                or "unresolved_targets" in edge_extra
+            ):
                 continue
+
+            bare_name = edge_extra.get(raw_key, edge[endpoint])
+            if not isinstance(bare_name, str):
+                continue
+            candidates = node_lookup.get(bare_name, [])
 
             context_file = edge["file_path"]
             imported_files = import_targets.get(context_file, set())
-            qualified = self._select_evidence_backed_candidate(
-                candidates,
-                context_file,
-                imported_files,
-            )
-            if qualified is None:
+            supported = [
+                qualified
+                for qualified, candidate_file in candidates
+                if candidate_file == context_file or candidate_file in imported_files
+            ]
+            ambiguous_files = ambiguous_import_targets.get(context_file, set())
+            ambiguity_supported = [
+                qualified
+                for qualified, candidate_file in candidates
+                if candidate_file in ambiguous_files
+            ]
+            managed = raw_key in edge_extra
+            if (
+                len(supported) != 1
+                and not managed
+                and len(supported) < 2
+                and not ambiguity_supported
+            ):
                 continue
+            desired_extra = dict(edge_extra)
+            desired_extra[raw_key] = bare_name
+            if len(supported) == 1:
+                desired_endpoint = supported[0]
+                for key in (
+                    "ambiguous_targets",
+                    "ambiguous_target_count",
+                    "ambiguous_targets_truncated",
+                    "unresolved_targets",
+                    "unresolved_target_count",
+                    "unresolved_targets_truncated",
+                ):
+                    desired_extra.pop(key, None)
+            else:
+                desired_endpoint = bare_name
+                if len(supported) > 1:
+                    resolution = "ambiguous"
+                    resolution_candidates = supported
+                    other = "unresolved"
+                elif ambiguity_supported:
+                    resolution = (
+                        "ambiguous"
+                        if len(ambiguity_supported) > 1
+                        else "unresolved"
+                    )
+                    resolution_candidates = ambiguity_supported
+                    other = (
+                        "unresolved"
+                        if resolution == "ambiguous"
+                        else "ambiguous"
+                    )
+                else:
+                    resolution = "unresolved"
+                    resolution_candidates = [
+                        qualified for qualified, _ in candidates
+                    ]
+                    other = "ambiguous"
+                for key in (
+                    f"{other}_targets",
+                    f"{other}_target_count",
+                    f"{other}_targets_truncated",
+                ):
+                    desired_extra.pop(key, None)
+                desired_extra.update({
+                    f"{resolution}_targets": resolution_candidates[:20],
+                    f"{resolution}_target_count": len(resolution_candidates),
+                    f"{resolution}_targets_truncated": (
+                        len(resolution_candidates) > 20
+                    ),
+                })
 
-            conn.execute(update_sql, (qualified, edge["id"]))
-            resolved += 1
+            serialized_extra = json.dumps(desired_extra, sort_keys=True)
+            if (
+                edge[endpoint] == desired_endpoint
+                and edge_extra == desired_extra
+            ):
+                continue
+            conn.execute(
+                f"UPDATE edges SET {endpoint_column} = ?, extra = ? WHERE id = ?",
+                (desired_endpoint, serialized_extra, edge["id"]),
+            )
+            changed = True
+            if len(supported) == 1 and edge[endpoint] != desired_endpoint:
+                resolved += 1
 
-        if resolved:
+        if changed:
             conn.commit()
+        if resolved:
             endpoint_label = (
                 "sources" if endpoint == "source_qualified" else "targets"
             )
@@ -737,6 +1181,62 @@ class GraphStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    def count_search_nodes(self, query: str) -> int:
+        """Count nodes using the same FTS-first semantics as ``search_nodes``."""
+        words = query.split()
+        if not words:
+            return 0
+
+        try:
+            if len(words) == 1:
+                fts_query = '"' + query.replace('"', '""') + '"'
+            else:
+                fts_query = " AND ".join(
+                    '"' + word.replace('"', '""') + '"' for word in words
+                )
+            count = self._conn.execute(
+                "SELECT COUNT(*) FROM nodes_fts f "
+                "JOIN nodes n ON f.rowid = n.id "
+                "WHERE nodes_fts MATCH ?",
+                (fts_query,),
+            ).fetchone()[0]
+            if count:
+                return int(count)
+        except Exception:  # nosec B110 - FTS5 may not exist on older schemas
+            pass
+
+        conditions: list[str] = []
+        params: list[str] = []
+        for word in words:
+            value = word.lower()
+            conditions.append(
+                "(LOWER(name) LIKE ? OR LOWER(qualified_name) LIKE ?)"
+            )
+            params.extend([f"%{value}%", f"%{value}%"])
+        where = " AND ".join(conditions)
+        sql = f"SELECT COUNT(*) FROM nodes WHERE {where}"  # nosec B608
+        return int(self._conn.execute(sql, params).fetchone()[0])
+
+    def count_nodes_by_name(
+        self,
+        name: str,
+        language: str | None = None,
+        kinds: tuple[str, ...] = (),
+    ) -> int:
+        """Count exact-name nodes with optional language and kind filters."""
+        conditions = ["name = ?"]
+        params: list[Any] = [name]
+        if language is not None:
+            conditions.append("language = ?")
+            params.append(language)
+        if kinds:
+            placeholders = ", ".join("?" for _ in kinds)
+            conditions.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        where = " AND ".join(conditions)
+        sql = f"SELECT COUNT(*) FROM nodes WHERE {where}"  # nosec B608
+        return int(self._conn.execute(sql, params).fetchone()[0])
+
     # --- Impact / Graph traversal ---
 
     def get_impact_radius(
@@ -745,11 +1245,16 @@ class GraphStore:
         max_depth: int = MAX_IMPACT_DEPTH,
         max_nodes: int = MAX_IMPACT_NODES,
     ) -> dict[str, Any]:
-        """BFS from changed files to find all impacted nodes within depth N.
+        """Find dependents and tests impacted by changed files within depth N.
 
         Delegates to ``get_impact_radius_sql()`` by default (faster for
         large graphs).  Set ``CRG_BFS_ENGINE=networkx`` to use the legacy
         Python-side BFS via NetworkX.
+
+        Dependency-shaped edges propagate from target to source, while
+        TESTED_BY propagates from production source to test target. CONTAINS
+        does not expand the traversal because every node in a changed file is
+        already seeded.
 
         Returns dict with:
           - changed_nodes: nodes in changed files
@@ -832,13 +1337,24 @@ class GraphStore:
         # many paths; these three bounded temp tables contain at most one row
         # per qualified name and each iteration scans the edge table once.
         self._conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _impact_weights "
-            "(kind TEXT PRIMARY KEY, weight REAL NOT NULL)"
+            "CREATE TEMP TABLE IF NOT EXISTS _impact_policies "
+            "(kind TEXT PRIMARY KEY, weight REAL NOT NULL, "
+            "direction TEXT NOT NULL)"
         )
-        self._conn.execute("DELETE FROM _impact_weights")
+        self._conn.execute("DELETE FROM _impact_policies")
         self._conn.executemany(
-            "INSERT INTO _impact_weights (kind, weight) VALUES (?, ?)",
-            list(IMPACT_EDGE_WEIGHTS.items()),
+            "INSERT INTO _impact_policies "
+            "(kind, weight, direction) VALUES (?, ?, ?)",
+            [
+                (
+                    kind,
+                    weight,
+                    IMPACT_EDGE_DIRECTIONS.get(
+                        kind, IMPACT_DEFAULT_EDGE_DIRECTION,
+                    ),
+                )
+                for kind, weight in IMPACT_EDGE_WEIGHTS.items()
+            ],
         )
         for table in ("_impact_best", "_impact_frontier", "_impact_next"):
             self._conn.execute(
@@ -861,16 +1377,18 @@ class GraphStore:
         SELECT node_qn, MAX(score)
         FROM (
             SELECT e.target_qualified AS node_qn,
-                   f.score * COALESCE(w.weight, ?) * ? AS score
+                   f.score * COALESCE(p.weight, ?) * ? AS score
             FROM _impact_frontier f
             JOIN edges e ON e.source_qualified = f.node_qn
-            LEFT JOIN _impact_weights w ON w.kind = e.kind
+            LEFT JOIN _impact_policies p ON p.kind = e.kind
+            WHERE COALESCE(p.direction, ?) = ?
             UNION ALL
             SELECT e.source_qualified AS node_qn,
-                   f.score * COALESCE(w.weight, ?) * ? AS score
+                   f.score * COALESCE(p.weight, ?) * ? AS score
             FROM _impact_frontier f
             JOIN edges e ON e.target_qualified = f.node_qn
-            LEFT JOIN _impact_weights w ON w.kind = e.kind
+            LEFT JOIN _impact_policies p ON p.kind = e.kind
+            WHERE COALESCE(p.direction, ?) = ?
         ) candidates
         WHERE score > ?
         GROUP BY node_qn
@@ -878,8 +1396,12 @@ class GraphStore:
         candidate_params = (
             IMPACT_DEFAULT_EDGE_WEIGHT,
             IMPACT_DEPTH_DECAY,
+            IMPACT_DEFAULT_EDGE_DIRECTION,
+            IMPACT_DIRECTION_OUTGOING,
             IMPACT_DEFAULT_EDGE_WEIGHT,
             IMPACT_DEPTH_DECAY,
+            IMPACT_DEFAULT_EDGE_DIRECTION,
+            IMPACT_DIRECTION_INCOMING,
             IMPACT_SCORE_FLOOR,
         )
         for _ in range(max_depth):
@@ -996,16 +1518,15 @@ class GraphStore:
                 if qn not in nxg:
                     continue
                 neighbors = [
-                    (target, data)
+                    (target, data["impact_outgoing_weight"])
                     for _, target, data in nxg.out_edges(qn, data=True)
+                    if "impact_outgoing_weight" in data
                 ] + [
-                    (source, data)
+                    (source, data["impact_incoming_weight"])
                     for source, _, data in nxg.in_edges(qn, data=True)
+                    if "impact_incoming_weight" in data
                 ]
-                for other_qn, data in neighbors:
-                    weight = IMPACT_EDGE_WEIGHTS.get(
-                        data.get("kind", ""), IMPACT_DEFAULT_EDGE_WEIGHT,
-                    )
+                for other_qn, weight in neighbors:
                     new_score = score * weight * IMPACT_DEPTH_DECAY
                     if new_score <= IMPACT_SCORE_FLOOR:
                         continue
@@ -1529,7 +2050,7 @@ class GraphStore:
     # --- Internal helpers ---
 
     def _build_networkx_graph(self) -> nx.DiGraph:
-        """Build a directed graph, retaining the strongest parallel edge."""
+        """Build a directed graph with impact weights for both policies."""
         with self._cache_lock:
             if self._nxg_cache is not None:
                 return self._nxg_cache
@@ -1539,26 +2060,36 @@ class GraphStore:
                 source = r["source_qualified"]
                 target = r["target_qualified"]
                 kind = r["kind"]
-                if g.has_edge(source, target):
-                    existing = g[source][target].get("kind", "")
-                    existing_weight = IMPACT_EDGE_WEIGHTS.get(
-                        existing, IMPACT_DEFAULT_EDGE_WEIGHT,
+                candidate_weight = IMPACT_EDGE_WEIGHTS.get(
+                    kind, IMPACT_DEFAULT_EDGE_WEIGHT,
+                )
+                if not g.has_edge(source, target):
+                    g.add_edge(source, target, kind=kind)
+                data = g[source][target]
+                existing_weight = IMPACT_EDGE_WEIGHTS.get(
+                    data.get("kind", ""), IMPACT_DEFAULT_EDGE_WEIGHT,
+                )
+                if candidate_weight > existing_weight:
+                    data["kind"] = kind
+
+                direction = IMPACT_EDGE_DIRECTIONS.get(
+                    kind, IMPACT_DEFAULT_EDGE_DIRECTION,
+                )
+                if direction != IMPACT_DIRECTION_NONE:
+                    weight_key = f"impact_{direction}_weight"
+                    data[weight_key] = max(
+                        data.get(weight_key, 0.0), candidate_weight,
                     )
-                    candidate_weight = IMPACT_EDGE_WEIGHTS.get(
-                        kind, IMPACT_DEFAULT_EDGE_WEIGHT,
-                    )
-                    if candidate_weight <= existing_weight:
-                        continue
-                g.add_edge(source, target, kind=kind)
             self._nxg_cache = g
             return g
 
     def _make_qualified(self, node: NodeInfo) -> str:
         if node.kind == "File":
             return node.file_path
+        identity_name = node.identity_name or node.name
         if node.parent_name:
-            return f"{node.file_path}::{node.parent_name}.{node.name}"
-        return f"{node.file_path}::{node.name}"
+            return f"{node.file_path}::{node.parent_name}.{identity_name}"
+        return f"{node.file_path}::{identity_name}"
 
     def _row_to_node(self, row: sqlite3.Row) -> GraphNode:
         return GraphNode(
@@ -1624,10 +2155,28 @@ def node_to_dict(n: GraphNode) -> dict:
 
 
 def edge_to_dict(e: GraphEdge) -> dict:
-    return {
+    result: dict = {
         "id": e.id, "kind": e.kind,
         "source": _sanitize_name(e.source_qualified),
         "target": _sanitize_name(e.target_qualified),
         "file_path": e.file_path, "line": e.line,
         "confidence": e.confidence, "confidence_tier": e.confidence_tier,
     }
+    for key in ("ambiguous_targets", "unresolved_targets"):
+        targets = e.extra.get(key)
+        if isinstance(targets, list):
+            result[key] = [
+                _sanitize_name(target)
+                for target in targets[:20]
+                if isinstance(target, str)
+            ]
+            resolution = key.removesuffix("_targets")
+            count = e.extra.get(f"{resolution}_target_count")
+            if not isinstance(count, int):
+                count = len(targets)
+            result[f"{resolution}_target_count"] = count
+            result[f"{resolution}_targets_truncated"] = bool(
+                e.extra.get(f"{resolution}_targets_truncated")
+                or count > len(result[key])
+            )
+    return result

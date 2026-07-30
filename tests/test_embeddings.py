@@ -2,7 +2,9 @@
 
 import json
 import os
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from code_review_graph.embeddings import (
     LOCAL_DEFAULT_MODEL,
     EmbeddingStore,
+    GoogleEmbeddingProvider,
     LocalEmbeddingProvider,
     MiniMaxEmbeddingProvider,
     OpenAIEmbeddingProvider,
@@ -189,6 +192,48 @@ class TestLocalEmbeddingProviderModelName:
             assert provider.name == "local:BAAI/bge-small-en-v1.5"
 
 
+class TestGoogleEmbeddingProviderRetryLogging:
+    def test_retryable_error_logs_attempt_fraction_then_succeeds(self, caplog):
+        fn = MagicMock(side_effect=[RuntimeError("429 rate limited"), [1.0]])
+
+        with patch("code_review_graph.embeddings.time.sleep") as sleep:
+            result = GoogleEmbeddingProvider._call_with_retry(fn)
+
+        assert result == [1.0]
+        assert fn.call_count == 2
+        sleep.assert_called_once_with(1)
+        assert "Gemini API retry 1/3 in 1s (RuntimeError)" in caplog.text
+
+    def test_non_retryable_error_logs_once_without_sleeping(self, caplog):
+        caplog.set_level("DEBUG")
+        fn = MagicMock(side_effect=ValueError("400 invalid request"))
+
+        with (
+            patch("code_review_graph.embeddings.time.sleep") as sleep,
+            pytest.raises(ValueError, match="400 invalid request"),
+        ):
+            GoogleEmbeddingProvider._call_with_retry(fn)
+
+        fn.assert_called_once_with()
+        sleep.assert_not_called()
+        assert "Non-retryable Gemini API error: ValueError" in caplog.text
+
+    def test_exhausted_retries_log_each_attempt_and_final_error(self, caplog):
+        fn = MagicMock(side_effect=RuntimeError("503 unavailable"))
+
+        with (
+            patch("code_review_graph.embeddings.time.sleep") as sleep,
+            pytest.raises(RuntimeError, match="503 unavailable"),
+        ):
+            GoogleEmbeddingProvider._call_with_retry(fn)
+
+        assert fn.call_count == 3
+        assert [call.args for call in sleep.call_args_list] == [(1,), (2,)]
+        assert "Gemini API retry 1/3 in 1s (RuntimeError)" in caplog.text
+        assert "Gemini API retry 2/3 in 2s (RuntimeError)" in caplog.text
+        assert "Gemini API request failed after 3 requests" in caplog.text
+
+
 class TestGetProviderValidation:
     """Unknown provider names must raise instead of silently using local."""
 
@@ -236,6 +281,46 @@ class TestGetProviderValidation:
         assert get_provider(None) is mock_cls.return_value
         assert get_provider("") is mock_cls.return_value
         assert get_provider("   ") is mock_cls.return_value
+
+    @patch("code_review_graph.embeddings.OpenAIEmbeddingProvider")
+    def test_none_defaults_to_openai_when_env_configured(self, mock_cls):
+        """When provider is omitted but OpenAI env vars are set, default to
+        the OpenAI-compatible provider instead of local (#551)."""
+        mock_cls.return_value = MagicMock()
+        env = {
+            "CRG_OPENAI_API_KEY": "fake-key",
+            "CRG_OPENAI_BASE_URL": "http://localhost:11434/v1",
+            "CRG_OPENAI_MODEL": "nomic-embed-text",
+            "CRG_ACCEPT_CLOUD_EMBEDDINGS": "1",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            provider = get_provider(None)
+        assert provider is mock_cls.return_value
+        mock_cls.assert_called_once_with(
+            api_key="fake-key",
+            base_url="http://localhost:11434/v1",
+            model="nomic-embed-text",
+            dimension=None,
+            batch_size=None,
+        )
+
+    @patch("code_review_graph.embeddings.OpenAIEmbeddingProvider")
+    @patch("code_review_graph.embeddings.LocalEmbeddingProvider")
+    @patch("code_review_graph.embeddings._check_available", return_value=True)
+    def test_explicit_blank_stays_local_when_openai_env_configured(
+        self, _mock_available, local_cls, openai_cls,
+    ):
+        """Only an omitted provider should use the configured OpenAI default."""
+        local_cls.return_value = MagicMock()
+        env = {
+            "CRG_OPENAI_API_KEY": "fake-key",
+            "CRG_OPENAI_BASE_URL": "http://localhost:11434/v1",
+            "CRG_OPENAI_MODEL": "nomic-embed-text",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            assert get_provider("") is local_cls.return_value
+            assert get_provider("   ") is local_cls.return_value
+        openai_cls.assert_not_called()
 
 
 class TestGetProviderModel:
@@ -502,6 +587,47 @@ def _make_openai_response(vectors: list[list[float]]) -> MagicMock:
     return mock
 
 
+@pytest.fixture
+def openai_loopback_server():
+    """Serve deterministic OpenAI-compatible embeddings on loopback."""
+    payloads: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            size = int(self.headers["Content-Length"])
+            payload = json.loads(self.rfile.read(size))
+            payloads.append(payload)
+
+            dimension = payload.get("dimensions", 7)
+            response = {
+                "data": [
+                    {"embedding": [0.1] * dimension, "index": index}
+                    for index, _text in enumerate(payload["input"])
+                ],
+                "model": payload["model"],
+            }
+            body = json.dumps(response).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}/v1", payloads
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 class TestIsLocalhostUrl:
     """Ensure localhost detection is robust against subdomain tricks."""
 
@@ -595,6 +721,100 @@ class TestOpenAIEmbeddingProvider:
             p.embed_query("x")
         payload = json.loads(mock_urlopen.call_args[0][0].data.decode("utf-8"))
         assert payload["dimensions"] == 256
+
+    def test_loopback_auto_learned_dimension_is_never_resent(
+        self, openai_loopback_server,
+    ):
+        base_url, payloads = openai_loopback_server
+        provider = OpenAIEmbeddingProvider(
+            api_key="k",
+            base_url=base_url,
+            model="text-embedding-3-small",
+        )
+
+        assert len(provider.embed_query("first")) == 7
+        assert provider.dimension == 7
+        assert len(provider.embed_query("second")) == 7
+
+        assert len(payloads) == 2
+        assert all("dimensions" not in payload for payload in payloads)
+
+    def test_loopback_explicit_dimension_is_sent_for_custom_model_alias(
+        self, openai_loopback_server,
+    ):
+        base_url, payloads = openai_loopback_server
+        provider = OpenAIEmbeddingProvider(
+            api_key="k",
+            base_url=base_url,
+            model="azure-production-deployment",
+            dimension=4,
+        )
+
+        assert len(provider.embed_query("custom alias")) == 4
+        assert payloads == [{
+            "model": "azure-production-deployment",
+            "input": ["custom alias"],
+            "dimensions": 4,
+        }]
+
+    def test_auto_learned_dimension_omitted_for_non_v3_models(self):
+        # Many OpenAI-compatible providers (SiliconFlow, Cohere, voyage-3,
+        # custom vLLM gateways) reject the `dimensions` body field with
+        # HTTP 400. The provider auto-learns dimension from the first
+        # response and would otherwise forward it on every subsequent call.
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1",
+            model="BAAI/bge-m3",
+        )
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_make_openai_response([[0.1] * 1024]),
+        ) as mock_urlopen:
+            vec = p.embed_query("x")
+        assert len(vec) == 1024
+        assert p.dimension == 1024
+
+        # Second call would have auto-forwarded dimensions before the fix.
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_make_openai_response([[0.1] * 1024]),
+        ) as mock_urlopen:
+            p.embed_query("y")
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode("utf-8"))
+        assert "dimensions" not in payload, (
+            f"non-v3 model {p._model!r} should not send `dimensions`; "
+            f"got payload keys: {list(payload)}"
+        )
+
+    def test_explicit_dimension_forwarded_for_non_v3_models(self):
+        # Explicit requests must not be inferred from the model name. OpenAI-
+        # compatible gateways can expose dimension-capable models under
+        # arbitrary aliases.
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1",
+            model="BAAI/bge-m3", dimension=1024,
+        )
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_make_openai_response([[0.1] * 1024]),
+        ) as mock_urlopen:
+            p.embed_query("x")
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode("utf-8"))
+        assert payload["dimensions"] == 1024
+
+    def test_explicit_dimension_forwarded_for_v3_models(self):
+        # Regression guard: v3 models must still honor the pinned dimension.
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1",
+            model="text-embedding-3-large", dimension=512,
+        )
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_make_openai_response([[0.1] * 512]),
+        ) as mock_urlopen:
+            p.embed_query("x")
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode("utf-8"))
+        assert payload["dimensions"] == 512
 
     def test_base_url_trailing_slash_stripped(self):
         p = OpenAIEmbeddingProvider(

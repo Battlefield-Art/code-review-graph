@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _QUERY_PATTERNS = {
     "callers_of": "Find all functions that call a given function",
+    "references_to": "Find all nodes that reference a given symbol",
     "callees_of": "Find all functions called by a given function",
     "imports_of": "Find all imports of a given file or module",
     "importers_of": "Find all files that import a given file or module",
@@ -234,8 +235,8 @@ def query_graph(
     """Run a predefined graph query.
 
     Args:
-        pattern: Query pattern. One of: callers_of, callees_of, imports_of,
-                 importers_of, children_of, tests_for, inheritors_of,
+        pattern: Query pattern. One of: callers_of, references_to, callees_of,
+                 imports_of, importers_of, children_of, tests_for, inheritors_of,
                  triggers_of, triggered_by, publishers_of, listeners_of,
                  handlers_of, endpoints_for, consumers_of, file_summary.
         target: The node name, qualified name, or file path to query about.
@@ -312,21 +313,38 @@ def query_graph(
                     if java_candidates is not None
                     else store.search_nodes(target, limit=20)
                 )
+                if pattern == "inheritors_of" and "::" not in target:
+                    exact_type_candidates = [
+                        candidate
+                        for candidate in candidates
+                        if candidate.name == target
+                        and candidate.kind
+                        in {"Class", "Interface", "Type", "Struct", "Enum", "Trait"}
+                    ]
+                    if exact_type_candidates:
+                        candidates = exact_type_candidates
                 if len(candidates) == 1:
                     node = candidates[0]
                     target = node.qualified_name
                 elif len(candidates) > 1:
+                    candidate_count = (
+                        len(candidates)
+                        if java_candidates is not None
+                        else store.count_search_nodes(target)
+                    )
                     ranked = _rank_disambiguation_candidates(candidates, target)
                     return {
                         "status": "ambiguous",
                         "summary": (
-                            f"'{target}' matches {len(candidates)} node(s). "
+                            f"'{target}' matches {candidate_count} node(s). "
                             "Re-run with a qualified_name from disambiguation."
                         ),
                         # Preserve the established key while adding the clearer
                         # agent-facing name introduced by #458.
                         "candidates": ranked,
                         "disambiguation": ranked,
+                        "candidate_count": candidate_count,
+                        "candidates_truncated": candidate_count > len(candidates),
                         "hint": (
                             "Use a qualified_name from disambiguation as the "
                             "target parameter."
@@ -354,12 +372,50 @@ def query_graph(
             # (e.g. "generateTestCode") while qn is fully qualified
             # (e.g. "file.ts::generateTestCode"). Search by plain name too.
             if node:
-                for e in store.iter_edges_by_target_name(node.name):
+                cpp_overload_count = (
+                    store.count_nodes_by_name(
+                        node.name,
+                        language="cpp",
+                        kinds=("Function", "Test"),
+                    )
+                    if node.language == "cpp"
+                    else 0
+                )
+                for e in store.iter_edges_by_target_name(
+                    node.name,
+                    language=node.language or None,
+                ):
+                    # A C++ overload set deliberately keeps the target bare.
+                    # Its candidates support disambiguation, but do not prove
+                    # that any one exact overload was called.
+                    if (
+                        "ambiguous_targets" in e.extra
+                        or "unresolved_targets" in e.extra
+                        or (node.language == "cpp" and e.extra.get("receiver"))
+                    ):
+                        continue
+                    if cpp_overload_count > 1:
+                        continue
                     if e.source_qualified not in seen_sources:
                         seen_sources.add(e.source_qualified)
                         caller = store.get_node(e.source_qualified)
                         if caller:
-                            add_result(node_to_dict(caller), e)
+                            caller_result = node_to_dict(caller)
+                            caller_result["target_resolution"] = "unresolved"
+                            add_result(caller_result, e)
+
+        elif pattern == "references_to":
+            seen_reference_sources: set[str] = set()
+            for e in store.iter_edges_by_target(qn):
+                if (
+                    e.kind != "REFERENCES"
+                    or e.source_qualified in seen_reference_sources
+                ):
+                    continue
+                source = store.get_node(e.source_qualified)
+                if source:
+                    seen_reference_sources.add(e.source_qualified)
+                    add_result(node_to_dict(source), e)
 
         elif pattern == "callees_of":
             seen_targets: set[str] = set()
@@ -370,12 +426,46 @@ def query_graph(
                         callee = store.get_node(e.target_qualified)
                         if callee:
                             add_result(node_to_dict(callee), e)
-                        elif "::" not in e.target_qualified:
-                            add_result({
+                        elif (
+                            isinstance(e.extra.get("ambiguous_targets"), list)
+                            or isinstance(e.extra.get("unresolved_targets"), list)
+                            or "::" not in e.target_qualified
+                            or (node is not None and node.language == "cpp")
+                        ):
+                            unresolved = (
+                                e.extra.get("ambiguous_targets")
+                                or e.extra.get("unresolved_targets")
+                            )
+                            result: dict[str, Any] = {
                                 "kind": "Function",
                                 "name": e.target_qualified,
                                 "qualified_name": e.target_qualified,
-                            }, e)
+                            }
+                            if isinstance(unresolved, list):
+                                resolution = (
+                                    "ambiguous"
+                                    if e.extra.get("ambiguous_targets")
+                                    else "unresolved"
+                                )
+                                result["resolution"] = resolution
+                                result["candidates"] = [
+                                    _sanitize_name(candidate)
+                                    for candidate in unresolved[:20]
+                                    if isinstance(candidate, str)
+                                ]
+                                candidate_count = e.extra.get(
+                                    f"{resolution}_target_count",
+                                )
+                                if not isinstance(candidate_count, int):
+                                    candidate_count = len(unresolved)
+                                result["candidate_count"] = candidate_count
+                                result["candidates_truncated"] = bool(
+                                    e.extra.get(
+                                        f"{resolution}_targets_truncated",
+                                    )
+                                    or candidate_count > len(result["candidates"])
+                                )
+                            add_result(result, e)
 
         elif pattern == "imports_of":
             for e in store.iter_edges_by_source(qn):
@@ -448,12 +538,24 @@ def query_graph(
                     seen.add(test_qn)
             # Also search by naming convention
             name = node.name if node else target
-            test_nodes = store.search_nodes(f"test_{name}", limit=10)
-            test_nodes += store.search_nodes(f"Test{name}", limit=10)
+            cpp_overload_set = bool(
+                node
+                and node.language == "cpp"
+                and store.count_nodes_by_name(
+                    node.name,
+                    language="cpp",
+                    kinds=("Function", "Test"),
+                ) > 1
+            )
+            test_nodes = []
+            if not cpp_overload_set:
+                test_nodes = store.search_nodes(f"test_{name}", limit=10)
+                test_nodes += store.search_nodes(f"Test{name}", limit=10)
             for t in test_nodes:
                 if t.qualified_name not in seen and t.is_test:
                     result = node_to_dict(t)
                     result["indirect"] = False
+                    result["inferred_by"] = "naming_convention"
                     add_result(result)
                     seen.add(t.qualified_name)
 
@@ -468,7 +570,9 @@ def query_graph(
             # (e.g. "sample.dart::Animal"). Search by plain name too. See: #87
             if total_results == 0 and node:
                 for kind in ("INHERITS", "IMPLEMENTS"):
-                    for e in store.iter_edges_by_target_name(node.name, kind=kind):
+                    for e in store.iter_edges_by_target_name(
+                        node.name, kind=kind, language=node.language or None,
+                    ):
                         child = store.get_node(e.source_qualified)
                         if child:
                             add_result(node_to_dict(child), e)
@@ -479,8 +583,9 @@ def query_graph(
                     continue
                 triggered = store.get_node(edge.target_qualified)
                 if triggered:
-                    results.append(node_to_dict(triggered))
-                edges_out.append(edge_to_dict(edge))
+                    add_result(node_to_dict(triggered), edge)
+                else:
+                    edges_out.append(edge_to_dict(edge))
 
         elif pattern == "triggered_by":
             for edge in store.get_edges_by_target(qn):
@@ -488,8 +593,9 @@ def query_graph(
                     continue
                 trigger = store.get_node(edge.source_qualified)
                 if trigger:
-                    results.append(node_to_dict(trigger))
-                edges_out.append(edge_to_dict(edge))
+                    add_result(node_to_dict(trigger), edge)
+                else:
+                    edges_out.append(edge_to_dict(edge))
 
         elif pattern in ("publishers_of", "listeners_of"):
             edge_kind = "PUBLISHES" if pattern == "publishers_of" else "HANDLES"
@@ -498,8 +604,9 @@ def query_graph(
                     continue
                 source = store.get_node(edge.source_qualified)
                 if source:
-                    results.append(node_to_dict(source))
-                edges_out.append(edge_to_dict(edge))
+                    add_result(node_to_dict(source), edge)
+                else:
+                    edges_out.append(edge_to_dict(edge))
 
         elif pattern == "handlers_of":
             for edge in store.get_edges_by_target(qn):
@@ -507,8 +614,9 @@ def query_graph(
                     continue
                 handler = store.get_node(edge.source_qualified)
                 if handler:
-                    results.append(node_to_dict(handler))
-                edges_out.append(edge_to_dict(edge))
+                    add_result(node_to_dict(handler), edge)
+                else:
+                    edges_out.append(edge_to_dict(edge))
 
         elif pattern == "endpoints_for":
             for edge in store.get_edges_by_source(qn):
@@ -516,7 +624,8 @@ def query_graph(
                     continue
                 endpoint = store.get_node(edge.target_qualified)
                 if endpoint and endpoint.kind == "Endpoint":
-                    results.append(node_to_dict(endpoint))
+                    add_result(node_to_dict(endpoint), edge)
+                elif endpoint is None:
                     edges_out.append(edge_to_dict(edge))
 
         elif pattern == "consumers_of":
@@ -527,9 +636,10 @@ def query_graph(
             for edge in store.get_config_consumers(key):
                 consumer = store.get_node(edge.source_qualified)
                 if consumer and consumer.qualified_name not in seen_config_sources:
-                    results.append(node_to_dict(consumer))
+                    add_result(node_to_dict(consumer), edge)
                     seen_config_sources.add(consumer.qualified_name)
-                edges_out.append(edge_to_dict(edge))
+                elif consumer is None:
+                    edges_out.append(edge_to_dict(edge))
 
         elif pattern == "file_summary":
             graph_paths = _resolve_graph_file_paths(store, root, [target])

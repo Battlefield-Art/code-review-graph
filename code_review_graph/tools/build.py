@@ -7,7 +7,11 @@ import sqlite3
 import time
 from typing import Any
 
-from ..incremental import full_build, incremental_update
+from ..incremental import (
+    full_build,
+    incremental_update,
+    resolve_incremental_base,
+)
 from ._common import _get_store
 
 logger = logging.getLogger(__name__)
@@ -77,15 +81,18 @@ def _run_postprocess(
         )
         return warnings
 
-    # Resolve only same-file/import-backed targets before derived graph steps.
+    # Resolve bare and C++ scoped call targets before derived graph steps.
     try:
         resolved = store.resolve_bare_call_targets()
         resolved += store.resolve_bare_tested_by_sources()
         build_result["bare_edges_resolved"] = resolved
+        build_result["cpp_scoped_edges_resolved"] = (
+            store.resolve_cpp_scoped_call_targets()
+        )
     except sqlite3.OperationalError as e:
-        logger.warning("Bare-endpoint resolution failed: %s", e)
+        logger.warning("Call-target resolution failed: %s", e)
         warnings.append(
-            f"Bare-endpoint resolution failed: {type(e).__name__}: {e}"
+            f"Call-target resolution failed: {type(e).__name__}: {e}"
         )
 
     # -- Signatures + FTS (fast, always run unless "none") --
@@ -458,7 +465,7 @@ def _compute_summaries(store: Any) -> None:
 def build_or_update_graph(
     full_rebuild: bool = False,
     repo_root: str | None = None,
-    base: str = "HEAD~1",
+    base: str | None = None,
     postprocess: str = "full",
     recurse_submodules: bool | None = None,
     embedding_provider: str | None = None,
@@ -470,7 +477,11 @@ def build_or_update_graph(
         full_rebuild: If True, re-parse every file. If False (default),
                       only re-parse files changed since ``base``.
         repo_root: Path to the repository root. Auto-detected if omitted.
-        base: Git ref for incremental diff (default: HEAD~1).
+        base: Git ref for the incremental diff. When None (default), the base
+              is resolved automatically to the commit the graph was last built
+              at, so a single update reconciles everything since the last sync
+              rather than only the most recent commit. Pass an explicit ref to
+              override. Ignored when full_rebuild is True.
         postprocess: Post-processing level after build:
             ``"full"`` (default) — signatures, FTS, flows, communities.
             ``"minimal"`` — signatures + FTS only (fast, keeps search working).
@@ -491,31 +502,48 @@ def build_or_update_graph(
     """
     store, root = _get_store(repo_root)
     try:
+        if not full_rebuild and not store.has_nodes():
+            full_rebuild = True
+
+        # An automatic (base is None) incremental update resolves its diff base
+        # to the last-synced commit. When no usable anchor exists, fall back to
+        # a full rebuild rather than a wrong HEAD~1 diff that could report the
+        # graph as up to date while it is actually stale.
+        base_resolved: str | None = base
+        if not full_rebuild and base is None:
+            base_resolved = resolve_incremental_base(root, store)
+            if base_resolved is None:
+                full_rebuild = True
+
         if full_rebuild:
             result = full_build(root, store, recurse_submodules)
             build_result = {
+                **result,
                 "status": "ok",
                 "build_type": "full",
+                "base_resolved": None,
                 "summary": (
                     f"Full build complete: parsed {result['files_parsed']} files, "
                     f"created {result['total_nodes']} nodes and "
                     f"{result['total_edges']} edges."
                 ),
-                **result,
             }
         else:
-            result = incremental_update(root, store, base=base)
+            result = incremental_update(root, store, base=base_resolved)
             if result["files_updated"] == 0:
                 return {
+                    **result,
                     "status": "ok",
                     "build_type": "incremental",
+                    "base_resolved": base_resolved,
                     "summary": "No changes detected. Graph is up to date.",
                     "postprocess_level": postprocess,
-                    **result,
                 }
             build_result = {
+                **result,
                 "status": "ok",
                 "build_type": "incremental",
+                "base_resolved": base_resolved,
                 "summary": (
                     f"Incremental update: {result['files_updated']} files re-parsed, "
                     f"{result['total_nodes']} nodes and "
@@ -523,7 +551,6 @@ def build_or_update_graph(
                     f"Changed: {result['changed_files']}. "
                     f"Dependents also updated: {result['dependent_files']}."
                 ),
-                **result,
             }
 
         # Pass changed_files for incremental flow/community detection
@@ -580,10 +607,13 @@ def run_postprocess(
             resolved = store.resolve_bare_call_targets()
             resolved += store.resolve_bare_tested_by_sources()
             result["bare_edges_resolved"] = resolved
+            result["cpp_scoped_edges_resolved"] = (
+                store.resolve_cpp_scoped_call_targets()
+            )
         except sqlite3.OperationalError as e:
-            logger.warning("Bare-endpoint resolution failed: %s", e)
+            logger.warning("Call-target resolution failed: %s", e)
             warnings.append(
-                f"Bare-endpoint resolution failed: {type(e).__name__}: {e}"
+                f"Call-target resolution failed: {type(e).__name__}: {e}"
             )
 
         try:

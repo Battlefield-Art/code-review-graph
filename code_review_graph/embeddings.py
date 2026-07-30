@@ -211,18 +211,38 @@ class GoogleEmbeddingProvider(EmbeddingProvider):
     @staticmethod
     def _call_with_retry(fn, max_retries: int = 3):
         """Call fn with exponential backoff on transient API errors."""
+        retryable_statuses = ("429", "500", "503")
         for attempt in range(max_retries):
             try:
                 return fn()
             except Exception as e:
                 # Retry on rate-limit (429) or server errors (5xx)
                 err_str = str(e)
-                is_retryable = "429" in err_str or "500" in err_str or "503" in err_str
-                if not is_retryable or attempt == max_retries - 1:
+                is_retryable = any(status in err_str for status in retryable_statuses)
+                if not is_retryable:
+                    logger.debug(
+                        "Non-retryable Gemini API error: %s",
+                        type(e).__name__,
+                    )
                     raise
+                if attempt == max_retries - 1:
+                    logger.error(
+                        "Gemini API request failed after %d requests.",
+                        max_retries,
+                    )
+                    raise
+
                 wait = 2 ** attempt
-                logger.warning("Gemini API error (attempt %d/%d), retrying in %ds: %s",
-                               attempt + 1, max_retries, wait, e)
+
+                logger.warning(
+                    "Gemini API retry %d/%d in %ds (%s): %s",
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    type(e).__name__,
+                    e,
+                )
+
                 time.sleep(wait)
 
     def embed_query(self, text: str) -> list[float]:
@@ -349,9 +369,10 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     from different backends (e.g. real OpenAI vs. an OpenAI-compatible
     gateway that ships different weights under the same model name).
 
-    Dimension is detected from the first response and frozen; switching the
-    ``model`` in the environment also changes ``provider.name`` and triggers
-    re-embed via the same isolation key.
+    When no dimension is explicitly requested, it is detected from the first
+    response and retained as local metadata. Switching the ``model`` in the
+    environment also changes ``provider.name`` and triggers re-embed via the
+    same isolation key.
     """
 
     _DEFAULT_BATCH_SIZE = 100
@@ -372,6 +393,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
+        self._requested_dimension = dimension
         self._dimension = dimension
         self._timeout = timeout
         self._batch_size = batch_size or self._DEFAULT_BATCH_SIZE
@@ -425,10 +447,13 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         import urllib.request
 
         body: dict[str, Any] = {"model": self._model, "input": texts}
-        # OpenAI v3 models (text-embedding-3-*) support dimension reduction;
-        # only forward the param when the user explicitly pinned one.
-        if self._dimension is not None:
-            body["dimensions"] = self._dimension
+        # Forward only a dimension explicitly requested by the user. The
+        # model name may be an Azure deployment or gateway alias, so it cannot
+        # tell us whether the endpoint accepts dimension reduction. A dimension
+        # learned from a response is local metadata and must never leak into a
+        # later request.
+        if self._requested_dimension is not None:
+            body["dimensions"] = self._requested_dimension
 
         payload = _json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
@@ -654,9 +679,11 @@ def get_provider(
 
     Args:
         provider: Provider name. One of "local", "google", "minimax", "openai",
-                  or None for local. Names are case-insensitive and surrounding
-                  whitespace is ignored; unknown names raise ValueError instead
-                  of silently falling back to the local provider.
+                  or None. When omitted, configured OpenAI-compatible
+                  credentials select OpenAI; otherwise the local provider is
+                  used. Names are case-insensitive and surrounding whitespace
+                  is ignored; unknown names raise ValueError instead of
+                  silently falling back to the local provider.
                   Google requires GOOGLE_API_KEY env var and explicit opt-in.
                   MiniMax requires MINIMAX_API_KEY env var and explicit opt-in.
                   OpenAI requires CRG_OPENAI_API_KEY + CRG_OPENAI_BASE_URL +
@@ -680,6 +707,17 @@ def get_provider(
             f"Unknown embedding provider '{name}'. "
             "Valid: local, openai, google, minimax"
         )
+
+    # When no explicit provider is given but OpenAI-compatible env vars are
+    # configured, default to the openai provider so MCP tool calls that omit
+    # the optional `provider` parameter still use the configured backend
+    # (#551).
+    if (
+        provider is None
+        and os.environ.get("CRG_OPENAI_API_KEY")
+        and os.environ.get("CRG_OPENAI_BASE_URL")
+    ):
+        name = "openai"
 
     if name == "openai":
         api_key = os.environ.get("CRG_OPENAI_API_KEY")
