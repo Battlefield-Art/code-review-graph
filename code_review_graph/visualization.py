@@ -8,7 +8,9 @@ Supports multiple rendering modes for large graphs:
 - ``full``  — render every node (default, current behavior)
 - ``community`` — aggregate by community; double-click to drill down
 - ``file``  — aggregate by file; each file is a node
-- ``auto``  — choose community mode when node count exceeds threshold
+- ``auto``  — choose an aggregated mode when the rendered node count or
+  edge count exceeds its threshold (community when community data exists,
+  file otherwise)
 """
 
 from __future__ import annotations
@@ -23,6 +25,17 @@ from pathlib import Path
 from .graph import GraphStore, edge_to_dict, node_to_dict
 
 logger = logging.getLogger(__name__)
+
+# Auto-mode thresholds for the full D3 force layout. Rendering cost scales
+# with both counts: every simulation tick runs an O(E) link force on top of
+# the O(N log N) many-body force, and the SVG DOM holds one element per node
+# *and* one per edge. The long-standing 3000-node cap implicitly tolerated
+# the ~3 edges per node typical of graphs at that size (~9000 rendered SVG
+# edge elements), so the edge cap is derived from the same rendering budget:
+# 3x the node cap. Issue #609 (2792 nodes / 17488 edges) stalled because
+# only nodes were checked.
+DEFAULT_MAX_FULL_NODES = 3000
+DEFAULT_MAX_FULL_EDGES = 3 * DEFAULT_MAX_FULL_NODES
 
 
 def _build_name_index(
@@ -357,11 +370,40 @@ def _aggregate_file(data: dict) -> dict:
     }
 
 
+def _has_community_data(data: dict) -> bool:
+    """Return True if the exported graph carries any community assignment."""
+    if data.get("communities"):
+        return True
+    return any(n.get("community_id") is not None for n in data["nodes"])
+
+
+def _resolve_auto_mode(
+    node_count: int,
+    edge_count: int,
+    max_full_nodes: int,
+    max_full_edges: int,
+    has_communities: bool,
+) -> str:
+    """Pick the effective rendering mode for ``mode="auto"``.
+
+    The full force layout is only viable while *both* rendered counts stay
+    within budget (see DEFAULT_MAX_FULL_NODES / DEFAULT_MAX_FULL_EDGES).
+    When aggregation is needed, prefer community mode; fall back to file
+    aggregation when no community data is available (otherwise every node
+    would collapse into a single "Uncategorized" super-node whose drill-down
+    re-renders the entire graph).
+    """
+    if node_count <= max_full_nodes and edge_count <= max_full_edges:
+        return "full"
+    return "community" if has_communities else "file"
+
+
 def generate_html(
     store: GraphStore,
     output_path: str | Path,
     mode: str = "auto",
-    max_full_nodes: int = 3000,
+    max_full_nodes: int = DEFAULT_MAX_FULL_NODES,
+    max_full_edges: int = DEFAULT_MAX_FULL_EDGES,
 ) -> Path:
     """Generate a self-contained interactive HTML visualization.
 
@@ -369,9 +411,12 @@ def generate_html(
         store: The GraphStore to read graph data from.
         output_path: Path for the output HTML file.
         mode: Rendering mode — ``"auto"``, ``"full"``, ``"community"``,
-              or ``"file"``.  ``"auto"`` switches to ``"community"`` when
-              the node count exceeds *max_full_nodes*.
-        max_full_nodes: Threshold for auto-switching to community mode.
+              or ``"file"``.  ``"auto"`` switches to an aggregated mode
+              (community, or file when no community data exists) when the
+              rendered node count exceeds *max_full_nodes* or the rendered
+              edge count exceeds *max_full_edges*.
+        max_full_nodes: Rendered-node threshold for auto-switching.
+        max_full_edges: Rendered-edge threshold for auto-switching.
 
     Writes the HTML file to *output_path* and returns the resolved Path.
     """
@@ -387,9 +432,20 @@ def generate_html(
     # Determine effective mode
     effective_mode = mode
     if effective_mode == "auto":
-        effective_mode = (
-            "community" if stats.total_nodes > max_full_nodes else "full"
+        effective_mode = _resolve_auto_mode(
+            node_count=len(data["nodes"]),
+            edge_count=len(data["edges"]),
+            max_full_nodes=max_full_nodes,
+            max_full_edges=max_full_edges,
+            has_communities=_has_community_data(data),
         )
+        if effective_mode != "full":
+            logger.info(
+                "auto mode: %d nodes / %d edges exceeds full-render budget "
+                "(%d nodes / %d edges) — using %s aggregation",
+                len(data["nodes"]), len(data["edges"]),
+                max_full_nodes, max_full_edges, effective_mode,
+            )
 
     if effective_mode == "community":
         # Keep full data available for drill-down; aggregate for top-level
