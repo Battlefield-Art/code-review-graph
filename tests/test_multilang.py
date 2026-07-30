@@ -234,7 +234,7 @@ class TestJavaImportResolution:
         _, edges = parser.parse_file(svc / "App.java")
         imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
         assert len(imports) == 1
-        assert imports[0].target == str((auth / "User.java").resolve())
+        assert imports[0].target == (auth / "User.java").resolve().as_posix()
 
     def test_jdk_import_stays_unresolved(self):
         """JDK imports have no local file and remain as raw strings."""
@@ -267,7 +267,7 @@ class TestJavaImportResolution:
         _, edges = parser.parse_file(app_dir / "App.java")
         imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
         assert len(imports) == 1
-        assert imports[0].target == str((pkg / "Helper.java").resolve())
+        assert imports[0].target == (pkg / "Helper.java").resolve().as_posix()
 
     def test_wildcard_import_stays_unresolved(self, tmp_path):
         """Wildcard imports cannot resolve to a single file."""
@@ -602,8 +602,8 @@ class TestCSharpNamespaceResolution:
         result = query_graph("importers_of", str(core), repo_root=str(tmp_path))
         assert result.get("status") == "ok"
         importers = {r["file"] for r in result.get("results", [])}
-        assert str(app) in importers
-        assert str(unrelated) not in importers
+        assert app.as_posix() in importers
+        assert unrelated.as_posix() not in importers
 
     def test_importers_of_resolves_nested_block_namespace(self, tmp_path):
         from code_review_graph.graph import GraphStore
@@ -642,7 +642,7 @@ class TestCSharpNamespaceResolution:
         result = query_graph("importers_of", str(core), repo_root=str(tmp_path))
         assert result.get("status") == "ok"
         importers = {r["file"] for r in result.get("results", [])}
-        assert str(app) in importers
+        assert app.as_posix() in importers
 
     def test_deep_ast_preserves_nested_namespace_metadata(self, tmp_path):
         """Namespace discovery must not recurse through the whole C# AST."""
@@ -982,7 +982,7 @@ class TestPHPImportResolution:
         _, edges = parser.parse_file(svc / "MatchService.php")
         imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
         assert len(imports) == 1
-        assert imports[0].target == str((entity / "Job.php").resolve())
+        assert imports[0].target == (entity / "Job.php").resolve().as_posix()
 
     def test_vendor_import_stays_unresolved(self, tmp_path):
         """A class with no local file stays as the bare FQN, not a raw
@@ -1019,7 +1019,7 @@ class TestPHPImportResolution:
         _, edges = parser.parse_file(job / "Job.php")
         imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
         assert len(imports) == 1
-        assert imports[0].target == str((contact / "Contact.php").resolve())
+        assert imports[0].target == (contact / "Contact.php").resolve().as_posix()
 
     def test_grouped_use_expands_to_multiple_imports(self, tmp_path):
         """``use App\\Domain\\{Entity\\Job, Model\\Status}`` -> two imports,
@@ -1043,8 +1043,8 @@ class TestPHPImportResolution:
         parser = CodeParser(tmp_path)
         _, edges = parser.parse_file(consumer / "C.php")
         targets = {e.target for e in edges if e.kind == "IMPORTS_FROM"}
-        assert str((base / "Entity/Job.php").resolve()) in targets
-        assert str((base / "Model/Status.php").resolve()) in targets
+        assert (base / "Entity/Job.php").resolve().as_posix() in targets
+        assert (base / "Model/Status.php").resolve().as_posix() in targets
         assert len(targets) == 2
 
 
@@ -2704,7 +2704,7 @@ class TestNixParsing:
         assert any("foo.nix" in t for t in targets)
 
     def test_contains_edges_wire_file_to_top_level_bindings(self):
-        file_path = str(self.flake_path)
+        file_path = self.flake_path.as_posix()
         contains_targets = {
             e.target for e in self.flake_edges
             if e.kind == "CONTAINS" and e.source == file_path
