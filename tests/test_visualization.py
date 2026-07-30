@@ -283,6 +283,58 @@ def test_bundled_d3_asset_is_packaged_and_pinned():
     assert _sha384_sri(data) == _D3_SRI_HASH
 
 
+@pytest.mark.parametrize("vis_mode", ["full", "community"])
+def test_graph_data_containing_script_sentinel_is_not_expanded(tmp_path, vis_mode):
+    """Repo content must never be run through the __D3_SCRIPTS__ substitution.
+
+    The template placeholders are substituted scripts-first, data-last: a node
+    literally named __D3_SCRIPTS__ (valid in Python) would otherwise be
+    rewritten into <script> markup inside the graphData script, truncating it
+    and promoting the remaining repo-derived JSON to live HTML.
+    """
+    from code_review_graph.visualization import generate_html
+
+    store = GraphStore(tmp_path / "test.db")
+    store.upsert_node(
+        NodeInfo(
+            kind="File", name="evil.py", file_path="src/evil.py",
+            line_start=1, line_end=10, language="python", parent_name=None,
+            params=None, return_type=None, modifiers=None, is_test=False,
+            extra={},
+        )
+    )
+    store.upsert_node(
+        NodeInfo(
+            kind="Function", name="__D3_SCRIPTS__", file_path="src/evil.py",
+            line_start=2, line_end=4, language="python", parent_name=None,
+            params=None, return_type=None, modifiers=None, is_test=False,
+            extra={},
+        )
+    )
+    store.upsert_node(
+        NodeInfo(
+            kind="Function", name="<img src=x onerror=alert(1)>",
+            file_path="src/evil.py", line_start=6, line_end=8,
+            language="python", parent_name=None, params=None,
+            return_type=None, modifiers=None, is_test=False, extra={},
+        )
+    )
+
+    output_path = tmp_path / "graph.html"
+    generate_html(store, output_path, mode=vis_mode)
+    content = output_path.read_text()
+
+    script_sources, inline_scripts = _extract_scripts(content)
+    # Exactly the vendored D3 reference — no injected external script tags.
+    assert script_sources == [_D3_FILENAME]
+    data_scripts = [s for s in inline_scripts if "graphData" in s]
+    assert data_scripts, "graphData script missing — data script was truncated"
+    for script in data_scripts:
+        assert "<script" not in script
+    # The parser must not see repo-derived markup as real elements.
+    assert "<img" not in re.sub(r"(?s)<script.*?</script>", "", content)
+
+
 def test_script_extraction_handles_case_insensitive_html_tags():
     content = (
         '<SCRIPT SRC="https://d3js.org/d3.v7.min.js"></SCRIPT>'

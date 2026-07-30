@@ -453,17 +453,21 @@ def generate_html(
         agg = _aggregate_community(data)
         # Escape </script> inside JSON to prevent premature tag closure
         data_json = json.dumps(agg, default=str).replace("</", "<\\/")
-        html = _AGGREGATED_HTML_TEMPLATE.replace("__GRAPH_DATA__", data_json)
+        template = _AGGREGATED_HTML_TEMPLATE
     elif effective_mode == "file":
         agg = _aggregate_file(data)
         data_json = json.dumps(agg, default=str).replace("</", "<\\/")
-        html = _AGGREGATED_HTML_TEMPLATE.replace("__GRAPH_DATA__", data_json)
+        template = _AGGREGATED_HTML_TEMPLATE
     else:
         # full mode — original behavior
         data_json = json.dumps(data, default=str).replace("</", "<\\/")
-        html = _HTML_TEMPLATE.replace("__GRAPH_DATA__", data_json)
+        template = _HTML_TEMPLATE
 
-    html = html.replace("__D3_SCRIPTS__", _d3_script_tags())
+    # Substitute the script tags into the trusted template BEFORE the graph
+    # data: graph content is repo-derived, and running a replace over it would
+    # let a node literally named __D3_SCRIPTS__ inject markup into the page.
+    html = template.replace("__D3_SCRIPTS__", _d3_script_tags())
+    html = html.replace("__GRAPH_DATA__", data_json)
     output_path.write_text(html, encoding="utf-8")
     # Ship the vendored D3 build alongside the HTML so the same-origin script
     # reference resolves both under `visualize --serve` and file:// opens.
