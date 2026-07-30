@@ -14051,6 +14051,16 @@ class CodeParser:
                 if child.type == "identifier":
                     return child.text.decode("utf-8", errors="replace")
             return None
+        # C#: unlike Java there is no type_identifier — a non-generic return
+        # type such as ``Task`` is itself an ``identifier``, so the generic
+        # loop below would return it instead of the method name. Read the
+        # ``name`` field; unusual shapes still fall through.
+        if language == "csharp" and kind == "function" and node.type in (
+            "method_declaration", "constructor_declaration",
+        ):
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                return name_node.text.decode("utf-8", errors="replace")
 
         if language == "cpp" and kind == "function":
             declarator = node.child_by_field_name("declarator")
