@@ -1010,6 +1010,37 @@ class GraphStore:
                     if isinstance(candidate, str)
                 )
 
+        # C# `using X.Y;` directives store IMPORTS_FROM targets as raw
+        # namespace strings rather than file paths, so the path-keyed
+        # evidence above never matches a candidate's defining file. Map
+        # declared namespaces back to the files declaring them and add
+        # those files as import evidence. See: #310, #792
+        namespace_files: dict[str, set[str]] = {}
+        for row in conn.execute(
+            "SELECT file_path, extra FROM nodes "
+            "WHERE kind = 'File' AND extra LIKE '%\"csharp_namespaces\"%'"
+        ).fetchall():
+            try:
+                node_extra = json.loads(row["extra"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(node_extra, dict):
+                continue
+            declared = node_extra.get("csharp_namespaces")
+            if not isinstance(declared, list):
+                continue
+            for ns in declared:
+                if isinstance(ns, str) and ns:
+                    namespace_files.setdefault(ns, set()).add(
+                        row["file_path"],
+                    )
+        if namespace_files:
+            for imported in import_targets.values():
+                expanded: set[str] = set()
+                for target in imported:
+                    expanded |= namespace_files.get(target, set())
+                imported |= expanded
+
         resolved = 0
         changed = False
         for edge in bare_edges:
@@ -1239,6 +1270,27 @@ class GraphStore:
 
     # --- Impact / Graph traversal ---
 
+    def _impact_seed_qns(self, changed_files: list[str]) -> set[str]:
+        """Seed qualified names for the impact traversal.
+
+        Includes every node in the changed files plus, for changed C#
+        files, the namespaces they declare. C# ``using X.Y;`` directives
+        store IMPORTS_FROM targets as raw namespace strings rather than
+        file paths, so without these bridge seeds the traversal can never
+        reach importers of a changed .cs file. The namespace strings have
+        no node rows, so they act purely as bridges and never surface in
+        results. See: #310
+        """
+        seeds: set[str] = set()
+        for f in changed_files:
+            for n in self.get_nodes_by_file(f):
+                seeds.add(n.qualified_name)
+                if n.kind == "File" and n.language == "csharp":
+                    for ns in n.extra.get("csharp_namespaces") or []:
+                        if isinstance(ns, str) and ns:
+                            seeds.add(ns)
+        return seeds
+
     def get_impact_radius(
         self,
         changed_files: list[str],
@@ -1298,11 +1350,7 @@ class GraphStore:
             }
 
         # Seed qualified names
-        seeds: set[str] = set()
-        for f in changed_files:
-            nodes = self.get_nodes_by_file(f)
-            for n in nodes:
-                seeds.add(n.qualified_name)
+        seeds = self._impact_seed_qns(changed_files)
 
         if not seeds:
             return {
@@ -1501,11 +1549,7 @@ class GraphStore:
         max_nodes = max(0, int(max_nodes))
         nxg = self._build_networkx_graph()
 
-        seeds: set[str] = set()
-        for f in changed_files:
-            nodes = self.get_nodes_by_file(f)
-            for n in nodes:
-                seeds.add(n.qualified_name)
+        seeds = self._impact_seed_qns(changed_files)
 
         best: dict[str, float] = dict.fromkeys(seeds, 1.0)
         frontier = dict(best)
