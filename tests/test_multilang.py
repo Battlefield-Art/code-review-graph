@@ -460,6 +460,42 @@ class TestCSharpParsing:
 @pytest.mark.skipif(
     not _has_csharp_parser(), reason="csharp tree-sitter grammar not installed",
 )
+class TestCSharpMethodNames:
+    """Regression tests for #791: a non-generic C# return type is itself an
+    ``identifier``, so ``async Task Foo()`` was named ``Task`` and every such
+    method in a class merged onto one ``qualified_name``.
+    """
+
+    def _parse(self, source: str, tmp_path):
+        p = tmp_path / "x.cs"
+        p.write_text(source, encoding="utf-8")
+        return CodeParser().parse_file(p)
+
+    def test_non_generic_return_type_is_not_the_name(self, tmp_path):
+        nodes, _ = self._parse(
+            "public class Suite {\n"
+            "    public async Task Should_do_thing() { }\n"
+            "    public async Task Should_do_other_thing() { }\n"
+            "    public async Task<int> Returns_generic() { return 1; }\n"
+            "    public void PlainVoid() { }\n"
+            "    public Suite() { }\n"
+            "}\n",
+            tmp_path,
+        )
+        funcs = [n for n in nodes if n.kind == "Function"]
+        assert {f.name for f in funcs} == {
+            "Should_do_thing",
+            "Should_do_other_thing",
+            "Returns_generic",
+            "PlainVoid",
+            "Suite",
+        }
+        assert len(funcs) == 5
+
+
+@pytest.mark.skipif(
+    not _has_csharp_parser(), reason="csharp tree-sitter grammar not installed",
+)
 class TestCSharpAttributes:
     """Regression tests for #295 (C# half): C# attributes use
     ``attribute_list`` nodes, not ``modifiers > annotation``, so they need
