@@ -13,16 +13,73 @@ Supports multiple rendering modes for large graphs:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import asdict
+from importlib import resources
 from pathlib import Path
 
 from .graph import GraphStore, edge_to_dict, node_to_dict
 
 logger = logging.getLogger(__name__)
+
+# Pinned D3 build vendored with the package (issue #475). The generated HTML
+# loads this same-origin copy first so `visualize --serve` works on offline or
+# filtered networks, and only falls back to the CDN — still SRI-pinned — when
+# the local copy is unavailable. Both references carry the same integrity hash.
+D3_LOCAL_FILENAME = "d3.v7.min.js"
+D3_CDN_URL = "https://d3js.org/d3.v7.min.js"
+D3_SRI_HASH = "sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i"
+
+
+def _d3_script_tags() -> str:
+    """Build the D3 loader tags: same-origin script plus SRI-pinned CDN fallback.
+
+    The fallback uses ``document.write`` so it loads *synchronously* during
+    parsing — the rest of the page's inline scripts use ``d3`` immediately.
+    """
+    local_tag = f'<script src="{D3_LOCAL_FILENAME}" integrity="{D3_SRI_HASH}"></script>'
+    cdn_tag = (
+        f'<script src="{D3_CDN_URL}" integrity="{D3_SRI_HASH}" crossorigin="anonymous">'
+        "<\\/script>"
+    )
+    fallback_tag = f"<script>window.d3 || document.write('{cdn_tag}');</script>"
+    return local_tag + "\n" + fallback_tag
+
+
+def _write_d3_asset(directory: Path) -> Path | None:
+    """Copy the vendored D3 build next to the generated HTML.
+
+    The copy is verified against the pinned SRI hash before writing. Returns
+    the written path, or ``None`` if the bundled asset is missing, corrupt, or
+    unwritable — the generated page then loads D3 via the SRI-pinned CDN
+    fallback tag instead.
+    """
+    dest = directory / D3_LOCAL_FILENAME
+    try:
+        asset = resources.files("code_review_graph") / "assets" / D3_LOCAL_FILENAME
+        data = asset.read_bytes()
+    except OSError as exc:
+        logger.warning("Bundled D3 asset unavailable (%s); page will use the CDN fallback.", exc)
+        return None
+    digest = base64.b64encode(hashlib.sha384(data).digest()).decode()
+    if f"sha384-{digest}" != D3_SRI_HASH:
+        logger.error(
+            "Bundled D3 asset does not match the pinned SRI hash; refusing to write %s. "
+            "The page will use the CDN fallback.",
+            dest,
+        )
+        return None
+    try:
+        dest.write_bytes(data)
+    except OSError as exc:
+        logger.warning("Could not write %s (%s); page will use the CDN fallback.", dest, exc)
+        return None
+    return dest
 
 
 def _build_name_index(
@@ -406,7 +463,11 @@ def generate_html(
         data_json = json.dumps(data, default=str).replace("</", "<\\/")
         html = _HTML_TEMPLATE.replace("__GRAPH_DATA__", data_json)
 
+    html = html.replace("__D3_SCRIPTS__", _d3_script_tags())
     output_path.write_text(html, encoding="utf-8")
+    # Ship the vendored D3 build alongside the HTML so the same-origin script
+    # reference resolves both under `visualize --serve` and file:// opens.
+    _write_d3_asset(output_path.parent)
     return output_path
 
 
@@ -424,7 +485,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Code Review Graph</title>
-<script src="https://d3js.org/d3.v7.min.js" integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i" crossorigin="anonymous"></script>
+__D3_SCRIPTS__
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { width: 100%; height: 100%; overflow: hidden; }
@@ -1457,7 +1518,7 @@ _AGGREGATED_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Code Review Graph (Aggregated)</title>
-<script src="https://d3js.org/d3.v7.min.js" integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i" crossorigin="anonymous"></script>
+__D3_SCRIPTS__
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { width: 100%; height: 100%; overflow: hidden; }

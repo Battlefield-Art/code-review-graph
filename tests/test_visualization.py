@@ -1,9 +1,13 @@
 """Tests for graph visualization export."""
 
+import base64
+import hashlib
 import json
+import re
 import shutil
 import subprocess
 from html.parser import HTMLParser
+from importlib import resources
 
 import pytest
 
@@ -216,11 +220,67 @@ def test_generate_html(store_with_data, tmp_path):
     assert output_path.exists()
     content = output_path.read_text()
     script_sources, _inline_scripts = _extract_scripts(content)
-    assert script_sources == ["https://d3js.org/d3.v7.min.js"]
+    assert script_sources == [_D3_FILENAME]
     assert "auth.py" in content
     assert "AuthService" in content
     assert "<!DOCTYPE html>" in content
     assert "</html>" in content
+
+
+# Pinned D3 contract for the visualization templates (issue #475): the page
+# must load D3 from a same-origin vendored file so `visualize --serve` works
+# on offline/filtered networks, while keeping SRI integrity verification.
+_D3_FILENAME = "d3.v7.min.js"
+_D3_CDN_URL = "https://d3js.org/d3.v7.min.js"
+_D3_SRI_HASH = "sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i"
+
+
+def _sha384_sri(data: bytes) -> str:
+    return "sha384-" + base64.b64encode(hashlib.sha384(data).digest()).decode()
+
+
+@pytest.mark.parametrize("vis_mode", ["full", "community"])
+def test_generated_html_loads_d3_same_origin_with_sri(store_with_data, tmp_path, vis_mode):
+    """Regression test for #475: `visualize --serve` must not depend on the
+    d3js.org CDN being reachable. The generated page loads a vendored,
+    same-origin D3 file (with the SRI hash intact) and only falls back to
+    the CDN — still SRI-pinned with crossorigin — if the local copy fails."""
+    from code_review_graph.visualization import generate_html
+
+    output_path = tmp_path / "graph.html"
+    generate_html(store_with_data, output_path, mode=vis_mode)
+    content = output_path.read_text()
+
+    script_sources, inline_scripts = _extract_scripts(content)
+    # Same-origin, offline-first D3 reference — no external host required.
+    assert script_sources == [_D3_FILENAME]
+
+    # The local script tag keeps SRI integrity verification.
+    local_tag = re.search(r"<script src=\"d3\.v7\.min\.js\"[^>]*>", content)
+    assert local_tag is not None
+    assert f'integrity="{_D3_SRI_HASH}"' in local_tag.group(0)
+
+    # CDN fallback (only used when the local asset is missing) keeps the
+    # security invariant: SRI hash AND crossorigin on the d3js.org tag.
+    fallback = [s for s in inline_scripts if _D3_CDN_URL in s]
+    assert len(fallback) == 1
+    assert f'integrity="{_D3_SRI_HASH}"' in fallback[0]
+    assert 'crossorigin="anonymous"' in fallback[0]
+
+    # The vendored asset is written next to the HTML, i.e. inside the
+    # directory `visualize --serve` exposes, so GET /d3.v7.min.js succeeds.
+    asset = tmp_path / _D3_FILENAME
+    assert asset.exists()
+    assert _sha384_sri(asset.read_bytes()) == _D3_SRI_HASH
+
+
+def test_bundled_d3_asset_is_packaged_and_pinned():
+    """The pinned D3 build ships inside the Python package so generated
+    visualizations work without network access (issue #475)."""
+    asset = resources.files("code_review_graph") / "assets" / _D3_FILENAME
+    data = asset.read_bytes()
+    assert data.startswith(b"// https://d3js.org v7")
+    assert _sha384_sri(data) == _D3_SRI_HASH
 
 
 def test_script_extraction_handles_case_insensitive_html_tags():
