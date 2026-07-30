@@ -752,6 +752,35 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".yaml": "yaml",
 }
 
+# ``.h`` is shared by C and C++. Keep C as the extension default, then promote
+# a header only when the C++ grammar finds syntax that C cannot express. Weak
+# compatibility markers such as ``__cplusplus`` and ``extern "C"`` are
+# deliberately excluded because they are common in otherwise-C headers.
+_CPP_HEADER_EVIDENCE_TYPES = frozenset({
+    "access_specifier",
+    "alias_declaration",
+    "base_class_clause",
+    "class_specifier",
+    "concept_definition",
+    "lambda_expression",
+    "namespace_definition",
+    "noexcept",
+    "template_declaration",
+    "trailing_return_type",
+    "using_declaration",
+})
+
+_CPP_HEADER_EVIDENCE_QUALIFIERS = frozenset({b"consteval", b"constinit"})
+
+_CPP_QT_STRUCTURAL_MACRO_REPLACEMENTS = {
+    b"QT_BEGIN_NAMESPACE": b" " * len(b"QT_BEGIN_NAMESPACE"),
+    b"QT_END_NAMESPACE": b" " * len(b"QT_END_NAMESPACE"),
+    b"Q_OBJECT": b" " * len(b"Q_OBJECT"),
+    b"Q_SIGNALS": b"public" + b" " * (len(b"Q_SIGNALS") - len(b"public")),
+    b"Q_SLOTS": b" " * len(b"Q_SLOTS"),
+    b"Q_EMIT": b" " * len(b"Q_EMIT"),
+}
+
 # Shebang interpreter → language mapping for extension-less Unix scripts.
 # Each key is the **basename** of the interpreter path as it appears after
 # ``#!`` (or after ``#!/usr/bin/env``).  Only languages already registered
@@ -943,13 +972,22 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     "rust": ["function_item", "function_signature_item"],
     "java": ["method_declaration", "constructor_declaration"],
     "c": ["function_definition"],
-    "cpp": ["function_definition"],
+    "cpp": ["function_definition", "declaration", "field_declaration"],
     "csharp": ["method_declaration", "constructor_declaration"],
     "ruby": ["method", "singleton_method"],
     "r": ["function_definition"],
     "perl": ["subroutine_declaration_statement", "method_declaration_statement"],
     "kotlin": ["function_declaration"],
-    "swift": ["function_declaration"],
+    # Swift: initializers, deinitializers and subscripts are separate node
+    # types, not `function_declaration`s, so they need listing alongside it —
+    # the same way java/csharp list `constructor_declaration`. Their names come
+    # from the `_get_name` Swift branch (the grammar has no usable name field).
+    "swift": [
+        "function_declaration",
+        "init_declaration",
+        "deinit_declaration",
+        "subscript_declaration",
+    ],
     "php": ["function_definition", "method_declaration"],
     "scala": ["function_definition", "function_declaration"],
     # Solidity: events and modifiers use kind="Function" because the graph
@@ -2522,6 +2560,22 @@ class CodeParser:
         if not language:
             return [], []
 
+        parser = None
+        tree = None
+        parse_source = source
+        if language == "c" and path.suffix.lower() == ".h":
+            cpp_parser = self._get_parser("cpp")
+            if cpp_parser is not None:
+                cpp_source = self._mask_cpp_qt_macros(source)
+                cpp_tree = cpp_parser.parse(cpp_source)
+                if self._has_cpp_header_evidence(cpp_tree.root_node):
+                    language = "cpp"
+                    parser = cpp_parser
+                    tree = cpp_tree
+                    parse_source = cpp_source
+        elif language == "cpp":
+            parse_source = self._mask_cpp_qt_macros(source)
+
         if language == "blade":
             return self._parse_blade(path, source)
 
@@ -2592,11 +2646,13 @@ class CodeParser:
         if language == "yaml":
             return [], []
 
-        parser = self._get_parser(language)
+        if parser is None:
+            parser = self._get_parser(language)
         if not parser:
             return [], []
 
-        tree = parser.parse(source)
+        if tree is None:
+            tree = parser.parse(parse_source)
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
         file_path_str = str(path)
@@ -2683,6 +2739,140 @@ class CodeParser:
                     ))
 
         return nodes, edges
+
+    @staticmethod
+    def _has_cpp_header_evidence(root) -> bool:
+        """Return whether a parsed ``.h`` tree contains C++-only syntax."""
+        pending = [root]
+        while pending:
+            node = pending.pop()
+            if node.type == "ERROR" or _is_in_static_dead_guard(node):
+                continue
+
+            previous = node.prev_named_sibling
+            recovered_after_error = (
+                previous is not None
+                and previous.type == "ERROR"
+                and previous.end_byte == node.start_byte
+            )
+            if recovered_after_error:
+                continue
+
+            if node.type in _CPP_HEADER_EVIDENCE_TYPES:
+                return True
+            if (
+                node.type == "enum_specifier"
+                and any(child.type in ("class", "struct") for child in node.children)
+            ):
+                return True
+            if (
+                node.type == "type_qualifier"
+                and node.text in _CPP_HEADER_EVIDENCE_QUALIFIERS
+            ):
+                return True
+            pending.extend(node.named_children)
+        return False
+
+    @staticmethod
+    def _mask_cpp_qt_macros(source: bytes) -> bytes:
+        """Shield structural Qt macros without changing byte or line offsets."""
+        masked = bytearray(source)
+        length = len(source)
+        index = 0
+        line_has_code = False
+
+        def skip_quoted(start: int, quote: int) -> int:
+            cursor = start + 1
+            while cursor < length:
+                if source[cursor] == ord("\\"):
+                    cursor += 2
+                elif source[cursor] == quote:
+                    return cursor + 1
+                else:
+                    cursor += 1
+            return length
+
+        def raw_string_end(start: int) -> Optional[int]:
+            for prefix in (b'u8R"', b'LR"', b'UR"', b'uR"', b'R"'):
+                if not source.startswith(prefix, start):
+                    continue
+                delimiter_start = start + len(prefix)
+                opening = source.find(b"(", delimiter_start, delimiter_start + 17)
+                if opening == -1:
+                    return None
+                delimiter = source[delimiter_start:opening]
+                if any(byte in b" ()\\\t\r\n" for byte in delimiter):
+                    return None
+                closing = source.find(b")" + delimiter + b'"', opening + 1)
+                return length if closing == -1 else closing + len(delimiter) + 2
+            return None
+
+        while index < length:
+            byte = source[index]
+            if byte == ord("\n"):
+                line_has_code = False
+                index += 1
+                continue
+
+            if source.startswith(b"//", index):
+                newline = source.find(b"\n", index + 2)
+                index = length if newline == -1 else newline
+                continue
+            if source.startswith(b"/*", index):
+                closing = source.find(b"*/", index + 2)
+                comment_end = length if closing == -1 else closing + 2
+                if b"\n" in source[index:comment_end]:
+                    line_has_code = False
+                index = comment_end
+                continue
+
+            if byte == ord("#") and not line_has_code:
+                cursor = index
+                while cursor < length:
+                    newline = source.find(b"\n", cursor)
+                    if newline == -1:
+                        cursor = length
+                        break
+                    previous = newline - 1
+                    if previous >= cursor and source[previous] == ord("\r"):
+                        previous -= 1
+                    if previous < cursor or source[previous] != ord("\\"):
+                        cursor = newline
+                        break
+                    cursor = newline + 1
+                index = cursor
+                continue
+
+            raw_end = raw_string_end(index)
+            if raw_end is not None:
+                line_has_code = True
+                index = raw_end
+                continue
+            if byte in (ord('"'), ord("'")):
+                line_has_code = True
+                index = skip_quoted(index, byte)
+                continue
+
+            if byte == ord("_") or chr(byte).isalpha():
+                end = index + 1
+                while end < length:
+                    candidate = source[end]
+                    if candidate != ord("_") and not chr(candidate).isalnum():
+                        break
+                    end += 1
+                token = source[index:end]
+                replacement = _CPP_QT_STRUCTURAL_MACRO_REPLACEMENTS.get(token)
+                if replacement is not None:
+                    masked[index:end] = replacement
+                line_has_code = True
+                index = end
+                continue
+
+            if byte not in b" \t\v\f\r":
+                line_has_code = True
+            index += 1
+
+        return bytes(masked)
 
     @classmethod
     def _mask_blade_comments(cls, text: str) -> str:
@@ -14064,6 +14254,13 @@ class CodeParser:
 
         if language == "cpp" and kind == "function":
             declarator = node.child_by_field_name("declarator")
+            if node.type in ("declaration", "field_declaration"):
+                if (
+                    not self._cpp_declaration_has_callable_scope(node)
+                    or not self._cpp_is_callable_declaration(declarator)
+                ):
+                    return None
+                return self._cpp_callable_name(declarator)
             cpp_name = self._cpp_callable_name(declarator)
             if cpp_name:
                 return cpp_name
@@ -14157,6 +14354,18 @@ class CodeParser:
             for child in node.children:
                 if child.type == "identifier":
                     return child.text.decode("utf-8", errors="replace")
+        # Swift init/deinit/subscript: the grammar gives none of them a usable
+        # name. `init_declaration`'s name field is the `init` keyword itself,
+        # `deinit_declaration` has no name field at all (so the generic loop
+        # returns None and the node is dropped), and `subscript_declaration`'s
+        # name field is the *return type* (`subscript(i: Int) -> String` would
+        # be named "String"). Name each after its Swift declaration keyword.
+        if language == "swift" and node.type in (
+            "init_declaration",
+            "deinit_declaration",
+            "subscript_declaration",
+        ):
+            return node.type.removesuffix("_declaration")
         # Swift extensions: name is inside user_type > type_identifier
         # (e.g. `extension MyClass: Protocol { ... }`)
         if language == "swift" and node.type == "class_declaration":
@@ -14426,6 +14635,11 @@ class CodeParser:
         if declarator is None:
             return None
         if declarator.type in ("function_declarator", "abstract_function_declarator"):
+            nested = self._cpp_find_function_declarator(
+                declarator.child_by_field_name("declarator"),
+            )
+            if nested is not None:
+                return nested
             return declarator
         for child in declarator.named_children:
             if child.type in ("parameter_list", "template_argument_list"):
@@ -14434,6 +14648,44 @@ class CodeParser:
             if found is not None:
                 return found
         return None
+
+    def _cpp_is_callable_declaration(self, declarator) -> bool:
+        """Return whether a declaration names a function, not a function pointer."""
+        function_declarator = self._cpp_find_function_declarator(declarator)
+        if function_declarator is None:
+            return False
+
+        callable_declarator = function_declarator.child_by_field_name("declarator")
+        if (
+            callable_declarator is None
+            or callable_declarator.type != "parenthesized_declarator"
+        ):
+            return True
+
+        # ``void (*callback)(int)`` has no nested function declarator inside
+        # the parentheses.  A real function returning a function pointer,
+        # such as ``void (*factory())(int)``, does.
+        return self._cpp_find_function_declarator(callable_declarator) is not None
+
+    @staticmethod
+    def _cpp_declaration_has_callable_scope(declaration) -> bool:
+        """Limit callable declarations to file, namespace, and class scopes."""
+        scope = declaration.parent
+        while scope is not None:
+            if scope.type in (
+                "translation_unit",
+                "namespace_definition",
+                "field_declaration_list",
+            ):
+                return not _is_in_static_dead_guard(declaration)
+            if scope.type in (
+                "compound_statement",
+                "function_definition",
+                "lambda_expression",
+            ):
+                return False
+            scope = scope.parent
+        return False
 
     def _cpp_find_qualified_identifier(self, declarator):
         """Find the callable's qualified identifier outside its parameters."""
