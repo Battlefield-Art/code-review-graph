@@ -2714,7 +2714,7 @@ class CodeParser:
                 file_path_str,
             )
 
-        edges = self._apply_typed_call_targets(edges, typed_call_targets)
+        edges = self._apply_typed_call_targets(edges, typed_call_targets, language)
 
         # Resolve bare call targets to qualified names using same-file definitions
         edges = self._resolve_call_targets(nodes, edges, file_path_str)
@@ -4966,6 +4966,7 @@ class CodeParser:
 
     _TYPED_CALL_LANGUAGES = frozenset({
         "python", "kotlin", "java", "javascript", "typescript", "tsx", "php",
+        "csharp",
     })
     _TRANSPARENT_TYPE_WRAPPERS = frozenset({"Annotated", "Optional", "Type"})
     _NON_RECEIVER_TYPE_NAMES = frozenset({
@@ -5005,6 +5006,7 @@ class CodeParser:
             "typescript": {"statement_block"},
             "tsx": {"statement_block"},
             "php": {"compound_statement"},
+            "csharp": {"block"},
         }.get(language, set())
         targets: dict[tuple[int, str, str], tuple[str, str, str]] = {}
 
@@ -5068,7 +5070,15 @@ class CodeParser:
                         else "typed_receiver"
                     )
                     if type_name is None and receiver[:1].isupper():
-                        if receiver in import_map or receiver in defined_names:
+                        # C# receivers keep their class-name evidence even
+                        # when the class is not visible in this file: the
+                        # graph-wide scoped resolver validates it against
+                        # actual Class nodes plus namespace evidence (#612).
+                        if (
+                            receiver in import_map
+                            or receiver in defined_names
+                            or language == "csharp"
+                        ):
                             type_name = receiver
                             evidence = "class_receiver"
                     if type_name:
@@ -5132,6 +5142,7 @@ class CodeParser:
             "javascript": {"required_parameter", "optional_parameter"},
             "typescript": {"required_parameter", "optional_parameter"},
             "tsx": {"required_parameter", "optional_parameter"},
+            "csharp": {"parameter"},
         }.get(language, set())
 
         def visit(node, depth: int = 0) -> None:
@@ -5261,6 +5272,38 @@ class CodeParser:
                 node.child_by_field_name("type"),
             )
 
+        elif language == "csharp" and node.type == "variable_declaration":
+            type_node = node.child_by_field_name("type")
+            if type_node is not None and type_node.type == "implicit_type":
+                type_node = None
+            for child in node.children:
+                if child.type != "variable_declarator":
+                    continue
+                declared_type = type_node
+                if declared_type is None:
+                    # ``var x = new Service();`` — use the constructed type.
+                    creation = next(
+                        (
+                            sub for sub in child.children
+                            if sub.type == "object_creation_expression"
+                        ),
+                        None,
+                    )
+                    if creation is not None:
+                        declared_type = creation.child_by_field_name("type")
+                self._store_typed_binding(
+                    result,
+                    child.child_by_field_name("name"),
+                    declared_type,
+                )
+
+        elif language == "csharp" and node.type == "parameter":
+            self._store_typed_binding(
+                result,
+                node.child_by_field_name("name"),
+                node.child_by_field_name("type"),
+            )
+
         elif language == "php" and node.type == "assignment_expression":
             name_node = node.child_by_field_name("left")
             value_node = node.child_by_field_name("right")
@@ -5361,6 +5404,16 @@ class CodeParser:
             scope = imported or normalized
             return f"{scope}::{method}"
 
+        if language == "csharp":
+            # C# ``using`` directives import namespaces, not files, so a
+            # class receiver cannot be resolved to its defining file during
+            # a single-file parse. Emit the receiver class as a scope target
+            # for the graph-wide scoped resolver (#612).
+            base_type = self._base_type_name(type_name)
+            if not base_type:
+                return None
+            return f"{base_type}::{method}"
+
         base_type = self._base_type_name(type_name)
         if not base_type:
             return None
@@ -5381,6 +5434,7 @@ class CodeParser:
     def _apply_typed_call_targets(
         edges: list[EdgeInfo],
         targets: dict[tuple[int, str, str], tuple[str, str, str]],
+        language: str,
     ) -> list[EdgeInfo]:
         if not targets:
             return edges
@@ -5397,9 +5451,9 @@ class CodeParser:
                     "receiver_resolution": evidence_kind,
                 })
                 resolved_target = target
-                if evidence_kind == "constructed_receiver":
-                    # Keep PHP parse-only CALLS output backward-compatible
-                    # (bare method target) while preserving the constructed
+                if evidence_kind == "constructed_receiver" or language == "csharp":
+                    # Keep PHP/C# parse-only CALLS output backward-compatible
+                    # (bare method target) while preserving the receiver
                     # class scope for the graph-wide resolver.
                     scope, separator, _ = target.rpartition("::")
                     if separator and scope:
@@ -10803,6 +10857,11 @@ class CodeParser:
             method = method_node.text.decode("utf-8", errors="replace")
             return receiver, method
 
+        if language == "csharp":
+            if node.type != "invocation_expression":
+                return None, None
+            return self._get_csharp_receiver_method(node)
+
         callee = node.child_by_field_name("function")
         if callee is None and node.children:
             callee = node.children[0]
@@ -10867,6 +10926,77 @@ class CodeParser:
                 )
 
         return None, method
+
+    @staticmethod
+    def _get_csharp_receiver_method(node) -> tuple[Optional[str], Optional[str]]:
+        """Return ``(receiver, method)`` for a C# invocation expression.
+
+        Handles ``obj.Method()`` / ``Class.Method()`` (member access),
+        ``this.field.Method()`` (class-field receiver), and
+        ``obj?.Method()`` (conditional access via a member binding).
+        Chained or computed receivers keep the method name but no receiver.
+        """
+        callee = node.child_by_field_name("function")
+        if callee is None and node.children:
+            callee = node.children[0]
+        if callee is None:
+            return None, None
+
+        if callee.type == "member_access_expression":
+            name_node = callee.child_by_field_name("name")
+            if name_node is None:
+                return None, None
+            method = name_node.text.decode("utf-8", errors="replace")
+            receiver_node = callee.child_by_field_name("expression")
+            if receiver_node is None:
+                return None, method
+            if receiver_node.type in ("identifier", "this", "this_expression"):
+                return (
+                    receiver_node.text.decode("utf-8", errors="replace"),
+                    method,
+                )
+            # ``this.field.Save()``: the class field is the receiver.
+            if receiver_node.type == "member_access_expression":
+                root = receiver_node.child_by_field_name("expression")
+                field_node = receiver_node.child_by_field_name("name")
+                if (
+                    root is not None
+                    and field_node is not None
+                    and root.type in ("this", "this_expression")
+                ):
+                    return (
+                        field_node.text.decode("utf-8", errors="replace"),
+                        method,
+                    )
+            return None, method
+
+        if callee.type == "conditional_access_expression":
+            bindings = [
+                child for child in callee.children
+                if child.type == "member_binding_expression"
+            ]
+            if not bindings:
+                return None, None
+            name_node = bindings[-1].child_by_field_name("name")
+            if name_node is None:
+                return None, None
+            method = name_node.text.decode("utf-8", errors="replace")
+            receiver_node = callee.child_by_field_name("condition")
+            named_children = [
+                child for child in callee.children if child.is_named
+            ]
+            if (
+                receiver_node is not None
+                and receiver_node.type == "identifier"
+                and len(named_children) == 2
+            ):
+                return (
+                    receiver_node.text.decode("utf-8", errors="replace"),
+                    method,
+                )
+            return None, method
+
+        return None, None
 
     # ------------------------------------------------------------------
     # PHP / Laravel semantic constructs
