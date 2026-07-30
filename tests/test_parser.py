@@ -297,7 +297,7 @@ class Plain:
         """Call targets defined in the same file should be qualified."""
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
         calls = [e for e in edges if e.kind == "CALLS"]
-        file_path = str(FIXTURES / "sample_python.py")
+        file_path = (FIXTURES / "sample_python.py").as_posix()
 
         # create_auth_service() calls AuthService() — a class defined in the same file
         auth_service_calls = [
@@ -310,7 +310,7 @@ class Plain:
         _, edges = self.parser.parse_file(FIXTURES / "caller_example.py")
         calls = [e for e in edges if e.kind == "CALLS"]
 
-        sample_path = str((FIXTURES / "sample_python.py").resolve())
+        sample_path = (FIXTURES / "sample_python.py").resolve().as_posix()
         # setup_and_run() calls create_auth_service(), imported from sample_python
         resolved_calls = [
             e for e in calls if e.target == f"{sample_path}::create_auth_service"
@@ -329,7 +329,7 @@ class Plain:
         """Decorated functions should be in defined_names and resolvable as call targets."""
         _, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
         calls = [e for e in edges if e.kind == "CALLS"]
-        file_path = str(FIXTURES / "sample_python.py")
+        file_path = (FIXTURES / "sample_python.py").as_posix()
 
         # guarded_process() calls process_request() — both in the same file,
         # but guarded_process is wrapped in a decorated_definition node
@@ -367,7 +367,7 @@ class Plain:
         try:
             _, edges = self.parser.parse_file(tmp)
             calls = [e for e in edges if e.kind == "CALLS"]
-            module_scope_calls = [e for e in calls if e.source == str(tmp)]
+            module_scope_calls = [e for e in calls if e.source == tmp.as_posix()]
             assert any(
                 "helper" in e.target for e in module_scope_calls
             ), f"Expected module-scope CALLS edge to helper(); got: {[(e.source, e.target) for e in calls]}"
@@ -401,7 +401,7 @@ class Plain:
             _, edges = self.parser.parse_file(tmp)
             calls = [e for e in edges if e.kind == "CALLS"]
             assert any(
-                "do_work" in e.target and e.source == str(tmp) for e in calls
+                "do_work" in e.target and e.source == tmp.as_posix() for e in calls
             ), f"Expected notebook CALLS edge to do_work(); got: {[(e.source, e.target) for e in calls]}"
         finally:
             tmp.unlink()
@@ -437,7 +437,7 @@ class Plain:
         tested_by = [e for e in edges if e.kind == "TESTED_BY"]
         assert len(tested_by) >= 1, "fixture should yield at least one TESTED_BY edge"
 
-        test_file = str(FIXTURES / "test_sample.py")
+        test_file = (FIXTURES / "test_sample.py").as_posix()
         test_qualified = {
             f"{test_file}::{n.name}" for n in nodes if n.kind == "Test"
         }
@@ -616,7 +616,7 @@ class Plain:
         nodes, edges = self.parser.parse_file(FIXTURES / "sample.dart")
         contains = [e for e in edges if e.kind == "CONTAINS"]
         # File should contain top-level classes and functions
-        file_path = str(FIXTURES / "sample.dart")
+        file_path = (FIXTURES / "sample.dart").as_posix()
         file_contains = [e for e in contains if e.source == file_path]
         assert len(file_contains) >= 1
         # Dog class should contain its methods
@@ -721,7 +721,7 @@ class Plain:
         ]
         assert len(it_tests) >= 2
 
-        file_path = str(FIXTURES / "sample_vitest.test.ts")
+        file_path = (FIXTURES / "sample_vitest.test.ts").as_posix()
         describe_qualified = {f"{file_path}::{n.name}" for n in describe_nodes}
         contains_sources = {e.source for e in edges if e.kind == "CONTAINS"}
         assert describe_qualified & contains_sources
@@ -732,7 +732,7 @@ class Plain:
         calls = [e for e in edges if e.kind == "CALLS"]
         assert len(calls) >= 1
         test_names = {n.name for n in nodes if n.kind == "Test"}
-        file_path = str(FIXTURES / "sample_vitest.test.ts")
+        file_path = (FIXTURES / "sample_vitest.test.ts").as_posix()
         test_qualified = {f"{file_path}::{name}" for name in test_names}
         call_sources = {e.source for e in calls}
         assert call_sources & test_qualified
@@ -907,10 +907,10 @@ class Plain:
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
-        expected_target = f"{str((FIXTURES / 'MarkdownMsg.tsx').resolve())}::MarkdownMsg"
+        expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
             e for e in calls
-            if e.source == f"{path}::BookWorkspace" and e.target == expected_target
+            if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
 
@@ -940,7 +940,7 @@ class Plain:
         calls = [e for e in edges if e.kind == "CALLS"]
         jsx_calls = [
             e for e in calls
-            if e.source == f"{path}::BookWorkspace" and e.target == "MarkdownMsg"
+            if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == "MarkdownMsg"
         ]
         assert len(jsx_calls) == 1
 
@@ -956,10 +956,10 @@ class Plain:
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
-        expected_target = f"{str((FIXTURES / 'MarkdownMsg.tsx').resolve())}::MarkdownMsg"
+        expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
             e for e in calls
-            if e.source == f"{path}::BookWorkspace" and e.target == expected_target
+            if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
 
@@ -975,10 +975,10 @@ class Plain:
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
-        expected_target = f"{str((FIXTURES / 'MarkdownMsg.tsx').resolve())}::MarkdownMsg"
+        expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
             e for e in calls
-            if e.source == f"{path}::BookWorkspace" and e.target == expected_target
+            if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
 
@@ -1006,12 +1006,13 @@ class Plain:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{str((root / 'components' / 'MarkdownMsg.tsx').resolve())}"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
                 "::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in calls
-                if e.source == f"{consumer}::BookWorkspace" and e.target == expected_target
+                if e.source == f"{consumer.as_posix()}::BookWorkspace"
+                and e.target == expected_target
             ]
             assert len(jsx_calls) == 1
 
@@ -1039,12 +1040,13 @@ class Plain:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{str((root / 'components' / 'MarkdownMsg.tsx').resolve())}"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
                 "::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in calls
-                if e.source == f"{consumer}::BookWorkspace" and e.target == expected_target
+                if e.source == f"{consumer.as_posix()}::BookWorkspace"
+                and e.target == expected_target
             ]
             assert len(jsx_calls) == 1
 
@@ -1072,12 +1074,13 @@ class Plain:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{str((root / 'components' / 'MarkdownMsg.tsx').resolve())}"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
                 "::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in calls
-                if e.source == f"{consumer}::BookWorkspace" and e.target == expected_target
+                if e.source == f"{consumer.as_posix()}::BookWorkspace"
+                and e.target == expected_target
             ]
             assert len(jsx_calls) == 1
 
@@ -1120,7 +1123,7 @@ class Plain:
             _, edges = self.parser.parse_file(consumer)
 
             expected_target = (
-                f"{str((components / 'MarkdownMsg.jsx').resolve())}::MarkdownMsg"
+                f"{(components / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in edges
@@ -1130,8 +1133,8 @@ class Plain:
             for edge in jsx_calls:
                 by_source[edge.source] = by_source.get(edge.source, 0) + 1
             assert by_source == {
-                f"{consumer}::BookDashboard": 3,
-                f"{consumer}::AIPanel": 2,
+                f"{consumer.as_posix()}::BookDashboard": 3,
+                f"{consumer.as_posix()}::AIPanel": 2,
             }
 
     def test_nested_barrel_chain_resolves_component_to_origin_file(self):
@@ -1163,12 +1166,12 @@ class Plain:
             _, edges = self.parser.parse_file(consumer)
 
             expected_target = (
-                f"{str((messages / 'MarkdownMsg.jsx').resolve())}::MarkdownMsg"
+                f"{(messages / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in edges
                 if e.kind == "CALLS"
-                and e.source == f"{consumer}::BookDashboard"
+                and e.source == f"{consumer.as_posix()}::BookDashboard"
                 and e.target == expected_target
             ]
             assert len(jsx_calls) == 1
@@ -1762,7 +1765,7 @@ class TestValueReferences:
         """REFERENCES edges should have resolved (qualified) targets for local funcs."""
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_map_dispatch.ts")
         refs = [e for e in edges if e.kind == "REFERENCES"]
-        file_path = str(FIXTURES / "sample_map_dispatch.ts")
+        file_path = (FIXTURES / "sample_map_dispatch.ts").as_posix()
         # At least some targets should be fully qualified
         qualified_refs = [e for e in refs if "::" in e.target]
         assert len(qualified_refs) > 0
@@ -1793,7 +1796,7 @@ class TestModuleScopeCalls:
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
             e for e in calls
-            if e.source == str(path) and e.target.endswith("worker")
+            if e.source == path.as_posix() and e.target.endswith("worker")
         ]
         assert len(top_level) == 1
         # Edge originates at the call site (line 4), not the def (line 1).
@@ -1813,7 +1816,7 @@ class TestModuleScopeCalls:
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
             e for e in calls
-            if e.source == str(path) and e.target.endswith("run_job")
+            if e.source == path.as_posix() and e.target.endswith("run_job")
         ]
         assert len(top_level) == 1
         # Edge originates inside the `if __name__` block (line 5).
@@ -1834,7 +1837,7 @@ class TestModuleScopeCalls:
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
             e for e in calls
-            if e.source == str(path) and e.target.endswith("App")
+            if e.source == path.as_posix() and e.target.endswith("App")
         ]
         assert len(top_level) == 1
         # Edge originates at the JSX site (line 3), not the import (line 1).
@@ -1856,7 +1859,7 @@ class TestModuleScopeCalls:
         top_level = [
             e for e in edges
             if e.kind == "CALLS"
-            and e.source == str(path)
+            and e.source == path.as_posix()
             and e.target.endswith("worker")
         ]
         assert len(top_level) == 1
@@ -1871,7 +1874,7 @@ class TestModuleScopeCalls:
         top_level = [
             e for e in edges
             if e.kind == "CALLS"
-            and e.source == str(path)
+            and e.source == path.as_posix()
             and e.target.endswith("puts")
         ]
         assert len(top_level) == 1
@@ -2050,10 +2053,10 @@ class TestJsMemberAssignedFunctions:
         )
         contains = [
             e for e in edges
-            if e.kind == "CONTAINS" and e.target == f"{path}::app.handle"
+            if e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::app.handle"
         ]
         assert len(contains) == 1
-        assert contains[0].source == str(path)
+        assert contains[0].source == path.as_posix()
 
     def test_non_function_member_assignment_not_captured(self):
         """``obj.prop = <non-function>`` must not create a Function node."""
@@ -2078,7 +2081,7 @@ class TestJsMemberAssignedFunctions:
         assert {n.name for n in functions} == {"a", "b"}
         assert all(n.name != "x.run" for n in functions)
         assert all(
-            not (e.kind == "CONTAINS" and e.target == f"{path}::x.run")
+            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run")
             for e in edges
         )
 
@@ -2093,7 +2096,7 @@ class TestJsMemberAssignedFunctions:
         functions = [n for n in nodes if n.kind == "Function"]
         assert all(n.name != "x.run" for n in functions)
         assert all(
-            not (e.kind == "CONTAINS" and e.target == f"{path}::x.run")
+            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run")
             for e in edges
         )
 
@@ -2109,7 +2112,7 @@ class TestJsMemberAssignedFunctions:
         assert all(
             not (
                 e.kind == "CONTAINS"
-                and e.target == f"{path}::factory().handle"
+                and e.target == f"{path.as_posix()}::factory().handle"
             )
             for e in edges
         )
@@ -2124,7 +2127,7 @@ class TestJsMemberAssignedFunctions:
         )
         calls = [
             e for e in edges
-            if e.kind == "CALLS" and e.source == f"{path}::start"
+            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
         ]
         assert len(calls) == 2
         handle_call = next(e for e in calls if e.target == "handle")
@@ -2143,7 +2146,7 @@ class TestJsMemberAssignedFunctions:
         calls = [
             e for e in edges
             if e.kind == "CALLS"
-            and e.source == f"{path}::app.handle"
+            and e.source == f"{path.as_posix()}::app.handle"
             and e.target.endswith("helper")
         ]
         assert len(calls) == 1
@@ -2158,10 +2161,10 @@ class TestJsMemberAssignedFunctions:
         )
         calls = [
             e for e in edges
-            if e.kind == "CALLS" and e.source == f"{path}::start"
+            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
         ]
         assert len(calls) == 1
-        assert calls[0].target == f"{path}::app.handle"
+        assert calls[0].target == f"{path.as_posix()}::app.handle"
 
     def test_optional_member_call_resolves_to_member_assigned_function(self):
         """Optional chaining retains the same static member-call target."""
@@ -2173,10 +2176,10 @@ class TestJsMemberAssignedFunctions:
         )
         calls = [
             e for e in edges
-            if e.kind == "CALLS" and e.source == f"{path}::start"
+            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
         ]
         assert len(calls) == 1
-        assert calls[0].target == f"{path}::app.handle"
+        assert calls[0].target == f"{path.as_posix()}::app.handle"
 
     def test_member_assignment_survives_full_build_with_resolved_caller(
         self,
@@ -2191,8 +2194,8 @@ class TestJsMemberAssignedFunctions:
             "function start() { return app.handle(); }\n",
             encoding="utf-8",
         )
-        member_qn = f"{source}::app.handle"
-        caller_qn = f"{source}::start"
+        member_qn = f"{source.as_posix()}::app.handle"
+        caller_qn = f"{source.as_posix()}::start"
 
         with GraphStore(tmp_path / "graph.db") as store:
             built = full_build(tmp_path, store)
@@ -2277,8 +2280,9 @@ class TestTypeScriptTypeDeclarations:
                 for e in edges
                 if e.kind == "REFERENCES"
             }
-            assert (f"{use}::summarize", f"{types.resolve()}::Finding") in refs
-            assert (f"{use}::summarize", f"{types.resolve()}::Verdict") in refs
+            summarize = f"{use.as_posix()}::summarize"
+            assert (summarize, f"{types.resolve().as_posix()}::Finding") in refs
+            assert (summarize, f"{types.resolve().as_posix()}::Verdict") in refs
 
     def test_aliased_type_import_resolves_to_exported_symbol(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2301,11 +2305,11 @@ class TestTypeScriptTypeDeclarations:
                 if edge.kind == "REFERENCES"
             }
             assert (
-                f"{use}::summarize",
-                f"{types.resolve()}::Finding",
+                f"{use.as_posix()}::summarize",
+                f"{types.resolve().as_posix()}::Finding",
             ) in refs
             assert not any(
-                target == f"{types.resolve()}::ImportedFinding"
+                target == f"{types.resolve().as_posix()}::ImportedFinding"
                 for _, target in refs
             )
 
@@ -2319,8 +2323,8 @@ class TestTypeScriptTypeDeclarations:
             # Severity appears only as Map<string, Severity>.
             assert any(
                 e.kind == "REFERENCES"
-                and e.source == f"{use}::summarize"
-                and e.target == f"{types.resolve()}::Severity"
+                and e.source == f"{use.as_posix()}::summarize"
+                and e.target == f"{types.resolve().as_posix()}::Severity"
                 for e in edges
             )
 
@@ -2353,8 +2357,8 @@ class TestTypeScriptTypeDeclarations:
 
             assert any(
                 e.kind == "REFERENCES"
-                and e.source == f"{wrapper}::Wrapper"
-                and e.target == f"{types.resolve()}::Verdict"
+                and e.source == f"{wrapper.as_posix()}::Wrapper"
+                and e.target == f"{types.resolve().as_posix()}::Verdict"
                 for e in edges
             )
 
@@ -2384,8 +2388,8 @@ class TestTypeScriptTypeDeclarations:
             inherits = {
                 (e.source, e.target) for e in edges if e.kind == "INHERITS"
             }
-            assert (f"{impl}::Impl", "Base") in inherits
-            assert (f"{impl}::Impl", "Findable") in inherits
+            assert (f"{impl.as_posix()}::Impl", "Base") in inherits
+            assert (f"{impl.as_posix()}::Impl", "Findable") in inherits
 
     def test_interface_extends_emits_inherits_edge(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2404,7 +2408,7 @@ class TestTypeScriptTypeDeclarations:
             _, edges = self.parser.parse_file(wrapper)
 
             inherits = {(e.source, e.target) for e in edges if e.kind == "INHERITS"}
-            assert (f"{wrapper}::Wrapper", "Findable") in inherits
+            assert (f"{wrapper.as_posix()}::Wrapper", "Findable") in inherits
 
     def test_heritage_does_not_double_emit_a_reference(self):
         """A base is already an INHERITS edge; it must not also be REFERENCES."""
@@ -2454,13 +2458,13 @@ class TestTypeScriptTypeDeclarations:
             references = [
                 edge for edge in edges
                 if edge.kind == "REFERENCES"
-                and edge.target == f"{base.resolve()}::Box"
+                and edge.target == f"{base.resolve().as_posix()}::Box"
             ]
             assert len(inherits) == 2
             assert references == []
             assert any(
                 edge.kind == "REFERENCES"
-                and edge.target == f"{base.resolve()}::Payload"
+                and edge.target == f"{base.resolve().as_posix()}::Payload"
                 for edge in edges
             )
 
@@ -2481,7 +2485,7 @@ class TestTypeScriptTypeDeclarations:
 
             assert any(
                 e.kind == "REFERENCES"
-                and e.source == f"{panel}::Panel"
-                and e.target == f"{types.resolve()}::Finding"
+                and e.source == f"{panel.as_posix()}::Panel"
+                and e.target == f"{types.resolve().as_posix()}::Finding"
                 for e in edges
             )

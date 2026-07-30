@@ -35,7 +35,7 @@ from .constants import (
     MAX_IMPACT_NODES,
 )
 from .migrations import get_schema_version, run_migrations
-from .parser import EdgeInfo, NodeInfo
+from .parser import EdgeInfo, NodeInfo, normalize_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,19 @@ def _compatible_edge_languages(language: str) -> tuple[str, ...]:
     if normalized in _JAVASCRIPT_LANGUAGE_FAMILY_SET:
         return _JAVASCRIPT_LANGUAGE_FAMILY
     return (language,)
+
+
+def _bridge_qualified_name(qualified_name: str) -> str:
+    """Return *qualified_name* with its file-path component POSIX-normalized.
+
+    Qualified names embed the file path before the first ``::`` (File nodes
+    are just the path). Stored identities always use forward slashes (#774),
+    so a Windows-native spelling must be bridged to find the POSIX-keyed row.
+    Only the path component is rewritten — the symbol part may legitimately
+    contain backslashes (PHP fully-qualified names).
+    """
+    path_part, sep, symbol_part = qualified_name.partition("::")
+    return normalize_file_path(path_part) + sep + symbol_part
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +298,7 @@ class GraphStore:
 
     def remove_file_data(self, file_path: str) -> None:
         """Remove all nodes and edges associated with a file."""
+        file_path = normalize_file_path(file_path)
         self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
         self._conn.execute("DELETE FROM edges WHERE file_path = ?", (file_path,))
         self._invalidate_cache()
@@ -295,6 +309,7 @@ class GraphStore:
 
     def remove_files_permanently(self, file_paths: list[str]) -> int:
         """Atomically remove deleted files and graph references to their nodes."""
+        file_paths = [normalize_file_path(p) for p in file_paths]
         changed = 0
         has_embeddings = self._conn.execute(
             "SELECT 1 FROM sqlite_master "
@@ -410,6 +425,14 @@ class GraphStore:
         row = self._conn.execute(
             "SELECT * FROM nodes WHERE qualified_name = ?", (qualified_name,)
         ).fetchone()
+        if row is None:
+            # Bridge Windows-native path spellings to the stored POSIX
+            # identity (#774), mirroring the file-keyed lookups above.
+            bridged = _bridge_qualified_name(qualified_name)
+            if bridged != qualified_name:
+                row = self._conn.execute(
+                    "SELECT * FROM nodes WHERE qualified_name = ?", (bridged,)
+                ).fetchone()
         return self._row_to_node(row) if row else None
 
     def get_nodes_by_file(self, file_path: str) -> list[GraphNode]:
@@ -418,7 +441,7 @@ class GraphStore:
     def iter_nodes_by_file(self, file_path: str) -> Iterator[GraphNode]:
         """Yield file nodes without first materializing the complete row set."""
         rows = self._conn.execute(
-            "SELECT * FROM nodes WHERE file_path = ?", (file_path,)
+            "SELECT * FROM nodes WHERE file_path = ?", (normalize_file_path(file_path),)
         )
         for row in rows:
             yield self._row_to_node(row)
@@ -1821,7 +1844,7 @@ class GraphStore:
         rows = self._conn.execute(
             "SELECT DISTINCT file_path FROM nodes "
             "WHERE file_path LIKE ?",
-            (f"%{pattern}",),
+            (f"%{normalize_file_path(pattern)}",),
         ).fetchall()
         return [r["file_path"] for r in rows]
 
@@ -1865,6 +1888,7 @@ class GraphStore:
         """Return node IDs belonging to the given file paths."""
         if not file_paths:
             return set()
+        file_paths = [normalize_file_path(p) for p in file_paths]
         result: set[int] = set()
         batch_size = 450
         for i in range(0, len(file_paths), batch_size):

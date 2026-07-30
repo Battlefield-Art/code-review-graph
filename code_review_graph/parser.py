@@ -20,7 +20,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, NamedTuple, Optional
 
 try:
@@ -647,6 +647,23 @@ def _read_php_composer_psr4(
 # ---------------------------------------------------------------------------
 
 
+def normalize_file_path(path: "str | PurePath") -> str:
+    """Return *path* as a forward-slash (POSIX) string for graph identity.
+
+    ``file_path`` values and the path component of qualified names are graph
+    identity: they must be separator-stable across operating systems so a
+    graph built on Windows produces the same identifiers as one built on
+    Linux/macOS, and so consumers that reconstruct identifiers from ``Path``
+    objects always agree with the parser. See issue #774.
+
+    Only apply this to file *paths* — never to symbol names: PHP namespace
+    identifiers (``App\\Domain\\Job``) legitimately contain backslashes.
+    """
+    if isinstance(path, PurePath):
+        return path.as_posix()
+    return str(path).replace("\\", "/")
+
+
 @dataclass
 class NodeInfo:
     kind: str  # File, Class, Function, Type, Test
@@ -663,6 +680,13 @@ class NodeInfo:
     extra: dict = field(default_factory=dict)
     identity_name: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        # Identity invariant (#774): file paths always use POSIX separators.
+        # File nodes carry their path in ``name`` as well.
+        self.file_path = normalize_file_path(self.file_path)
+        if self.kind == "File":
+            self.name = normalize_file_path(self.name)
+
 
 @dataclass
 class EdgeInfo:
@@ -674,6 +698,12 @@ class EdgeInfo:
     file_path: str
     line: int = 0
     extra: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Identity invariant (#774): file paths always use POSIX separators.
+        # ``source``/``target`` are left alone — they may contain qualified
+        # names whose symbol part legitimately embeds backslashes (PHP FQNs).
+        self.file_path = normalize_file_path(self.file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -2673,7 +2703,7 @@ class CodeParser:
             tree = parser.parse(parse_source)
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
-        file_path_str = str(path)
+        file_path_str = normalize_file_path(path)
 
         # File node
         test_file = _is_test_file(file_path_str)
@@ -2911,7 +2941,7 @@ class CodeParser:
         """Parse static Blade template references without a Tree-sitter grammar."""
         text = source.decode("utf-8", errors="replace")
         masked = self._mask_blade_comments(text)
-        file_path = str(path)
+        file_path = normalize_file_path(path)
         nodes = [
             NodeInfo(
                 kind="File",
@@ -2946,7 +2976,7 @@ class CodeParser:
             return [], []
 
         tree = vue_parser.parse(source)
-        file_path_str = str(path)
+        file_path_str = normalize_file_path(path)
         test_file = _is_test_file(file_path_str)
 
         all_nodes: list[NodeInfo] = [NodeInfo(
@@ -3068,7 +3098,7 @@ class CodeParser:
             return [], []
 
         tree = svelte_parser.parse(source)
-        file_path_str = str(path)
+        file_path_str = normalize_file_path(path)
         test_file = _is_test_file(file_path_str)
 
         all_nodes: list[NodeInfo] = [NodeInfo(
@@ -3249,7 +3279,7 @@ class CodeParser:
             cells.append(CellInfo(cell_index=cell_idx, language=cell_lang, source=cell_source))
 
         if not cells:
-            file_path_str = str(path)
+            file_path_str = normalize_file_path(path)
             return [NodeInfo(
                 kind="File",
                 name=file_path_str,
@@ -3275,7 +3305,7 @@ class CodeParser:
             cells: List of CellInfo with index, language, and source.
             default_language: Default language for the File node.
         """
-        file_path_str = str(path)
+        file_path_str = normalize_file_path(path)
         test_file = _is_test_file(file_path_str)
 
         # Group cells by language
@@ -3472,7 +3502,7 @@ class CodeParser:
             ))
 
         if not cells:
-            file_path_str = str(path)
+            file_path_str = normalize_file_path(path)
             file_node = NodeInfo(
                 kind="File",
                 name=file_path_str,
@@ -3511,7 +3541,7 @@ class CodeParser:
         text = source.decode("utf-8", errors="replace")
         cleaned = _strip_vbnet_noise(text)
         statements = _vbnet_logical_lines(cleaned)
-        file_path = str(path)
+        file_path = normalize_file_path(path)
         line_count = text.count("\n") + 1
         test_file = _is_test_file(file_path)
 
@@ -3933,7 +3963,7 @@ class CodeParser:
         extraction since signatures have no call sites.
         """
         text = source.decode("utf-8", errors="replace")
-        file_path_str = str(path)
+        file_path_str = normalize_file_path(path)
         test_file = _is_test_file(file_path_str)
         is_interface = path.suffix.lower() == ".resi"
 
@@ -4340,7 +4370,7 @@ class CodeParser:
         a ``ref()`` / ``source()`` call remains a best-effort content signal.
         """
         text = source.decode("utf-8", errors="replace")
-        file_path_str = str(path)
+        file_path_str = normalize_file_path(path)
         test_file = _is_test_file(file_path_str)
 
         nodes: list[NodeInfo] = []
@@ -5511,7 +5541,7 @@ class CodeParser:
 
     @staticmethod
     def _spring_config_file_node(path: Path, source: bytes, language: str) -> NodeInfo:
-        file_path = str(path)
+        file_path = normalize_file_path(path)
         return NodeInfo(
             kind="File",
             name=file_path,
@@ -5547,7 +5577,7 @@ class CodeParser:
         if self._is_non_spring_yaml(documents):
             return [], []
 
-        file_path = str(path)
+        file_path = normalize_file_path(path)
         nodes = [self._spring_config_file_node(path, source, "yaml")]
         emitted: set[str] = set()
 
@@ -5681,7 +5711,7 @@ class CodeParser:
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Index Spring .properties keys without retaining their values."""
         text = source.decode("utf-8", errors="replace")
-        file_path = str(path)
+        file_path = normalize_file_path(path)
         nodes = [self._spring_config_file_node(path, source, "properties")]
         emitted: set[str] = set()
         for line_number, line in self._spring_property_logical_lines(text):
@@ -5727,7 +5757,7 @@ class CodeParser:
         if root is None:
             return [], []
 
-        file_path_str = str(path)
+        file_path_str = normalize_file_path(path)
         line_count = source.count(b"\n") + 1
         nodes: list[NodeInfo] = [NodeInfo(
             kind="File",
@@ -13007,7 +13037,7 @@ class CodeParser:
             file_stat = module_path.stat()
         except (OSError, ValueError):
             return {}
-        resolved_module = str(module_path)
+        resolved_module = normalize_file_path(module_path)
         if resolved_module in resolving:
             return {}
 
@@ -13039,7 +13069,7 @@ class CodeParser:
         resolving: frozenset[str],
     ) -> dict[str, str]:
         """Read and parse one Python module for star-export discovery."""
-        resolved_module = str(module_path)
+        resolved_module = normalize_file_path(module_path)
         try:
             source = module_path.read_bytes()
         except (OSError, PermissionError):
@@ -13164,7 +13194,7 @@ class CodeParser:
                 if not self._path_is_within(resolved, boundary):
                     continue
                 if resolved.is_file():
-                    return str(resolved)
+                    return normalize_file_path(resolved)
         return None
 
     def _collect_js_exported_local_names(
@@ -13448,7 +13478,7 @@ class CodeParser:
         point at a forgotten file falls back to a bare module, and the calls
         it feeds stay bare too.
         """
-        self._excluded_files = {str(Path(p).resolve()) for p in paths}
+        self._excluded_files = {normalize_file_path(Path(p).resolve()) for p in paths}
         # Drop resolutions cached before the exclusions were applied.
         self._module_file_cache.clear()
 
@@ -13467,6 +13497,10 @@ class CodeParser:
             resolved = self._module_file_cache[cache_key]
         else:
             resolved = self._do_resolve_module(module, file_path, language)
+            if resolved is not None:
+                # Resolution walks the real filesystem, so on Windows the
+                # raw result uses backslashes; identity must not (#774).
+                resolved = normalize_file_path(resolved)
             if len(self._module_file_cache) >= self._MODULE_CACHE_MAX:
                 self._module_file_cache.clear()
             self._module_file_cache[cache_key] = resolved
@@ -13916,7 +13950,7 @@ class CodeParser:
             return None
         if not _path_is_within(resolved, boundary):
             return None
-        return str(resolved)
+        return normalize_file_path(resolved)
 
     def _resolve_php_composer_module(
         self,
@@ -14121,7 +14155,7 @@ class CodeParser:
             boundary = self._python_repo_boundary(file_path)
             if not self._path_is_within(candidate, boundary) or not candidate.is_file():
                 return None
-            resolved = str(candidate)
+            resolved = normalize_file_path(candidate)
         else:
             resolved = self._resolve_module_to_file(module, file_path, language)
         if not resolved:
@@ -14238,7 +14272,14 @@ class CodeParser:
         return None
 
     def _qualify(self, name: str, file_path: str, enclosing_class: Optional[str]) -> str:
-        """Create a qualified name: file_path::ClassName.name or file_path::name."""
+        """Create a qualified name: file_path::ClassName.name or file_path::name.
+
+        The path component is normalized to POSIX separators so identities
+        are stable across operating systems (#774). ``name`` and
+        ``enclosing_class`` are never touched — PHP namespace identifiers
+        legitimately contain backslashes.
+        """
+        file_path = normalize_file_path(file_path)
         if enclosing_class:
             return f"{file_path}::{enclosing_class}.{name}"
         return f"{file_path}::{name}"
