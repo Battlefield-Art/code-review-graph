@@ -1611,9 +1611,14 @@ class GraphStore:
         for row in self._conn.execute("SELECT kind, COUNT(*) as cnt FROM edges GROUP BY kind"):
             edges_by_kind[row["kind"]] = row["cnt"]
 
+        # Derive languages from the live File inventory, not from every node
+        # row: virtual or leftover rows without a backing File node (e.g. the
+        # synthetic Spring Event nodes) must not keep a language alive in
+        # `status` after its last real file left the graph (issue #474).
         languages = [
             r["language"] for r in self._conn.execute(
-                "SELECT DISTINCT language FROM nodes WHERE language IS NOT NULL AND language != ''"
+                "SELECT DISTINCT language FROM nodes WHERE kind = 'File' "
+                "AND language IS NOT NULL AND language != '' ORDER BY language"
             )
         ]
 
