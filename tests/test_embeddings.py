@@ -804,6 +804,20 @@ class TestGetProviderVoyage:
             "voyage:voyage-code-3:dim512:float@https://voyage.example.test/v1"
         )
 
+    def test_get_provider_voyage_ignores_local_embedding_model_env(self):
+        env = {
+            "VOYAGE_API_KEY": "test-key",
+            "CRG_EMBEDDING_MODEL": "local-only-model",
+            "CRG_ACCEPT_CLOUD_EMBEDDINGS": "1",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            provider = get_provider("voyage")
+
+        assert isinstance(provider, VoyageEmbeddingProvider)
+        assert provider.name == (
+            "voyage:voyage-code-3:dim1024:float@https://api.voyageai.com/v1"
+        )
+
 
 class TestEmbeddingStoreContextManager:
     """Regression tests for #260: EmbeddingStore must support the context

@@ -968,7 +968,7 @@ def main() -> None:
     )
     eval_cmd.add_argument(
         "--embed-provider",
-        choices=["local", "openai", "google", "minimax"],
+        choices=["local", "openai", "google", "minimax", "voyage"],
         default=None,
         help="Provider for --embed (default: local, needs "
              "code-review-graph[embeddings])",

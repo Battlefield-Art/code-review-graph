@@ -895,6 +895,7 @@ def get_provider(
                CRG_EMBEDDING_MODEL env var, then to all-MiniLM-L6-v2.
                For Google provider this is a Gemini model ID.
                For OpenAI provider this overrides CRG_OPENAI_MODEL.
+               For Voyage provider this overrides CRG_VOYAGE_MODEL.
 
     Raises:
         ValueError: If the provider name is not one of the known providers,
@@ -972,7 +973,6 @@ def get_provider(
         resolved_model = (
             model
             or os.environ.get("CRG_VOYAGE_MODEL")
-            or os.environ.get("CRG_EMBEDDING_MODEL")
             or VoyageEmbeddingProvider._DEFAULT_MODEL
         )
         dim_env = os.environ.get("CRG_VOYAGE_OUTPUT_DIMENSION")
