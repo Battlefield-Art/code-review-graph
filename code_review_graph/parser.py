@@ -949,7 +949,16 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     "r": ["function_definition"],
     "perl": ["subroutine_declaration_statement", "method_declaration_statement"],
     "kotlin": ["function_declaration"],
-    "swift": ["function_declaration"],
+    # Swift: initializers, deinitializers and subscripts are separate node
+    # types, not `function_declaration`s, so they need listing alongside it —
+    # the same way java/csharp list `constructor_declaration`. Their names come
+    # from the `_get_name` Swift branch (the grammar has no usable name field).
+    "swift": [
+        "function_declaration",
+        "init_declaration",
+        "deinit_declaration",
+        "subscript_declaration",
+    ],
     "php": ["function_definition", "method_declaration"],
     "scala": ["function_definition", "function_declaration"],
     # Solidity: events and modifiers use kind="Function" because the graph
@@ -14147,6 +14156,18 @@ class CodeParser:
             for child in node.children:
                 if child.type == "identifier":
                     return child.text.decode("utf-8", errors="replace")
+        # Swift init/deinit/subscript: the grammar gives none of them a usable
+        # name. `init_declaration`'s name field is the `init` keyword itself,
+        # `deinit_declaration` has no name field at all (so the generic loop
+        # returns None and the node is dropped), and `subscript_declaration`'s
+        # name field is the *return type* (`subscript(i: Int) -> String` would
+        # be named "String"). Name each after its Swift declaration keyword.
+        if language == "swift" and node.type in (
+            "init_declaration",
+            "deinit_declaration",
+            "subscript_declaration",
+        ):
+            return node.type.removesuffix("_declaration")
         # Swift extensions: name is inside user_type > type_identifier
         # (e.g. `extension MyClass: Protocol { ... }`)
         if language == "swift" and node.type == "class_declaration":

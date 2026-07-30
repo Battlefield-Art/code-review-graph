@@ -18,6 +18,15 @@
 
 ### Fixed
 
+- Swift initializers, deinitializers and subscripts now emit `Function` nodes
+  (#786). `init_declaration`, `deinit_declaration` and `subscript_declaration`
+  are node types distinct from `function_declaration`, so the walker skipped
+  them and attributed the calls in their bodies to the enclosing *File* node —
+  a change inside one initializer read as file-wide blast radius, and
+  `get_impact_radius` on a callee could not trace back to the initializer that
+  calls it. Each is named after its declaration keyword, since the grammar
+  gives none of the three a usable name field (`subscript`'s would be its
+  return type, `deinit`'s is absent).
 - GitHub Copilot auto-detection now requires the Copilot extension and also
   recognizes the extension bundled with released VS Code installations.
 - Added a post-index Python import resolver using unique module suffixes, so
