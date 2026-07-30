@@ -332,7 +332,19 @@ def test_graph_data_containing_script_sentinel_is_not_expanded(tmp_path, vis_mod
     for script in data_scripts:
         assert "<script" not in script
     # The parser must not see repo-derived markup as real elements.
-    assert "<img" not in re.sub(r"(?s)<script.*?</script>", "", content)
+    class _TagCollector(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=False)
+            self.tags: set[str] = set()
+
+        def handle_starttag(
+            self, tag: str, attrs: list[tuple[str, str | None]]
+        ) -> None:
+            self.tags.add(tag)
+
+    collector = _TagCollector()
+    collector.feed(content)
+    assert "img" not in collector.tags
 
 
 def test_script_extraction_handles_case_insensitive_html_tags():
