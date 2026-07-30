@@ -805,6 +805,118 @@ def test_auto_mode_switches_at_threshold(large_store, tmp_path):
     assert "community_details" in content2
 
 
+def test_auto_mode_switches_on_edge_count(large_store, tmp_path):
+    """Auto mode must switch to an aggregated view when edges exceed the cap.
+
+    Regression for issue #609: node count under the limit but edge count
+    over it must not fall through to the full force-layout template.
+    """
+    from code_review_graph.visualization import generate_html
+
+    # Under both limits -> full template
+    output_full = tmp_path / "auto_under_both.html"
+    generate_html(
+        large_store, output_full, mode="auto",
+        max_full_nodes=100000, max_full_edges=100000,
+    )
+    content_full = output_full.read_text()
+    assert "btn-community" in content_full
+    assert "flow-select" in content_full
+
+    # Under the node limit but over the edge limit -> aggregated template
+    output_agg = tmp_path / "auto_over_edges.html"
+    generate_html(
+        large_store, output_agg, mode="auto",
+        max_full_nodes=100000, max_full_edges=1,
+    )
+    content_agg = output_agg.read_text()
+    assert "btn-back" in content_agg
+    assert "community_details" in content_agg
+
+
+def test_auto_mode_decision_at_issue_609_boundary():
+    """The reported 2792-node/17488-edge graph must pick an aggregated view.
+
+    Regression for issue #609 using the exact reported boundary against the
+    shipped defaults, without building a 17k-edge store.
+    """
+    from code_review_graph.visualization import (
+        DEFAULT_MAX_FULL_EDGES,
+        DEFAULT_MAX_FULL_NODES,
+        _resolve_auto_mode,
+    )
+
+    # Shipped defaults: node cap unchanged, edge cap derived from it
+    assert DEFAULT_MAX_FULL_NODES == 3000
+    assert DEFAULT_MAX_FULL_EDGES == 3 * DEFAULT_MAX_FULL_NODES
+
+    # A graph under both caps stays in full mode
+    assert _resolve_auto_mode(
+        node_count=2792, edge_count=8000,
+        max_full_nodes=DEFAULT_MAX_FULL_NODES,
+        max_full_edges=DEFAULT_MAX_FULL_EDGES,
+        has_communities=True,
+    ) == "full"
+
+    # The exact graph from issue #609: 2792 nodes (under), 17488 edges (over)
+    assert _resolve_auto_mode(
+        node_count=2792, edge_count=17488,
+        max_full_nodes=DEFAULT_MAX_FULL_NODES,
+        max_full_edges=DEFAULT_MAX_FULL_EDGES,
+        has_communities=True,
+    ) == "community"
+
+    # Node count over the cap still switches (pre-existing behavior)
+    assert _resolve_auto_mode(
+        node_count=3001, edge_count=100,
+        max_full_nodes=DEFAULT_MAX_FULL_NODES,
+        max_full_edges=DEFAULT_MAX_FULL_EDGES,
+        has_communities=True,
+    ) == "community"
+
+    # Without community data the aggregated view falls back to file mode
+    assert _resolve_auto_mode(
+        node_count=2792, edge_count=17488,
+        max_full_nodes=DEFAULT_MAX_FULL_NODES,
+        max_full_edges=DEFAULT_MAX_FULL_EDGES,
+        has_communities=False,
+    ) == "file"
+
+
+def test_generate_html_defaults_match_constants():
+    """generate_html defaults must stay wired to the documented constants."""
+    import inspect
+
+    from code_review_graph.visualization import (
+        DEFAULT_MAX_FULL_EDGES,
+        DEFAULT_MAX_FULL_NODES,
+        generate_html,
+    )
+
+    sig = inspect.signature(generate_html)
+    assert sig.parameters["max_full_nodes"].default == DEFAULT_MAX_FULL_NODES
+    assert sig.parameters["max_full_edges"].default == DEFAULT_MAX_FULL_EDGES
+
+
+def test_auto_mode_falls_back_to_file_without_communities(
+    store_with_data, tmp_path
+):
+    """Auto-switch without community data must aggregate by file, not lump
+    everything into a single 'Uncategorized' community super-node."""
+    from code_review_graph.visualization import generate_html
+
+    output_path = tmp_path / "auto_no_communities.html"
+    generate_html(
+        store_with_data, output_path, mode="auto",
+        max_full_nodes=1, max_full_edges=100000,
+    )
+    content = output_path.read_text()
+    # Aggregated template, file mode data
+    assert "btn-back" in content
+    assert '"mode": "file"' in content
+    assert '"mode": "community"' not in content
+
+
 def test_community_mode_html_generation(large_store, tmp_path):
     """Community mode generates valid HTML with aggregated data."""
     from code_review_graph.visualization import generate_html

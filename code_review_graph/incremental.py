@@ -1317,7 +1317,13 @@ def incremental_update(
         _run_rescript_resolver(store) if rescript_changed else None
     )
 
-    spring_changed = any(rp.endswith(".java") for rp in all_files)
+    # Like python_changed above, include stale/missing paths so a deletion
+    # that only surfaces through reconciliation still clears derived state
+    # (e.g. virtual Spring Event nodes — issue #474).
+    spring_changed = any(
+        path.endswith(".java")
+        for path in set(all_files) | set(stale_files) | missing_paths
+    )
     spring_stats = _run_spring_resolver(store) if spring_changed else None
     spring_event_stats = (
         _run_spring_event_resolver(store) if spring_changed else None
@@ -1325,7 +1331,7 @@ def incremental_update(
     temporal_stats = _run_temporal_resolver(store) if spring_changed else None
     hcl_changed = any(rp.endswith((".tf", ".hcl")) for rp in all_files)
     hcl_stats = _run_hcl_resolver(store) if hcl_changed else None
-    scoped_changed = any(rp.endswith((".php", ".rs")) for rp in all_files)
+    scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
     scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
 
     return {
