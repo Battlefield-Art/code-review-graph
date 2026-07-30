@@ -1194,6 +1194,38 @@ class TestSwiftParsing:
         # extension InMemoryRepo: CustomStringConvertible
         assert "CustomStringConvertible" in targets
 
+    def test_finds_initializers(self):
+        """`init` / `convenience init` are Function nodes on their own type."""
+        inits = [
+            n for n in self.nodes
+            if n.kind == "Function" and n.name == "init" and n.parent_name == "InMemoryRepo"
+        ]
+        assert len(inits) == 2
+
+    def test_finds_deinitializer(self):
+        funcs = {(n.name, n.parent_name) for n in self.nodes if n.kind == "Function"}
+        assert ("deinit", "InMemoryRepo") in funcs
+
+    def test_finds_subscript(self):
+        """`subscript` is named after its keyword, not its return type."""
+        funcs = {(n.name, n.parent_name) for n in self.nodes if n.kind == "Function"}
+        assert ("subscript", "InMemoryRepo") in funcs
+        assert not any(n.name == "User" for n in self.nodes if n.kind == "Function")
+
+    def test_initializer_body_calls_attributed_to_declaration(self):
+        """Calls inside init/deinit/subscript belong to that declaration, not the file."""
+        calls = {
+            (e.source.rsplit("::", 1)[-1], e.target.rsplit("::", 1)[-1])
+            for e in self.edges if e.kind == "CALLS"
+        }
+        # init(seed:) calls save(user); convenience init() delegates to self.init
+        assert ("InMemoryRepo.init", "InMemoryRepo.save") in calls
+        assert ("InMemoryRepo.init", "InMemoryRepo.init") in calls
+        assert ("InMemoryRepo.deinit", "removeAll") in calls
+        assert ("InMemoryRepo.subscript", "InMemoryRepo.findById") in calls
+        # Previously these landed on the File node, making blast radius file-wide.
+        assert not any(src.endswith("sample.swift") for src, _ in calls)
+
 
 class TestScalaParsing:
     def setup_method(self):
