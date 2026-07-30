@@ -2450,7 +2450,7 @@ class CodeParser:
             self._parsers[language] = parser
         return self._parsers[language]
 
-    def detect_language(self, path: Path) -> Optional[str]:
+    def detect_language(self, path: Path, source: Optional[bytes] = None) -> Optional[str]:
         """Map a file path to its language name.
 
         Extension-based lookup is tried first.  For extension-less files
@@ -2459,6 +2459,12 @@ class CodeParser:
         already have a known extension are never re-read — shebang probing
         only runs when the extension lookup returns ``None`` **and** the path
         has no suffix at all.  See issue #237.
+
+        When *source* is provided, the shebang is sniffed from those bytes
+        instead of re-reading the file.  Callers that hash-and-parse one byte
+        snapshot MUST pass it: a separate disk read can race a concurrent
+        save, mis-detect the language, and store a wrong parse under the
+        snapshot's hash (issue #746).
         """
         if path.name.lower().endswith(".blade.php"):
             return "blade"
@@ -2476,12 +2482,20 @@ class CodeParser:
         # and other extension-less text files also fall here, but the probe is a
         # cheap 256-byte read that returns None when no shebang is found.
         if suffix == "":
-            return self._detect_language_from_shebang(path)
+            head = source[:_SHEBANG_PROBE_BYTES] if source is not None else None
+            return self._detect_language_from_shebang(path, head)
         return None
 
     @staticmethod
-    def _detect_language_from_shebang(path: Path) -> Optional[str]:
+    def _detect_language_from_shebang(
+        path: Path,
+        head: Optional[bytes] = None,
+    ) -> Optional[str]:
         """Inspect the first line of ``path`` for a shebang interpreter.
+
+        When *head* is given it is used as the first bytes of the file and
+        the file is not read from disk (TOCTOU-safe for callers that already
+        hold the byte snapshot being parsed, see issue #746).
 
         Returns the mapped language name or ``None`` if the file has no
         shebang, is unreadable, or names an interpreter we don't map.
@@ -2498,11 +2512,12 @@ class CodeParser:
         endings are handled.  Binary files read as garbage bytes simply
         fail the ``#!`` prefix check and return ``None``.
         """
-        try:
-            with path.open("rb") as fh:
-                head = fh.read(_SHEBANG_PROBE_BYTES)
-        except (OSError, PermissionError):
-            return None
+        if head is None:
+            try:
+                with path.open("rb") as fh:
+                    head = fh.read(_SHEBANG_PROBE_BYTES)
+            except (OSError, PermissionError):
+                return None
         if not head.startswith(b"#!"):
             return None
 
@@ -2554,9 +2569,12 @@ class CodeParser:
         """Parse pre-read bytes and return extracted nodes and edges.
 
         This avoids re-reading the file from disk, eliminating TOCTOU gaps
-        when the caller has already read the bytes (e.g. for hashing).
+        when the caller has already read the bytes (e.g. for hashing): every
+        parse decision, including shebang language detection, derives from
+        *source* so the stored file hash always describes the bytes that were
+        actually parsed (issue #746).
         """
-        language = self.detect_language(path)
+        language = self.detect_language(path, source)
         if not language:
             return [], []
 

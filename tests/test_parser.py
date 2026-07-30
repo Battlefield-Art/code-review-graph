@@ -160,6 +160,44 @@ class TestCodeParser:
         for n in nodes:
             assert n.language == "bash"
 
+    def test_parse_bytes_shebang_language_from_snapshot_not_disk(self, tmp_path):
+        """Regression for #746: ``parse_bytes`` must derive the language from
+        the byte snapshot it was given, not from a re-read of the file.
+
+        Simulates a save racing the indexer: an editor's truncate+rewrite save
+        has just emptied the extension-less script on disk while the indexer
+        parses its complete snapshot. If the shebang probe re-reads the disk it
+        sees an empty file, detects no language, and a complete snapshot parses
+        to zero nodes — stored under the snapshot's (final) file hash.
+        """
+        p = self._write_shebang_file(
+            tmp_path, "tool",
+            "#!/usr/bin/env python3\n\ndef damaged():\n    return 1\n",
+        )
+        snapshot = p.read_bytes()
+        p.write_bytes(b"")  # the racing save has truncated the file
+
+        nodes, _ = self.parser.parse_bytes(p, snapshot)
+
+        func_names = {n.name for n in nodes if n.kind == "Function"}
+        assert "damaged" in func_names
+        for n in nodes:
+            assert n.language == "python"
+
+    def test_detect_language_uses_provided_source_over_disk(self, tmp_path):
+        """With pre-read source bytes, shebang detection must not touch disk."""
+        p = tmp_path / "tool"
+        p.write_bytes(b"")  # on-disk content is mid-save (empty)
+        source = b"#!/usr/bin/env python3\nprint(1)\n"
+        assert self.parser.detect_language(p, source) == "python"
+
+    def test_detect_language_without_source_still_probes_disk(self, tmp_path):
+        """Path-only callers (file filters) keep the on-disk shebang probe."""
+        p = self._write_shebang_file(
+            tmp_path, "runner", "#!/usr/bin/env bash\necho hi\n",
+        )
+        assert self.parser.detect_language(p) == "bash"
+
     def test_parse_python_file(self):
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
 
