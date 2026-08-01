@@ -191,6 +191,8 @@ class TestGenerateSkills:
                 "get_flow_tool",
                 "find_large_functions_tool",
             ],
+            "review-changes": ["get_minimal_context_tool", "get_affected_flows_tool"],
+            "debug-issue": ["get_minimal_context_tool", "get_flow_tool"],
             "refactor-safely": ["get_minimal_context_tool", "find_large_functions_tool"],
         }
         legacy_tools = [
