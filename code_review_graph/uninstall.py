@@ -539,7 +539,7 @@ def _remove_yaml_entry(
     byte-for-byte; the parsed document is used only to locate the entry and to
     validate the result before writing.
     """
-    import yaml
+    import yaml  # type: ignore[import-untyped]
 
     if not path.exists() or not _safe_path(path, boundary, report):
         return
