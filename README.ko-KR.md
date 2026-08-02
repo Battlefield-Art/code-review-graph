@@ -42,7 +42,7 @@
 AI 코딩 도구는 리뷰 작업에서 코드베이스의 큰 부분을 반복해서 읽게 될 수 있습니다. `code-review-graph`는 이 문제를 해결합니다. [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)로 코드의 구조적 맵을 구축하고, 변경 사항을 점진적으로 추적하며, [MCP](https://modelcontextprotocol.io/)를 통해 AI 어시스턴트에게 정확한 컨텍스트를 제공하여 필요한 부분만 읽도록 합니다.
 
 <p align="center">
-  <img src="diagrams/diagram1_before_vs_after.png" alt="토큰 문제: flask 코퍼스 전체를 읽으면 125,022 토큰, 그래프 응답은 1,986 토큰 — 71.4배 적음" width="85%" />
+  <img src="diagrams/diagram1_before_vs_after.png" alt="토큰 문제: flask 코퍼스 전체를 읽으면 143,594 토큰, 그래프 응답은 2,196 토큰 — 71.0배 적음" width="85%" />
 </p>
 
 ---
@@ -112,10 +112,10 @@ Build the code review graph for this project
 
 ### 코드베이스 전체인가, 겨냥한 답변인가
 
-저장소가 클수록 토큰 낭비는 더 뼈아픕니다. 그래프는 코퍼스 전체를 모델에 넘기는 대신 답변에 필요한 부분만 돌려줍니다. 이 저장소에서는 208,821개의 소스 토큰이 질문당 약 2,495 토큰이 됩니다.
+저장소가 클수록 토큰 낭비는 더 뼈아픕니다. 그래프는 코퍼스 전체를 모델에 넘기는 대신 답변에 필요한 부분만 돌려줍니다. 이 저장소에서는 208,821개의 소스 토큰이 질문당 약 3,190 토큰이 됩니다.
 
 <p align="center">
-  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graph 저장소: 208,821개의 소스 토큰이 약 2,495 토큰의 그래프 응답으로 수렴 — 질문당 토큰 93배 감소" width="80%" />
+  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graph 저장소: 208,821개의 소스 토큰이 약 3,190 토큰의 그래프 응답으로 수렴 — 질문당 토큰 68배 감소" width="80%" />
 </p>
 
 ### 폭넓은 언어 지원 + Jupyter 노트북
@@ -131,7 +131,7 @@ Build the code review graph for this project
 ## 벤치마크
 
 <p align="center">
-  <img src="diagrams/diagram5_benchmark_board.png" alt="6개 실제 저장소 벤치마크: 질문당 토큰 감소 중앙값 약 82배(최대 528배), 그래프 기반 정답 데이터 대비 평균 F1 0.71" width="85%" />
+  <img src="diagrams/diagram5_benchmark_board.png" alt="6개 실제 저장소 벤치마크: 질문당 토큰 감소 중앙값 약 65배(최대 376배), 그래프 기반 정답 데이터 대비 평균 F1 0.71" width="85%" />
 </p>
 
 모든 수치는 6개 실제 오픈소스 저장소(총 13개 커밋)에 대한 자동화된 평가 실행 결과입니다. `code-review-graph eval --all`로 재현할 수 있습니다. 전체 재현 절차와 기준 수치는 [`docs/REPRODUCING.md`](docs/REPRODUCING.md)에 있습니다.

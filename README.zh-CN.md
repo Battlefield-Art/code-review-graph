@@ -42,7 +42,7 @@
 AI 编码工具在审查任务中可能会反复读取代码库的大量内容。`code-review-graph` 解决了这个问题。它使用 [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) 构建代码的结构化映射，增量跟踪变更，并通过 [MCP](https://modelcontextprotocol.io/) 为 AI 助手提供精准的上下文，使其只读取真正需要的内容。
 
 <p align="center">
-  <img src="diagrams/diagram1_before_vs_after.png" alt="Token 问题：读完 flask 的全部源码需要 125,022 个 token，而图给出的回答只需 1,986 个——减少 71.4 倍" width="85%" />
+  <img src="diagrams/diagram1_before_vs_after.png" alt="Token 问题：读完 flask 的全部源码需要 143,594 个 token，而图给出的回答只需 2,196 个——减少 71.0 倍" width="85%" />
 </p>
 
 ---
@@ -112,10 +112,10 @@ Build the code review graph for this project
 
 ### 整个代码库，还是有的放矢的回答？
 
-仓库越大，token 浪费越让人心疼。图不会把整个语料交给模型，而是只返回与回答相关的那一部分：在本仓库中，208,821 个源码 token 会缩减为每个问题约 2,495 个 token。
+仓库越大，token 浪费越让人心疼。图不会把整个语料交给模型，而是只返回与回答相关的那一部分：在本仓库中，208,821 个源码 token 会缩减为每个问题约 3,190 个 token。
 
 <p align="center">
-  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graph 仓库：208,821 个源码 token 收敛为约 2,495 token 的图响应——每个问题的 token 减少 93 倍" width="80%" />
+  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graph 仓库：208,821 个源码 token 收敛为约 3,190 token 的图响应——每个问题的 token 减少 68 倍" width="80%" />
 </p>
 
 ### 广泛语言覆盖 + Jupyter 笔记本
@@ -131,7 +131,7 @@ Build the code review graph for this project
 ## 基准测试
 
 <p align="center">
-  <img src="diagrams/diagram5_benchmark_board.png" alt="对 6 个真实仓库的基准测试：每个问题的 token 减少中位数约 82 倍（最高 528 倍），对图生成的基准答案平均 F1 为 0.71" width="85%" />
+  <img src="diagrams/diagram5_benchmark_board.png" alt="对 6 个真实仓库的基准测试：每个问题的 token 减少中位数约 65 倍（最高 376 倍），对图生成的基准答案平均 F1 为 0.71" width="85%" />
 </p>
 
 所有数据来自针对 6 个真实开源仓库（共 13 次提交）的自动化评估。可通过 `code-review-graph eval --all` 复现。完整基准测试数据请参阅[英文 README](README.md)。

@@ -49,7 +49,7 @@
 AI coding tools can end up re-reading large parts of your codebase on review tasks. `code-review-graph` fixes that. It builds a structural map of your code with [Tree-sitter](https://tree-sitter.github.io/tree-sitter/), tracks changes incrementally, and gives your AI assistant precise context via [MCP](https://modelcontextprotocol.io/) so it reads only what matters.
 
 <p align="center">
-  <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: reading flask's whole corpus costs 125,022 tokens, a graph answer costs 1,986 — 71.4x fewer" width="85%" />
+  <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: reading flask's whole corpus costs 143,594 tokens, a graph answer costs 2,196 — 71.0x fewer" width="85%" />
 </p>
 
 ---
@@ -135,9 +135,9 @@ When a file changes, the graph traces every caller, dependent, and test that cou
   <img src="diagrams/diagram3_blast_radius.png" alt="Blast radius visualization showing how a change to login() propagates to callers, dependents, and tests" width="70%" />
 </p>
 
-### Incremental updates in < 2 seconds
+### Incremental updates in seconds
 
-When hooks or watch mode are enabled, file saves and supported commit hooks trigger incremental updates. The graph diffs changed files, finds their dependents through the graph's own import and call edges, and re-parses only the files whose SHA-256 hash actually changed. A 2,900-file project re-indexes in under 2 seconds.
+When hooks or watch mode are enabled, file saves and supported commit hooks trigger incremental updates. The graph diffs changed files, finds their dependents through the graph's own import and call edges, and re-parses only the files whose SHA-256 hash actually changed. On a ~3,000-file project (django) a two-file edit re-indexes in about 2.5 seconds on the path the hooks use, of which ~1.4 s is process start-up; a no-op update costs only that start-up. See [Incremental update latency](docs/REPRODUCING.md#incremental-update-latency) for the full measurement.
 
 <p align="center">
   <img src="diagrams/diagram4_incremental_update.png" alt="Incremental update flow: a supported hook or watch update triggers a git diff, dependents are found through graph edges, and only files whose SHA-256 hash changed are re-parsed" width="90%" />
@@ -145,10 +145,10 @@ When hooks or watch mode are enabled, file saves and supported commit hooks trig
 
 ### Whole codebase or targeted answer?
 
-The bigger the repository, the more token waste hurts. Instead of feeding a whole corpus to the model, the graph returns an answer-shaped slice of it: on this repository, 208,821 source tokens become ~2,495 tokens per question.
+The bigger the repository, the more token waste hurts. Instead of feeding a whole corpus to the model, the graph returns an answer-shaped slice of it: on this repository, 208,821 source tokens become ~3,190 tokens per question.
 
 <p align="center">
-  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graph repo: 208,821 source tokens funnel down to ~2,495 token graph responses — 93x fewer tokens per question" width="80%" />
+  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graph repo: 208,821 source tokens funnel down to ~3,190 token graph responses — 68x fewer tokens per question" width="80%" />
 </p>
 
 ### Broad language coverage + Jupyter notebooks
@@ -210,31 +210,31 @@ See [docs/GITHUB_ACTION.md](docs/GITHUB_ACTION.md) for inputs, risk levels, and 
 ## Benchmarks
 
 <p align="center">
-  <img src="diagrams/diagram5_benchmark_board.png" alt="Benchmarks across 6 real repositories: ~82x median per-question token reduction (528x max), 0.71 average impact F1 against graph-derived ground truth" width="85%" />
+  <img src="diagrams/diagram5_benchmark_board.png" alt="Benchmarks across 6 real repositories: ~65x median per-question token reduction (376x max), 0.71 average impact F1 against graph-derived ground truth" width="85%" />
 </p>
 
-**Headline number: the median per-question token reduction across the 6 repos is ~82x** (whole-corpus baseline vs graph query). The frequently quoted **528x is the maximum** — a single best-case repo (fastapi) — not the typical result.
+**Headline number: the median per-question token reduction across the 6 repos is ~65x** (whole-corpus baseline vs graph query). The **376x maximum** is a single best-case repo (fastapi, the largest corpus) — not the typical result.
 
 All numbers come from the automated evaluation runner against 6 real open-source repositories (13 commits total). Every config pins an upstream SHA, the Leiden community detector runs with a fixed seed, and embeddings are deterministic on CPU — so two runs on different machines produce identical numbers. The full reproduction recipe with expected outputs is in [`docs/REPRODUCING.md`](docs/REPRODUCING.md). A weekly report-only run on the two smallest configs lives in [`.github/workflows/eval.yml`](.github/workflows/eval.yml).
 
 <details>
-<summary><strong>Token efficiency: ~82x median per-question reduction (range 38x – 528x; whole-corpus vs graph query)</strong></summary>
+<summary><strong>Token efficiency: ~65x median per-question reduction (range 36x – 376x; whole-corpus vs graph query)</strong></summary>
 <br>
 
 For a typical agent question (`"how does authentication work"`, `"what is the main entry point"`, etc.), the graph returns ~2,000–3,500 tokens of targeted search hits + neighbor edges instead of forcing the agent to read every source file. The table below averages over the 5 sample questions defined in `code_review_graph/token_benchmark.py`.
 
 | Repo | Snapshot SHA | naive_corpus_tokens | avg graph_tokens | Reduction |
 |------|---|-----------------:|----------------:|----------:|
-| fastapi | `0227991a` | 951,071 | 2,169 | **528.4x** |
-| code-review-graph | `84bde354` | 208,821 | 2,495 | **93.0x** |
-| gin | `5c00df8a` | 166,868 | 1,990 | **91.8x** |
-| flask | `a29f88ce` | 125,022 | 1,986 | **71.4x** |
-| express | `b4ab7d65` | 135,955 | 3,465 | **40.6x** |
-| httpx | `b55d4635` | 89,492 | 2,438 | **38.0x** |
+| fastapi | `22381558` | 948,793 | 2,653 | **375.6x** |
+| flask | `a29f88ce` | 143,594 | 2,196 | **71.0x** |
+| code-review-graph | `84bde354` | 208,821 | 3,190 | **68.1x** |
+| gin | `5c00df8a` | 166,868 | 2,766 | **61.9x** |
+| httpx | `b55d4635` | 142,356 | 2,661 | **60.6x** |
+| express | `b4ab7d65` | 136,052 | 3,936 | **36.0x** |
 
-Median per-question reduction across the 6 repos: **~82x**. The range is 38x – 528x, where **528x is the best case** (fastapi, the largest corpus), not the headline.
+Median per-question reduction across the 6 repos: **~65x**. The range is 36x – 376x, where **376x is the best case** (fastapi, the largest corpus), not the headline.
 
-> **Note on the fastapi row.** It was captured at snapshot `0227991a`, but `code_review_graph/eval/configs/fastapi.yaml` has since been re-pinned to `22381558` (and both of its impact-accuracy test commits were replaced). The measurement above is real for `0227991a`; it has not been re-captured at the new pin, so following the reproduction recipe today will not reproduce this row exactly. The other five rows still match their configs.
+> Re-captured 2026-08-02 from clean clones at the pinned SHAs (crg 2.3.7, local `all-MiniLM-L6-v2` embeddings). These numbers are lower than the 2026-05-25 capture they replace: the graph response grew as node embedding text became richer, so `avg graph_tokens` rose across every repo. fastapi is now measured at its current pin `22381558` rather than the retired `0227991a`.
 
 The whole-corpus baseline above is an upper bound no real agent pays: a competent agent greps for identifiers and reads only the best-matching files. The `agent_baseline` eval benchmark measures that realistic baseline — a pure-python grep over the corpus, top-3 files by match count, token-counted and compared to the graph query cost (`evaluate/results/<repo>_agent_baseline_*.csv`).
 
@@ -292,7 +292,7 @@ The benchmark also runs an honest **co-change mode**: the predictor is seeded wi
 
 | Feature | Details |
 |---------|---------|
-| **Incremental updates** | Re-parses only changed files. Subsequent updates complete in under 2 seconds. |
+| **Incremental updates** | Re-parses only the files whose hash changed. On a ~3,000-file repo a two-file edit takes ~2.5s on the hook path ([measured](docs/REPRODUCING.md#incremental-update-latency)). |
 | **Broad language + notebook support** | Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, VB.NET, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Terraform/OpenTofu structure (`.tf`; generic `.hcl` files are file-only), Ansible playbooks/roles/tasks, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks (.ipynb), and Perl XS (.xs) |
 | **Framework-aware PHP parsing** | Repository-bounded Composer PSR-4 imports, Blade template references, and evidence-gated Laravel Route-to-controller and Eloquent relationship edges |
 | **Blast-radius analysis** | Shows which functions, classes, and files are likely affected by a change |

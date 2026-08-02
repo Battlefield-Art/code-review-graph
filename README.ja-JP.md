@@ -42,7 +42,7 @@
 AIコーディングツールはレビュータスクでコードベースの大きな範囲を読み直しがちです。`code-review-graph` はその問題を解決します。[Tree-sitter](https://tree-sitter.github.io/tree-sitter/) でコードの構造マップを構築し、変更を差分で追跡し、[MCP](https://modelcontextprotocol.io/) を通じてAIアシスタントに必要最小限のコンテキストだけを提供します。
 
 <p align="center">
-  <img src="diagrams/diagram1_before_vs_after.png" alt="トークン問題：flaskのコーパス全体を読むと125,022トークン、グラフからの回答は1,986トークン — 71.4分の1" width="85%" />
+  <img src="diagrams/diagram1_before_vs_after.png" alt="トークン問題：flaskのコーパス全体を読むと143,594トークン、グラフからの回答は2,196トークン — 71.0分の1" width="85%" />
 </p>
 
 ---
@@ -112,10 +112,10 @@ Build the code review graph for this project
 
 ### コードベース全体か、狙いを定めた回答か
 
-リポジトリが大きいほどトークンの無駄は深刻になります。グラフはコーパス全体をモデルに渡すのではなく、回答に必要な部分だけを返します。このリポジトリでは208,821のソーストークンが、質問あたり約2,495トークンになります。
+リポジトリが大きいほどトークンの無駄は深刻になります。グラフはコーパス全体をモデルに渡すのではなく、回答に必要な部分だけを返します。このリポジトリでは208,821のソーストークンが、質問あたり約3,190トークンになります。
 
 <p align="center">
-  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graphリポジトリ：208,821のソーストークンが約2,495トークンのグラフ回答に収束 — 質問あたりのトークンは93分の1" width="80%" />
+  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graphリポジトリ：208,821のソーストークンが約3,190トークンのグラフ回答に収束 — 質問あたりのトークンは68分の1" width="80%" />
 </p>
 
 ### 幅広い言語対応 + Jupyterノートブック
@@ -131,7 +131,7 @@ Build the code review graph for this project
 ## ベンチマーク
 
 <p align="center">
-  <img src="diagrams/diagram5_benchmark_board.png" alt="6つの実リポジトリでのベンチマーク：質問あたりのトークン削減率は中央値で約82倍（最大528倍）、グラフ由来の正解データに対する平均F1は0.71" width="85%" />
+  <img src="diagrams/diagram5_benchmark_board.png" alt="6つの実リポジトリでのベンチマーク：質問あたりのトークン削減率は中央値で約65倍（最大376倍）、グラフ由来の正解データに対する平均F1は0.71" width="85%" />
 </p>
 
 すべての数値は6つの実際のオープンソースリポジトリ（合計13コミット）に対する自動評価ランナーの結果です。`code-review-graph eval --all` で再現可能です。完全な再現手順と正規の数値は [`docs/REPRODUCING.md`](docs/REPRODUCING.md) をご覧ください。
