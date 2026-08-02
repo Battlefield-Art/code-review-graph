@@ -210,7 +210,7 @@ See [docs/GITHUB_ACTION.md](docs/GITHUB_ACTION.md) for inputs, risk levels, and 
 ## Benchmarks
 
 <p align="center">
-  <img src="diagrams/diagram5_benchmark_board.png" alt="Benchmarks across 6 real repositories: ~65x median per-question token reduction (376x max), 0.71 average impact F1 against graph-derived ground truth" width="85%" />
+  <img src="diagrams/diagram5_benchmark_board.png" alt="Benchmarks across 6 real repositories: ~65x median per-question token reduction (376x max), 0.69 average impact F1 against graph-derived ground truth" width="85%" />
 </p>
 
 **Headline number: the median per-question token reduction across the 6 repos is ~65x** (whole-corpus baseline vs graph query). The **376x maximum** is a single best-case repo (fastapi, the largest corpus) — not the typical result.
@@ -245,22 +245,22 @@ Since v2.3.4, review and impact tools attach a compact `context_savings` estimat
 </details>
 
 <details>
-<summary><strong>Impact accuracy: 0.71 average F1 against graph-derived ground truth (recall 1.0 is a circular upper bound, not "100% recall")</strong></summary>
+<summary><strong>Impact accuracy: 0.69 average F1 against graph-derived ground truth (recall 1.0 is a circular upper bound, not "100% recall")</strong></summary>
 <br>
 
 Blast-radius analysis recovers every file in the ground truth on all 13 evaluation commits — **but read that as an upper bound, not as "100% recall"**: in this mode the ground truth (changed files + files with call/import edges into them) is derived from the same graph the predictor traverses, so it is circular by construction. The over-prediction visible in the precision column is a deliberate trade-off: better to flag too many files than miss a broken dependency.
 
 | Repo | Commits | Avg F1 | Avg Precision | Recall (graph-derived upper bound) |
 |------|--------:|-------:|--------------:|-------:|
-| httpx | 2 | 0.864 | 0.786 | 1.0 |
-| fastapi | 2 | 0.834 | 0.750 | 1.0 |
+| httpx | 2 | 0.863 | 0.785 | 1.0 |
 | code-review-graph | 2 | 0.734 | 0.584 | 1.0 |
+| fastapi | 2 | 0.697 | 0.539 | 1.0 |
 | express | 2 | 0.667 | 0.500 | 1.0 |
-| flask | 2 | 0.628 | 0.481 | 1.0 |
+| flask | 2 | 0.633 | 0.485 | 1.0 |
 | gin | 3 | 0.609 | 0.439 | 1.0 |
-| **Average** | **13** | **0.714** | **0.578** | **1.000** |
+| **Average** | **13** | **0.693** | **0.546** | **1.000** |
 
-The benchmark also runs an honest **co-change mode**: the predictor is seeded with a single changed file and graded against the *other* files the author actually touched in the same commit — independent-ish evidence from git history, not from the graph. Both modes appear side by side in the result CSVs (`ground_truth_mode` column). Co-change numbers will be added to the canonical stats once captured by the eval runner; we do not quote them before measuring.
+The benchmark also runs an honest **co-change mode**: the predictor is seeded with a single changed file and graded against the *other* files the author actually touched in the same commit — independent-ish evidence from git history, not from the graph. Both modes appear side by side in the result CSVs (`ground_truth_mode` column). As of the 2026-08-02 capture that mode returns `predicted_files = 0` on every graded commit, so it is not yet a usable measurement and no co-change number is quoted here — the harness needs fixing before the mode says anything about accuracy.
 
 </details>
 

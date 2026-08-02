@@ -238,14 +238,15 @@ a circular upper bound, not as "100% recall":
 | Metric (graph-derived mode — circular upper bound) | Value |
 |---|---|
 | Recall (mean across 13 commits) | **1.000** (upper bound on every commit) |
-| F1 (mean) | **0.714** |
+| F1 (mean) | **0.693** |
 | F1 (median) | 0.667 |
-| F1 (min / max) | 0.455 / 1.000 |
+| F1 (min / max) | 0.465 / 1.000 |
 
-Canonical co-change numbers will be added after the next full capture — we
-do not quote them before measuring. Single-file commits are recorded with
-`status=skipped` in co-change mode (there is nothing independent to grade
-against).
+Co-change mode was captured on 2026-08-02 and is **not yet usable**: every
+graded commit came back with `predicted_files = 0`, so the resulting F1 of
+0.000 measures a broken harness, not the predictor. No co-change number is
+quoted until that is fixed. Single-file commits are separately recorded with
+`status=skipped` (there is nothing independent to grade against).
 
 The blast-radius analysis over-predicts in some commits (precision ≈ 0.30 in the
 worst case, where 34 files are flagged for a 10-file change). That is
