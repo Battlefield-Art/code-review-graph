@@ -49,7 +49,7 @@
 AI coding tools can end up re-reading large parts of your codebase on review tasks. `code-review-graph` fixes that. It builds a structural map of your code with [Tree-sitter](https://tree-sitter.github.io/tree-sitter/), tracks changes incrementally, and gives your AI assistant precise context via [MCP](https://modelcontextprotocol.io/) so it reads only what matters.
 
 <p align="center">
-  <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: 38x to 528x token reduction across 6 real repositories" width="85%" />
+  <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: reading flask's whole corpus costs 125,022 tokens, a graph answer costs 1,986 — 71.4x fewer" width="85%" />
 </p>
 
 ---
@@ -65,7 +65,7 @@ code-review-graph build            # parse your codebase
 One command sets up everything. `install` detects which AI coding tools you have, writes the correct MCP configuration for each one, installs platform-native hooks/skills where supported, and injects graph-aware instructions into your platform rules. It auto-detects whether you installed via `uvx` or `pip`/`pipx` and generates the right config. Restart your editor/tool after installing.
 
 <p align="center">
-  <img src="diagrams/diagram8_supported_platforms.png" alt="One Install, Every Platform: auto-detects Codex, Claude Code, CodeBuddy Code, Cursor, Windsurf, Zed, Continue, OpenCode, Antigravity, Gemini CLI, Qwen, Qoder, Kiro, and GitHub Copilot" width="85%" />
+  <img src="diagrams/diagram8_supported_platforms.png" alt="One Install, Every Platform: auto-detects Codex, Claude Code, CodeBuddy Code, Cursor, Windsurf, Zed, Continue, OpenCode, Antigravity, Gemini CLI, Qwen, Qoder, Kiro, GitHub Copilot, and GitHub Copilot CLI" width="85%" />
 </p>
 
 To target a specific platform:
@@ -137,15 +137,15 @@ When a file changes, the graph traces every caller, dependent, and test that cou
 
 ### Incremental updates in < 2 seconds
 
-When hooks or watch mode are enabled, file saves and supported commit hooks trigger incremental updates. The graph diffs changed files, finds their dependents via SHA-256 hash checks, and re-parses only what changed. A 2,900-file project re-indexes in under 2 seconds.
+When hooks or watch mode are enabled, file saves and supported commit hooks trigger incremental updates. The graph diffs changed files, finds their dependents through the graph's own import and call edges, and re-parses only the files whose SHA-256 hash actually changed. A 2,900-file project re-indexes in under 2 seconds.
 
 <p align="center">
-  <img src="diagrams/diagram4_incremental_update.png" alt="Incremental update flow: supported hook or watch update triggers diff, finds dependents, re-parses only 5 files while 2,910 are skipped" width="90%" />
+  <img src="diagrams/diagram4_incremental_update.png" alt="Incremental update flow: a supported hook or watch update triggers a git diff, dependents are found through graph edges, and only files whose SHA-256 hash changed are re-parsed" width="90%" />
 </p>
 
-### The monorepo problem, solved
+### Whole codebase or targeted answer?
 
-Large monorepos are where token waste is most painful. The graph cuts through the noise — 27,700+ files excluded from review context, only ~15 files actually read.
+The bigger the repository, the more token waste hurts. Instead of feeding a whole corpus to the model, the graph returns an answer-shaped slice of it: on this repository, 208,821 source tokens become ~2,495 tokens per question.
 
 <p align="center">
   <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graph repo: 208,821 source tokens funnel down to ~2,495 token graph responses — 93x fewer tokens per question" width="80%" />
@@ -154,7 +154,7 @@ Large monorepos are where token waste is most painful. The graph cuts through th
 ### Broad language coverage + Jupyter notebooks
 
 <p align="center">
-  <img src="diagrams/diagram9_language_coverage.png" alt="Language coverage organized by category: Web, Backend, Systems, Mobile, Scripting, Config, plus Jupyter and Databricks notebook support" width="90%" />
+  <img src="diagrams/diagram9_language_coverage.png" alt="Language coverage organized by category: Web, Backend, Systems, Mobile, Scripting, Shells, Domain, and Other, plus Jupyter and Databricks notebook support" width="90%" />
 </p>
 
 Parser support covers functions, classes, imports, call sites, inheritance, and test detection across the current parser surface, using Tree-sitter where available and targeted fallbacks where needed. Current support includes Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, VB.NET, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Terraform/OpenTofu structure (`.tf`; generic `.hcl` files are recognized as file nodes), Ansible playbooks/roles/tasks, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks (`.ipynb`), and Perl XS files (`.xs`). Generic YAML is not treated as source code.
@@ -233,6 +233,8 @@ For a typical agent question (`"how does authentication work"`, `"what is the ma
 | httpx | `b55d4635` | 89,492 | 2,438 | **38.0x** |
 
 Median per-question reduction across the 6 repos: **~82x**. The range is 38x – 528x, where **528x is the best case** (fastapi, the largest corpus), not the headline.
+
+> **Note on the fastapi row.** It was captured at snapshot `0227991a`, but `code_review_graph/eval/configs/fastapi.yaml` has since been re-pinned to `22381558` (and both of its impact-accuracy test commits were replaced). The measurement above is real for `0227991a`; it has not been re-captured at the new pin, so following the reproduction recipe today will not reproduce this row exactly. The other five rows still match their configs.
 
 The whole-corpus baseline above is an upper bound no real agent pays: a competent agent greps for identifiers and reads only the best-matching files. The `agent_baseline` eval benchmark measures that realistic baseline — a pure-python grep over the corpus, top-3 files by match count, token-counted and compared to the graph query cost (`evaluate/results/<repo>_agent_baseline_*.csv`).
 

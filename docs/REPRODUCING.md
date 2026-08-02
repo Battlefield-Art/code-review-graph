@@ -199,6 +199,14 @@ Each row is the average of 5 sample questions (`how does authentication work`,
 | express | `b4ab7d65` | 135,955 | 3,465 | **40.6×** |
 | httpx | `b55d4635` | 89,492 | 2,438 | **38.0×** |
 
+> **The fastapi row is stale relative to its config.** `code_review_graph/eval/configs/fastapi.yaml`
+> was re-pinned from `0227991a` to `22381558` (and both `test_commits` were replaced) after this
+> capture. The row above is a real measurement at `0227991a`, but it has not been re-captured at the
+> new pin, so Step 2 below will clone a different snapshot and you will *not* reproduce it exactly —
+> that is known drift, not the bug the "identical numbers" promise refers to. The other five repos
+> still match their configs. The same caveat applies to two of the thirteen commits behind the
+> impact-accuracy table, which came from the two replaced fastapi test commits.
+
 Range across 6 repos: **38× – 528×**. The numbers shifted down from a
 previous capture because (a) the test repos are now wiped/re-cloned from
 scratch — no leftover build artifacts or local caches inflate the naive
