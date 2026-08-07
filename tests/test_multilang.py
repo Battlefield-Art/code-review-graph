@@ -82,6 +82,16 @@ class TestGoParsing:
         assert find_by_id_contains[0][0].endswith("::InMemoryRepo")
         assert save_contains[0][0].endswith("::InMemoryRepo")
 
+    def test_receiver_call_resolves_to_receiver_method(self):
+        calls = [
+            edge for edge in self.edges
+            if edge.kind == "CALLS"
+            and edge.source.endswith("::InMemoryRepo.SaveAndReturn")
+        ]
+        assert len(calls) == 1
+        assert calls[0].target.endswith("::InMemoryRepo.Save")
+        assert calls[0].extra["receiver"] == "r"
+
 
 class TestRustParsing:
     def setup_method(self):

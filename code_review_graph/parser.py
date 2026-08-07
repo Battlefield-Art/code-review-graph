@@ -4668,6 +4668,7 @@ class CodeParser:
             )
 
         is_cpp = any(node.language == "cpp" for node in nodes)
+        is_go = any(node.language == "go" for node in nodes)
 
         def cpp_resolution_extra(
             extra: dict,
@@ -4702,6 +4703,12 @@ class CodeParser:
                     callable_symbols[bare].append(entry)
                 source_scopes[qualified] = node.parent_name
 
+        go_receivers = {
+            self._node_qualified(node): node.extra["go_receiver"]
+            for node in nodes
+            if node.language == "go" and "go_receiver" in node.extra
+        }
+
         def candidate_entries(
             target: str,
             edge_kind: str,
@@ -4721,6 +4728,29 @@ class CodeParser:
                 continue
             receiver = edge.extra.get("receiver")
             has_receiver = bool(receiver)
+            if (
+                is_go
+                and edge.kind == "CALLS"
+                and receiver == go_receivers.get(edge.source)
+            ):
+                candidates = [
+                    qualified
+                    for qualified, parent_scope in candidate_entries(
+                        edge.target, edge.kind,
+                    )
+                    if parent_scope == source_scopes.get(edge.source)
+                ]
+                if len(candidates) == 1:
+                    edge = EdgeInfo(
+                        kind=edge.kind,
+                        source=edge.source,
+                        target=candidates[0],
+                        file_path=edge.file_path,
+                        line=edge.line,
+                        extra=edge.extra,
+                    )
+                    resolved.append(edge)
+                    continue
             if edge.kind in ("CALLS", "REFERENCES") and "::" not in edge.target:
                 # JS/TS calls retain their full member expression as evidence
                 # (``app.handle``) while keeping the method name (``handle``)
@@ -10400,6 +10430,10 @@ class CodeParser:
 
         # Java: detect Temporal method-level annotations and Kafka listeners
         method_extra: dict = {}
+        if language == "go" and child.type == "method_declaration":
+            receiver_name = self._get_go_receiver_name(child)
+            if receiver_name:
+                method_extra["go_receiver"] = receiver_name
         if julia_qualifier:
             method_extra["julia_module_qualifier"] = julia_qualifier
         if language == "java" and deco_list:
@@ -10726,7 +10760,7 @@ class CodeParser:
                     call_extra["member_call"] = member_call
             if (
                 language in self._TYPED_CALL_LANGUAGES
-                or language in ("cpp", "rust")
+                or language in ("cpp", "go", "rust")
             ):
                 receiver, method_name = self._get_member_call_receiver_method(
                     child, language,
@@ -10868,6 +10902,19 @@ class CodeParser:
             if callee is None or callee.type != "field_expression":
                 return None, None
             receiver = callee.child_by_field_name("value")
+            method = callee.child_by_field_name("field")
+            if receiver is None or method is None:
+                return None, None
+            return (
+                receiver.text.decode("utf-8", errors="replace"),
+                method.text.decode("utf-8", errors="replace"),
+            )
+
+        if language == "go" and node.type == "call_expression":
+            callee = node.child_by_field_name("function")
+            if callee is None or callee.type != "selector_expression":
+                return None, None
+            receiver = callee.child_by_field_name("operand")
             method = callee.child_by_field_name("field")
             if receiver is None or method is None:
                 return None, None
@@ -14722,6 +14769,24 @@ class CodeParser:
             # First parameter_list is always the receiver; stop searching.
             return None
         return None
+
+    @staticmethod
+    def _get_go_receiver_name(node) -> Optional[str]:
+        """Return the variable name from a Go method receiver."""
+        receiver = node.child_by_field_name("receiver")
+        if receiver is None:
+            return None
+        parameter = next(
+            (child for child in receiver.children if child.type == "parameter_declaration"),
+            None,
+        )
+        if parameter is None:
+            return None
+        name = next(
+            (child for child in parameter.children if child.type == "identifier"),
+            None,
+        )
+        return name.text.decode("utf-8", errors="replace") if name else None
 
     @staticmethod
     def _cpp_scope_join(

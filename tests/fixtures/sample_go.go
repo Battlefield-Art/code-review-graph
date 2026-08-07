@@ -38,6 +38,10 @@ func (r *InMemoryRepo) Save(user *User) error {
 	return nil
 }
 
+func (r *InMemoryRepo) SaveAndReturn(user *User) error {
+	return r.Save(user)
+}
+
 func CreateUser(repo UserRepository, name string, email string) (*User, error) {
 	user := &User{ID: 1, Name: name, Email: email}
 	err := repo.Save(user)
