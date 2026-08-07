@@ -14807,11 +14807,19 @@ class CodeParser:
                 "func_literal", "function_declaration", "method_declaration",
             } and CodeParser._go_function_binds_name(scope, receiver_name):
                 return True
-            if (
-                scope.type == "block"
-                and CodeParser._go_block_binds_name(scope, node, receiver_name)
-            ):
-                return True
+            if scope.type in {
+                "block", "expression_case", "type_case", "communication_case",
+            }:
+                method = scope.parent if scope.type == "block" else None
+                if CodeParser._go_statement_scope_binds_name(
+                    scope,
+                    node,
+                    receiver_name,
+                    method is not None
+                    and method.type == "method_declaration"
+                    and CodeParser._get_go_receiver_name(method) == receiver_name,
+                ):
+                    return True
             if scope.type in {"if_statement", "expression_switch_statement"}:
                 initializer = next(
                     (
@@ -14833,44 +14841,45 @@ class CodeParser:
                     (child for child in scope.children if child.type == "block"),
                     None,
                 )
-                if body in path:
-                    range_clause = next(
+                range_clause = next(
+                    (
+                        child for child in scope.children
+                        if child.type == "range_clause"
+                    ),
+                    None,
+                )
+                for_clause = next(
+                    (
+                        child for child in scope.children
+                        if child.type == "for_clause"
+                    ),
+                    None,
+                )
+                initializer = (
+                    next(
                         (
-                            child for child in scope.children
-                            if child.type == "range_clause"
+                            child for child in for_clause.children
+                            if child.type == "short_var_declaration"
                         ),
                         None,
                     )
-                    for_clause = next(
-                        (
-                            child for child in scope.children
-                            if child.type == "for_clause"
-                        ),
-                        None,
+                    if for_clause is not None
+                    else None
+                )
+                if (
+                    range_clause is not None
+                    and body in path
+                    and CodeParser._go_binding_binds_name(
+                        range_clause, receiver_name,
                     )
-                    initializer = (
-                        next(
-                            (
-                                child for child in for_clause.children
-                                if child.type == "short_var_declaration"
-                            ),
-                            None,
-                        )
-                        if for_clause is not None
-                        else None
+                ) or (
+                    initializer is not None
+                    and initializer.end_byte <= node.start_byte
+                    and CodeParser._go_binding_binds_name(
+                        initializer, receiver_name,
                     )
-                    if (
-                        (range_clause is not None and CodeParser._go_binding_binds_name(
-                            range_clause, receiver_name,
-                        ))
-                        or (
-                            initializer is not None
-                            and CodeParser._go_binding_binds_name(
-                                initializer, receiver_name,
-                            )
-                        )
-                    ):
-                        return True
+                ):
+                    return True
             if (
                 scope.type == "type_switch_statement"
                 and any(part.type == "type_case" for part in path)
@@ -14896,10 +14905,15 @@ class CodeParser:
         )
 
     @staticmethod
-    def _go_block_binds_name(block, node, receiver_name: str) -> bool:
-        """Return whether an earlier declaration in ``block`` binds the name."""
+    def _go_statement_scope_binds_name(
+        scope,
+        node,
+        receiver_name: str,
+        receiver_already_declared: bool,
+    ) -> bool:
+        """Return whether an earlier declaration in ``scope`` binds the name."""
         statements = next(
-            (child for child in block.children if child.type == "statement_list"),
+            (child for child in scope.children if child.type == "statement_list"),
             None,
         )
         if statements is None:
@@ -14916,17 +14930,25 @@ class CodeParser:
             elif (
                 statement.type == "short_var_declaration"
                 and statement.end_byte <= node.start_byte
-                and CodeParser._go_binding_binds_name(statement, receiver_name)
+                and CodeParser._go_binding_binds_name(
+                    statement, receiver_name, receiver_already_declared,
+                )
             ):
                 return True
         return False
 
     @staticmethod
-    def _go_binding_binds_name(node, receiver_name: str) -> bool:
+    def _go_binding_binds_name(
+        node,
+        receiver_name: str,
+        receiver_already_declared: bool = False,
+    ) -> bool:
         """Return whether a Go declaration's left side binds ``receiver_name``."""
         if node.type == "var_spec":
             candidates = node.children
         else:
+            if receiver_already_declared:
+                return False
             try:
                 assignment = next(
                     index for index, child in enumerate(node.children)

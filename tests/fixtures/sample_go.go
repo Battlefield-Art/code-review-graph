@@ -45,8 +45,8 @@ func (r *InMemoryRepo) SaveAndReturn(user *User) error {
 type ShadowA struct{}
 type ShadowB struct{}
 
-func (a *ShadowA) Save() {}
-func (b *ShadowB) Save() {}
+func (a *ShadowA) Save() bool { return true }
+func (b *ShadowB) Save() bool { return true }
 
 func (a *ShadowA) CallsShadowedReceiver() {
 	func(a *ShadowB) { a.Save() }(&ShadowB{})
@@ -70,10 +70,34 @@ func (a *ShadowA) CallsRangeShadowedReceiver() {
 	}
 }
 
+func (a *ShadowA) CallsForClauseShadowedReceiver() {
+	for a := &ShadowB{}; a.Save(); a.Save() {
+		a.Save()
+		break
+	}
+}
+
 func (a *ShadowA) CallsTypeSwitchShadowedReceiver(value any) {
 	switch a := value.(type) {
 	case *ShadowB:
 		a.Save()
+	}
+}
+
+func (a *ShadowA) CallsExpressionCaseShadowedReceiver() {
+	switch 1 {
+	case 1:
+		var a *ShadowB
+		a.Save()
+	}
+}
+
+func (a *ShadowA) CallsSelectCaseShadowedReceiver(ch <-chan struct{}) {
+	select {
+	case <-ch:
+		var a *ShadowB
+		a.Save()
+	default:
 	}
 }
 
@@ -99,6 +123,12 @@ func (a *ShadowA) CallsInitializerScope() {
 	}(); a != nil {
 		a.Save()
 	}
+}
+
+func (a *ShadowA) CallsSameScopeRedeclaration() {
+	a, n := a, 1
+	_ = n
+	a.Save()
 }
 
 func CreateUser(repo UserRepository, name string, email string) (*User, error) {

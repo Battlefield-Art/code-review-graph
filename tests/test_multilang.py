@@ -95,26 +95,31 @@ class TestGoParsing:
         assert calls[0].extra["receiver"] == "r"
 
     @pytest.mark.parametrize(
-        "method_name",
+        ("method_name", "call_count"),
         [
-            "CallsShadowedReceiver",
-            "CallsBlockShadowedReceiver",
-            "CallsVarShadowedReceiver",
-            "CallsRangeShadowedReceiver",
-            "CallsTypeSwitchShadowedReceiver",
-            "CallsNamedResultShadowedReceiver",
+            ("CallsShadowedReceiver", 1),
+            ("CallsBlockShadowedReceiver", 1),
+            ("CallsVarShadowedReceiver", 1),
+            ("CallsRangeShadowedReceiver", 1),
+            ("CallsForClauseShadowedReceiver", 3),
+            ("CallsTypeSwitchShadowedReceiver", 1),
+            ("CallsExpressionCaseShadowedReceiver", 1),
+            ("CallsSelectCaseShadowedReceiver", 1),
+            ("CallsNamedResultShadowedReceiver", 1),
         ],
     )
-    def test_shadowed_receiver_call_stays_unresolved(self, method_name):
+    def test_shadowed_receiver_call_stays_unresolved(
+        self, method_name, call_count,
+    ):
         calls = [
             edge for edge in self.edges
             if edge.kind == "CALLS"
             and edge.source.endswith(f"::ShadowA.{method_name}")
-            and edge.target == "Save"
+            and edge.extra.get("receiver") == "a"
         ]
-        assert len(calls) == 1
-        assert calls[0].extra["receiver"] == "a"
-        assert "go_method_receiver" not in calls[0].extra
+        assert len(calls) == call_count
+        assert all(edge.target == "Save" for edge in calls)
+        assert all("go_method_receiver" not in edge.extra for edge in calls)
 
     def test_receiver_call_resolves_after_shadowing_scope(self):
         calls = [
@@ -137,6 +142,17 @@ class TestGoParsing:
         assert [edge.target.endswith("::ShadowA.Save") for edge in calls] == [
             True, False,
         ]
+
+    def test_same_scope_redeclaration_keeps_receiver_resolution(self):
+        calls = [
+            edge for edge in self.edges
+            if edge.kind == "CALLS"
+            and edge.source.endswith("::ShadowA.CallsSameScopeRedeclaration")
+            and edge.extra.get("receiver") == "a"
+        ]
+        assert len(calls) == 1
+        assert calls[0].target.endswith("::ShadowA.Save")
+        assert calls[0].extra["go_method_receiver"] is True
 
     def test_deep_receiver_scope_walk_does_not_overflow(self):
         source = (
