@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import threading
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path, PurePath
@@ -6256,6 +6257,9 @@ class CodeParser:
         import_map: Optional[dict[str, str]] = None,
         defined_names: Optional[set[str]] = None,
         _depth: int = 0,
+        _go_receiver_bindings: Optional[
+            tuple[str, tuple[int, ...], tuple[int, ...]]
+        ] = None,
     ) -> None:
         """Recursively walk the AST and extract nodes/edges."""
         if _depth > self._MAX_AST_DEPTH:
@@ -6476,7 +6480,7 @@ class CodeParser:
                 if self._extract_calls(
                     child, source, language, file_path, nodes, edges,
                     enclosing_class, enclosing_func,
-                    import_map, defined_names, _depth,
+                    import_map, defined_names, _depth, _go_receiver_bindings,
                 ):
                     continue
 
@@ -6520,6 +6524,7 @@ class CodeParser:
                 enclosing_func=enclosing_func,
                 import_map=import_map, defined_names=defined_names,
                 _depth=_depth + 1,
+                _go_receiver_bindings=_go_receiver_bindings,
             )
 
     def _elixir_call_identifier(self, node) -> Optional[str]:
@@ -10431,10 +10436,14 @@ class CodeParser:
 
         # Java: detect Temporal method-level annotations and Kafka listeners
         method_extra: dict = {}
+        go_receiver_bindings = None
         if language == "go" and child.type == "method_declaration":
             receiver_name = self._get_go_receiver_name(child)
             if receiver_name:
                 method_extra["go_receiver"] = receiver_name
+                go_receiver_bindings = self._go_receiver_binding_index(
+                    child, receiver_name,
+                )
         if julia_qualifier:
             method_extra["julia_module_qualifier"] = julia_qualifier
         if language == "java" and deco_list:
@@ -10593,6 +10602,7 @@ class CodeParser:
             enclosing_class=recursive_class, enclosing_func=identity_name,
             import_map=import_map, defined_names=defined_names,
             _depth=_depth + 1,
+            _go_receiver_bindings=go_receiver_bindings,
         )
         return True
 
@@ -10639,6 +10649,9 @@ class CodeParser:
         import_map: Optional[dict[str, str]],
         defined_names: Optional[set[str]],
         _depth: int,
+        _go_receiver_bindings: Optional[
+            tuple[str, tuple[int, ...], tuple[int, ...]]
+        ] = None,
     ) -> bool:
         """Extract call expressions, including test runner special cases.
 
@@ -10770,8 +10783,13 @@ class CodeParser:
                     call_name = method_name
                 if receiver:
                     call_extra["receiver"] = receiver
-                    if language == "go" and not self._go_receiver_is_shadowed(
-                        child, receiver,
+                    if (
+                        language == "go"
+                        and _go_receiver_bindings is not None
+                        and receiver == _go_receiver_bindings[0]
+                        and not self._go_receiver_is_shadowed(
+                            child, _go_receiver_bindings,
+                        )
                     ):
                         call_extra["go_method_receiver"] = True
                 if language == "java" and child.type == "method_reference":
@@ -14793,178 +14811,168 @@ class CodeParser:
         )
         return name.text.decode("utf-8", errors="replace") if name else None
 
-    @staticmethod
-    def _go_receiver_is_shadowed(node, receiver_name: str) -> bool:
-        """Return whether a lexical Go binding shadows a method receiver."""
-        path = []
-        cursor = node.parent
-        while cursor is not None:
-            path.append(cursor)
-            cursor = cursor.parent
+    _GO_LEXICAL_SCOPE_TYPES = frozenset({
+        "block", "communication_case", "default_case", "expression_case", "type_case",
+    })
+    _GO_DECLARATION_NAME_FIELDS = {
+        "const_spec": "name",
+        "type_alias": "name",
+        "type_spec": "name",
+        "var_spec": "name",
+    }
+    _GO_INIT_SCOPE_PARENTS = frozenset({
+        "expression_switch_statement", "if_statement", "type_switch_statement",
+    })
+    _GO_PARAMETER_TYPES = frozenset({
+        "parameter_declaration", "variadic_parameter_declaration",
+    })
 
-        for scope in path:
-            if scope.type in {
-                "func_literal", "function_declaration", "method_declaration",
-            } and CodeParser._go_function_binds_name(scope, receiver_name):
+    @staticmethod
+    def _go_field_binds_name(node, field: str, name: str) -> bool:
+        """Return whether a grammar field declares ``name``."""
+        for field_node in node.children_by_field_name(field):
+            candidates = (
+                field_node.named_children
+                if field_node.type == "expression_list"
+                else (field_node,)
+            )
+            if any(
+                candidate.type in {"identifier", "type_identifier"}
+                and candidate.text.decode("utf-8", errors="replace") == name
+                for candidate in candidates
+            ):
                 return True
-            if scope.type in {
-                "block", "expression_case", "type_case", "communication_case",
-            }:
-                method = scope.parent if scope.type == "block" else None
-                if CodeParser._go_statement_scope_binds_name(
-                    scope,
-                    node,
-                    receiver_name,
-                    method is not None
-                    and method.type == "method_declaration"
-                    and CodeParser._get_go_receiver_name(method) == receiver_name,
+        return False
+
+    @classmethod
+    def _go_function_parameters_bind_name(cls, node, name: str) -> bool:
+        """Return whether a function's parameters or named results bind ``name``."""
+        for field_name in ("parameters", "result"):
+            for parameter_list in node.children_by_field_name(field_name):
+                if any(
+                    parameter.type in cls._GO_PARAMETER_TYPES
+                    and cls._go_field_binds_name(parameter, "name", name)
+                    for parameter in parameter_list.named_children
                 ):
                     return True
-            if scope.type in {"if_statement", "expression_switch_statement"}:
-                initializer = next(
-                    (
-                        child for child in scope.children
-                        if child.type == "short_var_declaration"
-                    ),
-                    None,
-                )
+        return False
+
+    def _go_receiver_binding_index(
+        self, method, receiver_name: str,
+    ) -> tuple[str, tuple[int, ...], tuple[int, ...]]:
+        """Build merged lexical-shadow intervals for one Go method."""
+        body = method.child_by_field_name("body")
+        if body is None:
+            return receiver_name, (), ()
+
+        def scope_key(scope) -> tuple[str, int, int]:
+            return scope.type, scope.start_byte, scope.end_byte
+
+        intervals: list[tuple[int, int]] = []
+        receiver_scopes = {scope_key(body)}
+        stack = [(body, body)]
+        while stack:
+            node, scope = stack.pop()
+            if node.type in self._GO_LEXICAL_SCOPE_TYPES:
+                scope = node
+
+            if node.type == "func_literal":
+                function_body = node.child_by_field_name("body")
                 if (
-                    initializer is not None
-                    and initializer.end_byte <= node.start_byte
-                    and CodeParser._go_binding_binds_name(
-                        initializer, receiver_name,
-                    )
+                    function_body is not None
+                    and self._go_function_parameters_bind_name(node, receiver_name)
                 ):
-                    return True
-            if scope.type == "for_statement":
-                body = next(
-                    (child for child in scope.children if child.type == "block"),
-                    None,
-                )
-                range_clause = next(
-                    (
-                        child for child in scope.children
-                        if child.type == "range_clause"
-                    ),
-                    None,
-                )
-                for_clause = next(
-                    (
-                        child for child in scope.children
-                        if child.type == "for_clause"
-                    ),
-                    None,
-                )
-                initializer = (
-                    next(
+                    intervals.append((function_body.start_byte, function_body.end_byte))
+                    receiver_scopes.add(scope_key(function_body))
+
+            if (
+                node.type == "type_switch_statement"
+                and self._go_field_binds_name(node, "alias", receiver_name)
+            ):
+                for case in node.named_children:
+                    if case.type not in {"default_case", "type_case"}:
+                        continue
+                    statements = next(
                         (
-                            child for child in for_clause.children
-                            if child.type == "short_var_declaration"
+                            child for child in case.named_children
+                            if child.type == "statement_list"
                         ),
                         None,
                     )
-                    if for_clause is not None
-                    else None
-                )
-                if (
-                    range_clause is not None
-                    and body in path
-                    and CodeParser._go_binding_binds_name(
-                        range_clause, receiver_name,
-                    )
-                ) or (
-                    initializer is not None
-                    and initializer.end_byte <= node.start_byte
-                    and CodeParser._go_binding_binds_name(
-                        initializer, receiver_name,
-                    )
-                ):
-                    return True
+                    if statements is not None:
+                        intervals.append((statements.start_byte, case.end_byte))
+                    receiver_scopes.add(scope_key(case))
+
+            declaration_field = self._GO_DECLARATION_NAME_FIELDS.get(node.type)
             if (
-                scope.type == "type_switch_statement"
-                and any(part.type == "type_case" for part in path)
-                and CodeParser._go_binding_binds_name(scope, receiver_name)
+                declaration_field is not None
+                and self._go_field_binds_name(node, declaration_field, receiver_name)
             ):
-                return True
-        return False
+                intervals.append((node.end_byte, scope.end_byte))
+                receiver_scopes.add(scope_key(scope))
 
-    @staticmethod
-    def _go_function_binds_name(node, receiver_name: str) -> bool:
-        """Return whether a Go function scope binds ``receiver_name``."""
-        parameters = [
-            child for child in node.children if child.type == "parameter_list"
-        ]
-        if node.type == "method_declaration":
-            parameters = parameters[1:]
-        return any(
-            child.type == "identifier"
-            and child.text.decode("utf-8", errors="replace") == receiver_name
-            for parameter_list in parameters
-            for parameter in parameter_list.children
-            for child in parameter.children
-        )
-
-    @staticmethod
-    def _go_statement_scope_binds_name(
-        scope,
-        node,
-        receiver_name: str,
-        receiver_already_declared: bool,
-    ) -> bool:
-        """Return whether an earlier declaration in ``scope`` binds the name."""
-        statements = next(
-            (child for child in scope.children if child.type == "statement_list"),
-            None,
-        )
-        if statements is None:
-            return False
-        for statement in statements.children:
-            if statement.type == "var_declaration":
-                for spec in statement.children:
-                    if (
-                        spec.type == "var_spec"
-                        and spec.end_byte <= node.start_byte
-                        and CodeParser._go_binding_binds_name(spec, receiver_name)
-                    ):
-                        return True
-            elif (
-                statement.type == "short_var_declaration"
-                and statement.end_byte <= node.start_byte
-                and CodeParser._go_binding_binds_name(
-                    statement, receiver_name, receiver_already_declared,
-                )
+            if (
+                node.type == "short_var_declaration"
+                and self._go_field_binds_name(node, "left", receiver_name)
             ):
-                return True
-        return False
+                parent = node.parent
+                if parent is not None and parent.type == "for_clause":
+                    binding_scope = parent.parent
+                elif parent is not None and parent.type in self._GO_INIT_SCOPE_PARENTS:
+                    binding_scope = parent
+                else:
+                    binding_scope = scope
+                if (
+                    binding_scope is not None
+                    and scope_key(binding_scope) not in receiver_scopes
+                ):
+                    intervals.append((node.end_byte, binding_scope.end_byte))
+                    receiver_scopes.add(scope_key(binding_scope))
+
+            if (
+                node.type == "range_clause"
+                and any(child.type == ":=" for child in node.children)
+                and self._go_field_binds_name(node, "left", receiver_name)
+            ):
+                loop = node.parent
+                loop_body = loop.child_by_field_name("body") if loop is not None else None
+                if loop_body is not None:
+                    intervals.append((loop_body.start_byte, loop_body.end_byte))
+                    receiver_scopes.add(scope_key(loop_body))
+
+            if (
+                node.type == "receive_statement"
+                and any(child.type == ":=" for child in node.children)
+                and self._go_field_binds_name(node, "left", receiver_name)
+                and node.parent is not None
+            ):
+                intervals.append((node.end_byte, node.parent.end_byte))
+                receiver_scopes.add(scope_key(node.parent))
+
+            stack.extend((child, scope) for child in reversed(node.named_children))
+
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(intervals):
+            if start >= end:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = merged[-1][0], max(merged[-1][1], end)
+            else:
+                merged.append((start, end))
+        return (
+            receiver_name,
+            tuple(start for start, _ in merged),
+            tuple(end for _, end in merged),
+        )
 
     @staticmethod
-    def _go_binding_binds_name(
+    def _go_receiver_is_shadowed(
         node,
-        receiver_name: str,
-        receiver_already_declared: bool = False,
+        bindings: tuple[str, tuple[int, ...], tuple[int, ...]],
     ) -> bool:
-        """Return whether a Go declaration's left side binds ``receiver_name``."""
-        if node.type == "var_spec":
-            candidates = node.children
-        else:
-            if receiver_already_declared:
-                return False
-            try:
-                assignment = next(
-                    index for index, child in enumerate(node.children)
-                    if child.type == ":="
-                )
-            except StopIteration:
-                return False
-            candidates = node.children[:assignment]
-        return any(
-            child.type == "identifier"
-            and child.text.decode("utf-8", errors="replace") == receiver_name
-            for candidate in candidates
-            for child in (
-                candidate.children if candidate.type == "expression_list" else (candidate,)
-            )
-        )
+        """Return whether a pre-indexed Go binding shadows the receiver."""
+        index = bisect_right(bindings[1], node.start_byte) - 1
+        return index >= 0 and node.start_byte < bindings[2][index]
 
     @staticmethod
     def _cpp_scope_join(

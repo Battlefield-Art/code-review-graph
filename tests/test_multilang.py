@@ -154,6 +154,28 @@ class TestGoParsing:
         assert calls[0].target.endswith("::ShadowA.Save")
         assert calls[0].extra["go_method_receiver"] is True
 
+    @pytest.mark.parametrize(
+        ("method_name", "receiver_resolution"),
+        [
+            ("CallsTypeSwitchInitShadowedReceiver", [True, False, True]),
+            ("CallsSelectReceiveShadowedReceiver", [True, False, True]),
+            ("CallsConstShadowedReceiver", [False, True]),
+            ("CallsTypeShadowedReceiver", [False, True]),
+        ],
+    )
+    def test_receiver_bindings_follow_lexical_lifetime(
+        self, method_name, receiver_resolution,
+    ):
+        calls = [
+            edge for edge in self.edges
+            if edge.kind == "CALLS"
+            and edge.source.endswith(f"::ShadowA.{method_name}")
+            and edge.extra.get("receiver") == "a"
+        ]
+        assert [
+            edge.target.endswith("::ShadowA.Save") for edge in calls
+        ] == receiver_resolution
+
     def test_deep_receiver_scope_walk_does_not_overflow(self):
         source = (
             "package auth\n"
@@ -167,13 +189,49 @@ class TestGoParsing:
         ).encode()
         root = self.parser._get_parser("go").parse(source).root_node
         stack = [root]
+        method = None
+        call = None
         while stack:
             current = stack.pop()
+            if (
+                current.type == "method_declaration"
+                and current.child_by_field_name("name").text == b"Deep"
+            ):
+                method = current
             if current.type == "call_expression":
-                assert not self.parser._go_receiver_is_shadowed(current, "a")
-                return
+                call = current
             stack.extend(current.children)
-        pytest.fail("deep Go fixture should contain a call expression")
+        assert method is not None
+        assert call is not None
+        bindings = self.parser._go_receiver_binding_index(method, "a")
+        assert not self.parser._go_receiver_is_shadowed(call, bindings)
+
+    def test_receiver_binding_prepass_runs_once_per_method(self, monkeypatch):
+        builds = []
+        original = CodeParser._go_receiver_binding_index
+
+        def counted(parser, method, receiver_name):
+            name = method.child_by_field_name("name").text.decode()
+            if name == "ManyCalls":
+                builds.append(name)
+            return original(parser, method, receiver_name)
+
+        monkeypatch.setattr(CodeParser, "_go_receiver_binding_index", counted)
+        source = (
+            "package auth\n"
+            "type ShadowA struct{}\n"
+            "func (a *ShadowA) Save() {}\n"
+            "func (a *ShadowA) ManyCalls() {\n"
+            + "\n".join("a.Save()" for _ in range(200))
+            + "\n}\n"
+        ).encode()
+        _, edges = CodeParser().parse_bytes(Path("many_calls.go"), source)
+        calls = [
+            edge for edge in edges
+            if edge.kind == "CALLS" and edge.source.endswith("::ShadowA.ManyCalls")
+        ]
+        assert len(calls) == 200
+        assert builds == ["ManyCalls"]
 
 
 class TestRustParsing:
