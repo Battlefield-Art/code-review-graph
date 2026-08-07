@@ -42,6 +42,23 @@ func (r *InMemoryRepo) SaveAndReturn(user *User) error {
 	return r.Save(user)
 }
 
+type ShadowA struct{}
+type ShadowB struct{}
+
+func (a *ShadowA) Save() {}
+func (b *ShadowB) Save() {}
+
+func (a *ShadowA) CallsShadowedReceiver() {
+	func(a *ShadowB) { a.Save() }(&ShadowB{})
+}
+
+func (a *ShadowA) CallsBlockShadowedReceiver() {
+	if true {
+		a := &ShadowB{}
+		a.Save()
+	}
+}
+
 func CreateUser(repo UserRepository, name string, email string) (*User, error) {
 	user := &User{ID: 1, Name: name, Email: email}
 	err := repo.Save(user)

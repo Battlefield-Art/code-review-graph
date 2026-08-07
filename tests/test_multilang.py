@@ -53,14 +53,16 @@ class TestGoParsing:
         struct they belong to.
         """
         funcs = [n for n in self.nodes if n.kind == "Function"]
-        by_name = {f.name: f for f in funcs}
-        assert "FindByID" in by_name
-        assert "Save" in by_name
-        assert by_name["FindByID"].parent_name == "InMemoryRepo"
-        assert by_name["Save"].parent_name == "InMemoryRepo"
+        find_by_id = next(f for f in funcs if f.name == "FindByID")
+        save = next(
+            f for f in funcs
+            if f.name == "Save" and f.parent_name == "InMemoryRepo"
+        )
+        assert find_by_id.parent_name == "InMemoryRepo"
+        assert save.parent_name == "InMemoryRepo"
         # Free functions should still have no parent.
-        assert by_name["NewInMemoryRepo"].parent_name is None
-        assert by_name["CreateUser"].parent_name is None
+        assert next(f for f in funcs if f.name == "NewInMemoryRepo").parent_name is None
+        assert next(f for f in funcs if f.name == "CreateUser").parent_name is None
 
         contains = [(e.source, e.target) for e in self.edges if e.kind == "CONTAINS"]
         find_by_id_contains = [
@@ -91,6 +93,21 @@ class TestGoParsing:
         assert len(calls) == 1
         assert calls[0].target.endswith("::InMemoryRepo.Save")
         assert calls[0].extra["receiver"] == "r"
+
+    @pytest.mark.parametrize(
+        "method_name",
+        ["CallsShadowedReceiver", "CallsBlockShadowedReceiver"],
+    )
+    def test_shadowed_receiver_call_stays_unresolved(self, method_name):
+        calls = [
+            edge for edge in self.edges
+            if edge.kind == "CALLS"
+            and edge.source.endswith(f"::ShadowA.{method_name}")
+            and edge.target == "Save"
+        ]
+        assert len(calls) == 1
+        assert calls[0].extra["receiver"] == "a"
+        assert "go_method_receiver" not in calls[0].extra
 
 
 class TestRustParsing:

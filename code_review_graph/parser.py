@@ -4731,6 +4731,7 @@ class CodeParser:
             if (
                 is_go
                 and edge.kind == "CALLS"
+                and edge.extra.get("go_method_receiver")
                 and receiver == go_receivers.get(edge.source)
             ):
                 candidates = [
@@ -10769,6 +10770,10 @@ class CodeParser:
                     call_name = method_name
                 if receiver:
                     call_extra["receiver"] = receiver
+                    if language == "go" and not self._go_receiver_is_shadowed(
+                        child, receiver,
+                    ):
+                        call_extra["go_method_receiver"] = True
                 if language == "java" and child.type == "method_reference":
                     call_extra["call_syntax"] = "method_reference"
 
@@ -14787,6 +14792,55 @@ class CodeParser:
             None,
         )
         return name.text.decode("utf-8", errors="replace") if name else None
+
+    @staticmethod
+    def _go_receiver_is_shadowed(node, receiver_name: str) -> bool:
+        """Return whether a local Go binding shadows a method receiver."""
+        cursor = node.parent
+        while cursor is not None:
+            if cursor.type == "func_literal":
+                params = next(
+                    (child for child in cursor.children if child.type == "parameter_list"),
+                    None,
+                )
+                if params is not None and any(
+                    part.type == "identifier" and part.text.decode(
+                        "utf-8", errors="replace"
+                    ) == receiver_name
+                    for parameter in params.children
+                    for part in parameter.children
+                ):
+                    return True
+            if cursor.type == "block":
+                def shadows_receiver(child) -> bool:
+                    if child.start_byte >= node.start_byte:
+                        return False
+                    if child.type == "short_var_declaration":
+                        names = next(
+                            (
+                                part for part in child.children
+                                if part.type == "expression_list"
+                            ),
+                            None,
+                        )
+                        if names is not None and any(
+                            part.type == "identifier" and part.text.decode(
+                                "utf-8", errors="replace"
+                            ) == receiver_name
+                            for part in names.children
+                        ):
+                            return True
+                    return any(
+                        shadows_receiver(part)
+                        for part in child.children
+                        if part.type not in ("block", "func_literal")
+                        or (part.start_byte <= node.start_byte < part.end_byte)
+                    )
+
+                if any(shadows_receiver(child) for child in cursor.children):
+                    return True
+            cursor = cursor.parent
+        return False
 
     @staticmethod
     def _cpp_scope_join(
