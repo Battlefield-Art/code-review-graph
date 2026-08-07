@@ -59,6 +59,48 @@ func (a *ShadowA) CallsBlockShadowedReceiver() {
 	}
 }
 
+func (a *ShadowA) CallsVarShadowedReceiver() {
+	var a *ShadowB
+	a.Save()
+}
+
+func (a *ShadowA) CallsRangeShadowedReceiver() {
+	for a := range []int{1} {
+		a.Save()
+	}
+}
+
+func (a *ShadowA) CallsTypeSwitchShadowedReceiver(value any) {
+	switch a := value.(type) {
+	case *ShadowB:
+		a.Save()
+	}
+}
+
+func (a *ShadowA) CallsNamedResultShadowedReceiver() {
+	func() (a *ShadowB) {
+		a.Save()
+		return nil
+	}()
+}
+
+func (a *ShadowA) CallsAfterShadowScope() {
+	{
+		var a *ShadowB
+		a.Save()
+	}
+	a.Save()
+}
+
+func (a *ShadowA) CallsInitializerScope() {
+	if a := func() *ShadowB {
+		a.Save()
+		return nil
+	}(); a != nil {
+		a.Save()
+	}
+}
+
 func CreateUser(repo UserRepository, name string, email string) (*User, error) {
 	user := &User{ID: 1, Name: name, Email: email}
 	err := repo.Save(user)

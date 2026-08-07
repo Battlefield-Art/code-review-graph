@@ -96,7 +96,14 @@ class TestGoParsing:
 
     @pytest.mark.parametrize(
         "method_name",
-        ["CallsShadowedReceiver", "CallsBlockShadowedReceiver"],
+        [
+            "CallsShadowedReceiver",
+            "CallsBlockShadowedReceiver",
+            "CallsVarShadowedReceiver",
+            "CallsRangeShadowedReceiver",
+            "CallsTypeSwitchShadowedReceiver",
+            "CallsNamedResultShadowedReceiver",
+        ],
     )
     def test_shadowed_receiver_call_stays_unresolved(self, method_name):
         calls = [
@@ -108,6 +115,49 @@ class TestGoParsing:
         assert len(calls) == 1
         assert calls[0].extra["receiver"] == "a"
         assert "go_method_receiver" not in calls[0].extra
+
+    def test_receiver_call_resolves_after_shadowing_scope(self):
+        calls = [
+            edge for edge in self.edges
+            if edge.kind == "CALLS"
+            and edge.source.endswith("::ShadowA.CallsAfterShadowScope")
+            and edge.extra.get("receiver") == "a"
+        ]
+        assert [edge.target.endswith("::ShadowA.Save") for edge in calls] == [
+            False, True,
+        ]
+
+    def test_initializer_uses_receiver_before_shadowing(self):
+        calls = [
+            edge for edge in self.edges
+            if edge.kind == "CALLS"
+            and edge.source.endswith("::ShadowA.CallsInitializerScope")
+            and edge.extra.get("receiver") == "a"
+        ]
+        assert [edge.target.endswith("::ShadowA.Save") for edge in calls] == [
+            True, False,
+        ]
+
+    def test_deep_receiver_scope_walk_does_not_overflow(self):
+        source = (
+            "package auth\n"
+            "type ShadowA struct{}\n"
+            "func (a *ShadowA) Save() {}\n"
+            "func (a *ShadowA) Deep() {\n"
+            + "(" * 1200
+            + "a.Save()"
+            + ")" * 1200
+            + "\n}\n"
+        ).encode()
+        root = self.parser._get_parser("go").parse(source).root_node
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            if current.type == "call_expression":
+                assert not self.parser._go_receiver_is_shadowed(current, "a")
+                return
+            stack.extend(current.children)
+        pytest.fail("deep Go fixture should contain a call expression")
 
 
 class TestRustParsing:

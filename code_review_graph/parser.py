@@ -14795,52 +14795,154 @@ class CodeParser:
 
     @staticmethod
     def _go_receiver_is_shadowed(node, receiver_name: str) -> bool:
-        """Return whether a local Go binding shadows a method receiver."""
+        """Return whether a lexical Go binding shadows a method receiver."""
+        path = []
         cursor = node.parent
         while cursor is not None:
-            if cursor.type == "func_literal":
-                params = next(
-                    (child for child in cursor.children if child.type == "parameter_list"),
+            path.append(cursor)
+            cursor = cursor.parent
+
+        for scope in path:
+            if scope.type in {
+                "func_literal", "function_declaration", "method_declaration",
+            } and CodeParser._go_function_binds_name(scope, receiver_name):
+                return True
+            if (
+                scope.type == "block"
+                and CodeParser._go_block_binds_name(scope, node, receiver_name)
+            ):
+                return True
+            if scope.type in {"if_statement", "expression_switch_statement"}:
+                initializer = next(
+                    (
+                        child for child in scope.children
+                        if child.type == "short_var_declaration"
+                    ),
                     None,
                 )
-                if params is not None and any(
-                    part.type == "identifier" and part.text.decode(
-                        "utf-8", errors="replace"
-                    ) == receiver_name
-                    for parameter in params.children
-                    for part in parameter.children
+                if (
+                    initializer is not None
+                    and initializer.end_byte <= node.start_byte
+                    and CodeParser._go_binding_binds_name(
+                        initializer, receiver_name,
+                    )
                 ):
                     return True
-            if cursor.type == "block":
-                def shadows_receiver(child) -> bool:
-                    if child.start_byte >= node.start_byte:
-                        return False
-                    if child.type == "short_var_declaration":
-                        names = next(
+            if scope.type == "for_statement":
+                body = next(
+                    (child for child in scope.children if child.type == "block"),
+                    None,
+                )
+                if body in path:
+                    range_clause = next(
+                        (
+                            child for child in scope.children
+                            if child.type == "range_clause"
+                        ),
+                        None,
+                    )
+                    for_clause = next(
+                        (
+                            child for child in scope.children
+                            if child.type == "for_clause"
+                        ),
+                        None,
+                    )
+                    initializer = (
+                        next(
                             (
-                                part for part in child.children
-                                if part.type == "expression_list"
+                                child for child in for_clause.children
+                                if child.type == "short_var_declaration"
                             ),
                             None,
                         )
-                        if names is not None and any(
-                            part.type == "identifier" and part.text.decode(
-                                "utf-8", errors="replace"
-                            ) == receiver_name
-                            for part in names.children
-                        ):
-                            return True
-                    return any(
-                        shadows_receiver(part)
-                        for part in child.children
-                        if part.type not in ("block", "func_literal")
-                        or (part.start_byte <= node.start_byte < part.end_byte)
+                        if for_clause is not None
+                        else None
                     )
-
-                if any(shadows_receiver(child) for child in cursor.children):
-                    return True
-            cursor = cursor.parent
+                    if (
+                        (range_clause is not None and CodeParser._go_binding_binds_name(
+                            range_clause, receiver_name,
+                        ))
+                        or (
+                            initializer is not None
+                            and CodeParser._go_binding_binds_name(
+                                initializer, receiver_name,
+                            )
+                        )
+                    ):
+                        return True
+            if (
+                scope.type == "type_switch_statement"
+                and any(part.type == "type_case" for part in path)
+                and CodeParser._go_binding_binds_name(scope, receiver_name)
+            ):
+                return True
         return False
+
+    @staticmethod
+    def _go_function_binds_name(node, receiver_name: str) -> bool:
+        """Return whether a Go function scope binds ``receiver_name``."""
+        parameters = [
+            child for child in node.children if child.type == "parameter_list"
+        ]
+        if node.type == "method_declaration":
+            parameters = parameters[1:]
+        return any(
+            child.type == "identifier"
+            and child.text.decode("utf-8", errors="replace") == receiver_name
+            for parameter_list in parameters
+            for parameter in parameter_list.children
+            for child in parameter.children
+        )
+
+    @staticmethod
+    def _go_block_binds_name(block, node, receiver_name: str) -> bool:
+        """Return whether an earlier declaration in ``block`` binds the name."""
+        statements = next(
+            (child for child in block.children if child.type == "statement_list"),
+            None,
+        )
+        if statements is None:
+            return False
+        for statement in statements.children:
+            if statement.type == "var_declaration":
+                for spec in statement.children:
+                    if (
+                        spec.type == "var_spec"
+                        and spec.end_byte <= node.start_byte
+                        and CodeParser._go_binding_binds_name(spec, receiver_name)
+                    ):
+                        return True
+            elif (
+                statement.type == "short_var_declaration"
+                and statement.end_byte <= node.start_byte
+                and CodeParser._go_binding_binds_name(statement, receiver_name)
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _go_binding_binds_name(node, receiver_name: str) -> bool:
+        """Return whether a Go declaration's left side binds ``receiver_name``."""
+        if node.type == "var_spec":
+            candidates = node.children
+        else:
+            try:
+                assignment = next(
+                    index for index, child in enumerate(node.children)
+                    if child.type == ":="
+                )
+            except StopIteration:
+                return False
+            candidates = node.children[:assignment]
+        return any(
+            child.type == "identifier"
+            and child.text.decode("utf-8", errors="replace") == receiver_name
+            for candidate in candidates
+            for child in (
+                candidate.children if candidate.type == "expression_list" else (candidate,)
+            )
+        )
 
     @staticmethod
     def _cpp_scope_join(
