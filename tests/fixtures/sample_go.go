@@ -39,7 +39,7 @@ func (r *InMemoryRepo) Save(user *User) error {
 }
 
 func (r *InMemoryRepo) SaveAndReturn(user *User) error {
-	return r.Save(user)
+	return (*r).Save(user)
 }
 
 type ShadowA struct{}

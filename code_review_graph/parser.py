@@ -10941,6 +10941,16 @@ class CodeParser:
             method = callee.child_by_field_name("field")
             if receiver is None or method is None:
                 return None, None
+            while receiver.type == "parenthesized_expression":
+                if len(receiver.named_children) != 1:
+                    break
+                receiver = receiver.named_children[0]
+            if (
+                receiver.type == "unary_expression"
+                and receiver.children
+                and receiver.children[0].type == "*"
+            ):
+                receiver = receiver.child_by_field_name("operand") or receiver
             return (
                 receiver.text.decode("utf-8", errors="replace"),
                 method.text.decode("utf-8", errors="replace"),
