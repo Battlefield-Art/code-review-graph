@@ -83,7 +83,7 @@ class TestGoParsing:
         assert save_contains[0][0].endswith("::InMemoryRepo")
 
     def test_generic_methods_attached_to_receiver(self):
-        nodes, _ = self.parser.parse_bytes(
+        nodes, edges = self.parser.parse_bytes(
             Path("generic.go"),
             b"""package sample
 type Box[T any] struct{}
@@ -98,6 +98,11 @@ func (b *Box[T]) Pointer() {}
             if node.kind == "Function"
         }
         assert parents == {"Value": "Box", "Pointer": "Box"}
+        assert {
+            edge.target.rsplit("::", 1)[-1]
+            for edge in edges
+            if edge.kind == "CONTAINS" and edge.source.endswith("::Box")
+        } == {"Box.Value", "Box.Pointer"}
 
 
 class TestRustParsing:
