@@ -51,7 +51,8 @@ class CellInfo(NamedTuple):
 
 
 _SQL_TABLE_RE = re.compile(
-    r"(?:FROM|JOIN|INTO|CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)|INSERT\s+OVERWRITE)"
+    r"(?:FROM|JOIN|INTO|CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)"
+    r"(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+OVERWRITE)"
     r"\s+((?:`[^`]+`|\w+)(?:\.(?:`[^`]+`|\w+))*)",
     re.IGNORECASE,
 )
@@ -443,7 +444,7 @@ _SQL_KEYWORDS: frozenset[str] = frozenset({
     "UNION", "INTERSECT", "EXCEPT", "AS", "ON", "USING", "SET",
     "VALUES", "DEFAULT", "NULL", "TRUE", "FALSE",
     "INNER", "OUTER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL",
-    "LATERAL", "RECURSIVE", "ONLY", "WITH",
+    "LATERAL", "RECURSIVE", "ONLY", "WITH", "IF", "NOT", "EXISTS",
 })
 
 logger = logging.getLogger(__name__)

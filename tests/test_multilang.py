@@ -3635,6 +3635,17 @@ class TestSQLParsing:
         targets = {e.target for e in imports}
         # active_orders view and archive procedure both reference orders/users
         assert "orders" in targets or "users" in targets
+
+    def test_multiple_if_not_exists_creates_keep_distinct_references(self):
+        _, edges = self.parser.parse_bytes(
+            Path("idempotent_schema.sql"),
+            b"CREATE TABLE IF NOT EXISTS customers (id INT);\n"
+            b"CREATE TABLE IF NOT EXISTS invoices (id INT);\n",
+        )
+        targets = [e.target for e in edges if e.kind == "IMPORTS_FROM"]
+        assert targets == ["customers", "invoices"]
+
+
 class TestZigParsing:
     def setup_method(self):
         self.parser = CodeParser()
