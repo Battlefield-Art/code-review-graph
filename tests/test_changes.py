@@ -403,6 +403,31 @@ class TestChanges:
         )
         assert len(result["affected_flows"]) >= 1
 
+    def test_analyze_changes_lifecycle_methods_not_test_gaps(self):
+        """Lifecycle and construction methods are exempt from gaps (#850)."""
+        self._add_func("setUp", path="thing_test_helper.py",
+                       line_start=1, line_end=5)
+        self._add_func("tearDown", path="thing_test_helper.py",
+                       line_start=6, line_end=10)
+        self._add_func("__construct", path="thing.php",
+                       line_start=1, line_end=5)
+        self._add_func("realMethod", path="thing.php",
+                       line_start=6, line_end=20)
+
+        result = analyze_changes(
+            self.store,
+            changed_files=["thing_test_helper.py", "thing.php"],
+            changed_ranges={
+                "thing_test_helper.py": [(1, 10)],
+                "thing.php": [(1, 20)],
+            },
+        )
+        gap_names = {g["name"] for g in result["test_gaps"]}
+        assert "setUp" not in gap_names
+        assert "tearDown" not in gap_names
+        assert "__construct" not in gap_names
+        assert "realMethod" in gap_names
+
     def test_analyze_changes_review_priorities_ordered(self):
         """Review priorities are ordered by descending risk score."""
         # Create several functions with varying risk levels.
