@@ -746,7 +746,7 @@ class Plain:
             f"All edges: {[(e.kind, e.source, e.target) for e in edges]}"
         )
 
-    # --- Python callback REFERENCES (#363) ---
+    # --- Python callback REFERENCES (#363, #840) ---
     # Functions passed as bare-identifier arguments (executor.submit(fn),
     # filter(fn, xs), map(fn, xs), df.apply(fn), ...) should produce
     # REFERENCES edges so dead-code detection does not flag them as unused.
@@ -764,6 +764,13 @@ class Plain:
                 f"Expected REFERENCES edge to {callback}, got targets: "
                 f"{ref_target_names}"
             )
+
+    def test_python_keyword_callback_reference_emitted(self):
+        """A function passed as a keyword-argument value should produce a reference."""
+        nodes, edges = self.parser.parse_file(FIXTURES / "sample_callback_refs.py")
+        refs = [e for e in edges if e.kind == "REFERENCES"]
+        ref_target_names = {e.target.rsplit("::", 1)[-1] for e in refs}
+        assert "keyword_callback" in ref_target_names
 
     def test_python_callback_references_not_treated_as_dead(self):
         """End-to-end: with REFERENCES edges in place, find_dead_code
@@ -785,7 +792,10 @@ class Plain:
                 dead = find_dead_code(store)
                 dead_names = {d["name"] for d in dead}
                 for callback in (
-                    "executor_callback", "filter_callback", "map_callback",
+                    "executor_callback",
+                    "filter_callback",
+                    "map_callback",
+                    "keyword_callback",
                 ):
                     assert callback not in dead_names, (
                         f"{callback} was flagged as dead but is used as a "
