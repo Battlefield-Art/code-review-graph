@@ -13574,11 +13574,25 @@ class CodeParser:
                 # Try exact path first (might already have extension)
                 if base.is_file():
                     return str(base.resolve())
-                # Try with extensions
+                # APPEND the extension — never `with_suffix`, which REPLACES the
+                # final suffix and so resolves `./outlet.entity` to `outlet.ts`
+                # instead of `outlet.entity.ts`. Dotted stems are the dominant
+                # NestJS convention (*.entity.ts, *.service.ts, *.controller.ts,
+                # *.guard.ts, *.module.ts), so the replace form silently dropped
+                # every relative import between them — a confident, wrong `0`
+                # from importers_of. Mirrors `_probe_path` in tsconfig_resolver.py,
+                # which already had this right for alias imports.
                 for ext in extensions:
-                    target = base.with_suffix(ext)
+                    target = Path(str(base) + ext)
                     if target.is_file():
                         return str(target.resolve())
+                # ESM/NodeNext writes `./foo.js` for a file that is `foo.ts` on
+                # disk; only here does replacing the suffix become correct.
+                if base.suffix in (".js", ".jsx", ".mjs", ".cjs"):
+                    for ext in (".ts", ".tsx"):
+                        target = base.with_suffix(ext)
+                        if target.is_file():
+                            return str(target.resolve())
                 # Try index file in directory
                 if base.is_dir():
                     for ext in extensions:
@@ -13597,8 +13611,13 @@ class CodeParser:
                 base = caller_dir / module
                 if base.is_file():
                     return str(base.resolve())
-                # Fallback: try appending .dart
-                target = base.with_suffix(".dart")
+                # Fallback: try appending .dart. APPEND, never `with_suffix`,
+                # which REPLACES the final suffix — same bug class as the
+                # JS/TS resolver above. Imports normally already carry the
+                # `.dart` extension (caught by `base.is_file()` above), so
+                # this only bites an omitted extension on a dotted stem
+                # (e.g. `./thing.model` where `thing.model.dart` exists).
+                target = Path(str(base) + ".dart")
                 if target.is_file():
                     return str(target.resolve())
             elif module.startswith("package:"):
