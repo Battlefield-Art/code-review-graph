@@ -4,6 +4,18 @@
 
 ### Added
 
+- Empty results from `query_graph`, `get_impact_radius`, and
+  `semantic_search_nodes` now carry a one-sentence `confidence` field saying
+  *why* the count is zero: the target was never indexed, the graph is behind
+  the working tree, a known static-analysis gap applies to that language and
+  query (PHP container resolution and `include`/`require`, JS/TS callbacks and
+  route registration, npm-aliased imports, Java AOP and reflection, Go
+  structural interface satisfaction, C# DI, Python `getattr` and registry
+  decorators), or the zero is a verified real absence. The field is capped at
+  140 characters and is emitted **only** when the result list is empty, so
+  responses that carry results are byte-identical to before. One honest
+  sentence is far cheaper than the wrong conclusion or the repo-wide grep a
+  bare zero provokes (#314, #819, #850, #851).
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each
