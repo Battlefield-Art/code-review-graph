@@ -171,6 +171,7 @@ def _handle_status(_args: argparse.Namespace) -> None:
             f"{'-' * 6}  {'-' * 40}"
         )
         stalled = False
+        degraded = False
         for repo in config.repos:
             entry = state.get(repo.alias, {})
             child_pid: int | None = entry.get("pid")
@@ -180,6 +181,7 @@ def _handle_status(_args: argparse.Namespace) -> None:
             health = read_watch_health(repo.path)
             watcher = watcher_status(alive, health)
             stalled = stalled or watcher == "stalled"
+            degraded = degraded or watcher == "partial"
             last_event = health.get("last_event_at") if health else None
             event_str = (
                 _format_age(time.time() - last_event)
@@ -199,6 +201,16 @@ def _handle_status(_args: argparse.Namespace) -> None:
             print(
                 "  the graph is no longer updating. Check the log, then: "
                 "crg-daemon restart"
+            )
+        if degraded:
+            print()
+            print(
+                "  A partial watcher ran out of watch slots and fell back to one "
+                "recursive watch:"
+            )
+            print(
+                "  still complete, but ignored trees are watched again. Raise "
+                "CRG_MAX_WATCH_SCHEDULES."
             )
     else:
         print(f"  {'Alias':<{alias_width}}  Path")

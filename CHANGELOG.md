@@ -26,12 +26,21 @@
 - Watch mode no longer registers OS watches inside ignored trees, and no longer
   keeps running after its filesystem observer dies. Watches are now planned per
   directory (ignored trees are skipped, the repo root is watched
-  non-recursively so new top-level directories are still adopted), nested build
-  output such as `moduleA/target/` is ignored when a sibling `pom.xml` proves it
-  is build output, and a dead watchdog thread makes the watcher log an error and
-  exit non-zero so the daemon restarts it. `crg-daemon status` gained a
-  `Watcher` column and last-event age, so a stalled watcher stops reporting as
-  healthy (#811).
+  non-recursively, and directories that appear or disappear later are picked up
+  from a per-tick listing rather than from directory events, which macOS never
+  delivers for a child of a non-recursive watch), nested build output such as
+  `moduleA/target/` is ignored when a sibling `pom.xml` proves it is build
+  output — reported at info level and overridable per path with `!path` in
+  `.code-review-graphignore` — and a dead watchdog thread makes the watcher log
+  an error and exit non-zero so the daemon restarts it, while a deleted watch
+  root is merely released. `crg-daemon status` gained a `Watcher` column
+  (ok/partial/stalled/unknown/dead) and last-event age, and the daemon now backs
+  off exponentially between restarts of a watcher that keeps dying (#811).
+- `code-review-graph watch --repo .` no longer empties the graph on startup. The
+  watcher resolves its repository root before reconciling, so stored absolute
+  paths are no longer all treated as stale, and a graph built under a genuinely
+  different root is now refused with a clear error instead of being reconciled
+  away file by file (#811).
 - C# receiver calls (`Service.StaticCall()`, `obj.Method()`, `obj?.Method()`)
   now resolve to canonical method nodes using receiver-type and namespace
   evidence recorded at parse time, so `callers_of`, `get_impact_radius`, and

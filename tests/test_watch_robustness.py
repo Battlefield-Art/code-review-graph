@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sys
 import threading
 import time
@@ -36,8 +37,10 @@ from code_review_graph.incremental import (
     _should_ignore,
     _WatchSupervisor,
     clear_nested_ignore_cache,
+    incremental_update,
     watch,
 )
+from code_review_graph.parser import NodeInfo
 
 
 @pytest.fixture(autouse=True)
@@ -68,8 +71,9 @@ class FakeEmitter:
     is the one that dies in #811 — the emitter itself stays alive.
     """
 
-    def __init__(self, reader: threading.Thread | None = None) -> None:
+    def __init__(self, reader: threading.Thread | None = None, root: str | None = None) -> None:
         self._inotify = reader
+        self.watch = FakeWatch(root, True) if root is not None else None
 
 
 class FakeObserver:
@@ -244,82 +248,163 @@ class TestIgnoreAwareScheduling:
 
         assert "/intranet-backend/target/**" not in patterns
 
+    def test_a_single_path_can_opt_out(self, tmp_path):
+        """Dropping files from the graph needs an escape smaller than a kill switch."""
+        _maven_repo(tmp_path)
+        (tmp_path / ".code-review-graphignore").write_text(
+            "# keep our hand-written module\n!intranet-backend/target\n", encoding="utf-8"
+        )
+        clear_nested_ignore_cache()
+
+        patterns = _load_ignore_patterns(tmp_path)
+
+        assert "/intranet-backend/target/**" not in patterns
+        assert not _should_ignore("intranet-backend/target/Main.java", patterns)
+
+    def test_excluded_directories_are_logged(self, tmp_path, caplog):
+        """An exclusion drops files from the graph, so it has to be discoverable."""
+        _maven_repo(tmp_path)
+        clear_nested_ignore_cache()
+
+        with caplog.at_level(logging.INFO, logger="code_review_graph.incremental"):
+            _load_ignore_patterns(tmp_path)
+
+        assert "intranet-backend/target" in caplog.text
+        assert ".code-review-graphignore" in caplog.text
+
 
 class TestNewDirectoryAdoption:
-    def _supervisor(self, tmp_path) -> tuple[_WatchSupervisor, FakeObserver]:
+    """Adoption is driven by a per-tick listing, never by directory events.
+
+    macOS drops every directory event for a child of a non-recursive watch, so
+    an event-driven design is permanently blind to a new top-level directory.
+    """
+
+    def _supervisor(self, tmp_path, **kwargs) -> tuple[_WatchSupervisor, FakeObserver]:
+        (tmp_path / "src").mkdir(exist_ok=True)
+        for index in range(6):
+            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True, exist_ok=True)
         observer = FakeObserver()
         supervisor = _WatchSupervisor(
-            observer, tmp_path, _load_ignore_patterns(tmp_path), health_path=None
+            observer, tmp_path, _load_ignore_patterns(tmp_path), health_path=None, **kwargs
         )
         supervisor.schedule_initial(MagicMock())
         return supervisor, observer
 
     def test_new_top_level_directory_is_picked_up(self, tmp_path):
         """A non-recursive root watch only helps if new children get scheduled."""
-        (tmp_path / "src").mkdir()
-        for index in range(6):
-            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
         supervisor, observer = self._supervisor(tmp_path)
         before = list(observer.scheduled)
 
         created = tmp_path / "services"
         created.mkdir()
-        supervisor.note_directory_event("created", str(created))
-        supervisor.apply_pending()
+        adopted, vanished = supervisor.sync_watches()
 
+        assert adopted == [str(created)]
+        assert vanished == []
         assert (str(created), True) in observer.scheduled
         assert (str(created), True) not in before
 
-    def test_new_ignored_directory_is_not_picked_up(self, tmp_path):
+    def test_recreated_directory_is_watched_again(self, tmp_path):
+        """`rm -rf src && mkdir src` must not leave src unwatched forever."""
+        supervisor, observer = self._supervisor(tmp_path)
+
+        shutil.rmtree(tmp_path / "src")
+        _, vanished = supervisor.sync_watches()
+        assert vanished == [str(tmp_path / "src")]
+        assert observer.unscheduled == [str(tmp_path / "src")]
+
         (tmp_path / "src").mkdir()
-        for index in range(6):
-            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        adopted, _ = supervisor.sync_watches()
+
+        assert adopted == [str(tmp_path / "src")]
+        assert observer.scheduled.count((str(tmp_path / "src"), True)) == 2
+
+    def test_new_ignored_directory_is_not_picked_up(self, tmp_path):
         supervisor, observer = self._supervisor(tmp_path)
 
         created = tmp_path / "dist"
         created.mkdir()
-        supervisor.note_directory_event("created", str(created))
-        supervisor.apply_pending()
+        adopted, _ = supervisor.sync_watches()
 
+        assert adopted == []
         assert not any(path == str(created) for path, _ in observer.scheduled)
 
     def test_directory_inside_a_recursive_watch_is_not_rescheduled(self, tmp_path):
         """watchdog already covers those; a second watch would be waste."""
-        (tmp_path / "src").mkdir()
-        for index in range(6):
-            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
         supervisor, observer = self._supervisor(tmp_path)
 
         created = tmp_path / "src" / "nested"
         created.mkdir()
-        supervisor.note_directory_event("created", str(created))
-        supervisor.apply_pending()
+        adopted, _ = supervisor.sync_watches()
 
+        assert adopted == []
         assert not any(path == str(created) for path, _ in observer.scheduled)
 
     def test_deleted_directory_releases_its_watch(self, tmp_path):
-        (tmp_path / "src").mkdir()
-        for index in range(6):
-            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
         supervisor, observer = self._supervisor(tmp_path)
 
-        supervisor.note_directory_event("deleted", str(tmp_path / "src"))
-        supervisor.apply_pending()
+        shutil.rmtree(tmp_path / "src")
+        adopted, vanished = supervisor.sync_watches()
 
+        assert vanished == [str(tmp_path / "src")]
         assert observer.unscheduled == [str(tmp_path / "src")]
 
-    def test_directory_events_do_not_schedule_on_the_dispatch_thread(self, tmp_path):
-        """Dispatch must stay an append; scheduling happens on the watch loop."""
+    def test_a_quiet_tick_touches_nothing(self, tmp_path):
+        supervisor, observer = self._supervisor(tmp_path)
+        before = list(observer.scheduled)
+
+        assert supervisor.sync_watches() == ([], [])
+        assert observer.scheduled == before
+        assert observer.unscheduled == []
+
+    def test_relative_repo_root_still_adopts_and_releases(self, tmp_path, monkeypatch):
+        """`--repo .` stays relative in the CLI; the supervisor must resolve it."""
+        monkeypatch.chdir(tmp_path)
         (tmp_path / "src").mkdir()
         for index in range(6):
             (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
-        supervisor, observer = self._supervisor(tmp_path)
-        created = tmp_path / "services"
-        created.mkdir()
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer, Path("."), _load_ignore_patterns(Path(".")), health_path=None
+        )
+        supervisor.schedule_initial(MagicMock())
 
-        supervisor.note_directory_event("created", str(created))
+        (tmp_path / "services").mkdir()
+        adopted, _ = supervisor.sync_watches()
 
-        assert not any(path == str(created) for path, _ in observer.scheduled)
+        assert adopted == [str(tmp_path / "services")]
+
+        shutil.rmtree(tmp_path / "services")
+        _, vanished = supervisor.sync_watches()
+
+        assert vanished == [str(tmp_path / "services")]
+
+    def test_budget_exhaustion_degrades_to_a_recursive_watch(self, tmp_path):
+        """Covering less would be silent blindness; cover more instead."""
+        supervisor, observer = self._supervisor(tmp_path, max_schedules=2)
+        assert supervisor.degraded is False
+
+        (tmp_path / "services").mkdir()
+        (tmp_path / "services" / "deep").mkdir()
+        adopted, _ = supervisor.sync_watches()
+
+        assert supervisor.degraded is True
+        assert (str(tmp_path), True) in observer.scheduled, "root now watched recursively"
+        assert supervisor.watched_paths == [str(tmp_path)]
+        assert adopted == [str(tmp_path / "services")]
+
+    def test_degraded_watchers_are_reported_as_partial(self, tmp_path):
+        supervisor, _ = self._supervisor(tmp_path, max_schedules=2)
+        supervisor._health_path = tmp_path / "health.json"
+
+        (tmp_path / "services").mkdir()
+        supervisor.sync_watches()
+        supervisor.report_health(observer_alive=True, force=True)
+
+        health = json.loads((tmp_path / "health.json").read_text(encoding="utf-8"))
+        assert health["degraded"] is True
+        assert watcher_status(True, {**health, "stalled": False}) == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +465,44 @@ class TestObserverLiveness:
         supervisor = _WatchSupervisor(MagicMock(), tmp_path, [], health_path=None)
 
         assert supervisor.dead_threads() == []
+
+    def test_deleting_a_watched_directory_is_not_a_death(self, tmp_path):
+        """Both backends stop an emitter whose own root disappears.
+
+        `rm -rf lib/` during normal work must not exit the watcher — with the
+        daemon restarting on every exit, that is a restart loop paying for a
+        full initial update each time.
+        """
+        watched = tmp_path / "lib"
+        watched.mkdir()
+        thread, gate = _live_thread()
+        observer = FakeObserver()
+        observer.emitters = [FakeEmitter(thread, root=str(watched))]
+        supervisor = _WatchSupervisor(observer, tmp_path, [], health_path=None)
+
+        assert supervisor.dead_threads() == []
+
+        shutil.rmtree(watched)
+        gate.set()
+        thread.join(timeout=5)
+
+        assert supervisor.dead_threads() == []
+
+    def test_dead_thread_whose_root_still_exists_is_a_death(self, tmp_path):
+        """The guard must not swallow the failure it was written for."""
+        watched = tmp_path / "lib"
+        watched.mkdir()
+        thread, gate = _live_thread()
+        observer = FakeObserver()
+        observer.emitters = [FakeEmitter(thread, root=str(watched))]
+        supervisor = _WatchSupervisor(observer, tmp_path, [], health_path=None)
+
+        assert supervisor.dead_threads() == []
+
+        gate.set()
+        thread.join(timeout=5)
+
+        assert supervisor.dead_threads() == ["fake-inotify-buffer"]
 
 
 class TestWatchLoop:
@@ -515,6 +638,114 @@ class TestWatchLoop:
         assert (str(tmp_path / "src"), True) in observer.scheduled
         assert not any("node_modules" in path for path, _ in observer.scheduled)
 
+    def test_relative_repo_keeps_a_graph_built_with_an_absolute_root(
+        self, tmp_path, monkeypatch
+    ):
+        """`watch --repo .` used to reconcile every file away on startup.
+
+        Stored paths are spelled by whoever built the graph, and reconciliation
+        deletes anything it cannot place under the current root — so a
+        relative root deleted the lot.
+        """
+        (tmp_path / "src").mkdir()
+        source = tmp_path / "src" / "app.py"
+        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        incremental_update(tmp_path, store, changed_files=["src/app.py"])
+        assert store.get_all_files(), "precondition: the graph has files"
+
+        monkeypatch.chdir(tmp_path)
+        try:
+            self._watch_with(Path("."), store, FakeObserver(), _tick_driver())
+            survivors = store.get_all_files()
+        finally:
+            store.close()
+
+        assert survivors, "the relative root reconciled the whole graph away"
+
+    def test_a_graph_from_another_root_is_refused_not_emptied(self, tmp_path):
+        """A total mismatch is a misconfiguration, not a mass deletion."""
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        incremental_update(tmp_path / "elsewhere", store, changed_files=[])
+        store.store_file_nodes_edges(
+            "/somewhere/else/mod.py",
+            [
+                NodeInfo(
+                    kind="File",
+                    name="mod.py",
+                    file_path="/somewhere/else/mod.py",
+                    line_start=1,
+                    line_end=2,
+                    language="python",
+                )
+            ],
+            [],
+            "hash",
+        )
+        store.commit()
+
+        try:
+            with (
+                patch("watchdog.observers.Observer") as observer,
+                pytest.raises(RuntimeError, match="different repository root"),
+            ):
+                watch(repo, store)
+            assert store.get_all_files() == ["/somewhere/else/mod.py"], "nothing was deleted"
+            observer.assert_not_called()
+        finally:
+            store.close()
+
+    def test_health_is_published_before_the_first_build(self, tmp_path):
+        """A repo whose first build takes minutes must not read as stalled."""
+        (tmp_path / "src").mkdir()
+        source = tmp_path / "src" / "app.py"
+        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        seen: list[dict] = []
+
+        def record_initial_health(*args, **kwargs):
+            seen.append(read_watch_health(tmp_path) or {})
+            return {"files_updated": 0}
+
+        try:
+            with (
+                patch("watchdog.observers.Observer", return_value=FakeObserver()),
+                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental.incremental_update",
+                    side_effect=record_initial_health,
+                ),
+            ):
+                watch(tmp_path, store)
+        finally:
+            store.close()
+
+        assert seen, "incremental_update was never reached"
+        assert seen[0].get("phase") == "initial-build"
+        assert seen[0].get("stalled") is False
+
+    def test_sigterm_clears_the_health_file(self, tmp_path):
+        """`crg-daemon stop` sends SIGTERM; a leftover file reads as stalled."""
+        import os
+        import signal
+
+        (tmp_path / "src").mkdir()
+        store = GraphStore(tmp_path / "graph.db")
+
+        def send_sigterm():
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        try:
+            self._watch_with(tmp_path, store, FakeObserver(), _tick_driver(send_sigterm))
+        finally:
+            store.close()
+
+        assert not watch_health_path(tmp_path).exists()
+        assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL, "handler not restored"
+
     def test_health_is_not_rewritten_on_every_tick(self, tmp_path):
         """Watch mode runs for days; the heartbeat must stay rate-limited."""
         (tmp_path / "src").mkdir()
@@ -532,6 +763,109 @@ class TestWatchLoop:
         supervisor.report_health(observer_alive=False, dead_threads=("Thread-3",))
 
         assert (tmp_path / "health.json").read_text(encoding="utf-8") != first
+
+
+class TestRealObserver:
+    """The one place a fake observer cannot be trusted.
+
+    Backend semantics differ: on macOS a non-recursive watch delivers no
+    directory event at all for a child, and no file event from inside it
+    (``FSEventsEmitter._is_recursive_event``).  Any design that learns about
+    new directories from events is silently blind there, so this drives the
+    real ``Observer`` and asserts the file reaches the graph.
+    """
+
+    def _wait_for(self, predicate, timeout=20.0, interval=0.05):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(interval)
+        return False
+
+    def test_new_top_level_directory_is_indexed(self, tmp_path):
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        # Enough ignored directories that the root is planned non-recursively;
+        # a recursive root watch would hide the bug this test exists for.
+        for index in range(6):
+            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        (repo / "src" / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+
+        store = GraphStore(repo / "graph.db")
+        reader = GraphStore(repo / "graph.db")
+        stop = threading.Event()
+        failure: list[BaseException] = []
+
+        def run_watch():
+            try:
+                watch(repo, store, stop_event=stop)
+            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions
+                failure.append(exc)
+
+        with patch("code_review_graph.incremental._WATCH_TICK_SECONDS", 0.05):
+            thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
+            thread.start()
+            try:
+                assert self._wait_for(
+                    lambda: watch_health_path(repo).exists()
+                ), "the watch loop never started"
+
+                # The whole point: this directory did not exist when the
+                # watches were planned.
+                created = repo / "services"
+                created.mkdir()
+                (created / "svc.py").write_text("def service():\n    return 3\n", encoding="utf-8")
+
+                indexed = self._wait_for(
+                    lambda: any(
+                        path.endswith("svc.py") for path in reader.get_all_files()
+                    )
+                )
+            finally:
+                stop.set()
+                thread.join(timeout=20)
+                store.close()
+                reader.close()
+
+        assert not failure, f"watch() raised: {failure[0]!r}"
+        assert indexed, (
+            "a top-level directory created after startup was never watched or indexed"
+        )
+
+    def test_deleting_a_watched_directory_does_not_kill_the_watcher(self, tmp_path):
+        """The emitter stops itself when its root vanishes; that is not a death."""
+        repo = tmp_path / "repo"
+        (repo / "lib").mkdir(parents=True)
+        for index in range(6):
+            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        (repo / "lib" / "mod.py").write_text("def mod():\n    return 1\n", encoding="utf-8")
+
+        store = GraphStore(repo / "graph.db")
+        stop = threading.Event()
+        failure: list[BaseException] = []
+
+        def run_watch():
+            try:
+                watch(repo, store, stop_event=stop)
+            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions
+                failure.append(exc)
+
+        with patch("code_review_graph.incremental._WATCH_TICK_SECONDS", 0.05):
+            thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
+            thread.start()
+            try:
+                assert self._wait_for(lambda: watch_health_path(repo).exists())
+                shutil.rmtree(repo / "lib")
+                time.sleep(1.0)  # several ticks
+                still_running = thread.is_alive()
+            finally:
+                stop.set()
+                thread.join(timeout=20)
+                store.close()
+
+        assert not failure, f"deleting a watched directory killed the watcher: {failure[0]!r}"
+        assert still_running
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +979,78 @@ class TestStatusSurfacesStalls:
         printed = "\n".join(str(call) for call in printer.call_args_list)
         assert "stalled" in printed
         assert "alive" in printed, "the process column still says alive"
+
+    def test_restart_backs_off_instead_of_looping(self, tmp_path, caplog):
+        """A watcher that keeps dying must not repay a full build every 30s."""
+        from code_review_graph.daemon import WatchDaemon
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        config = DaemonConfig(
+            repos=[WatchRepo(path=str(repo), alias="repo")],
+            log_dir=tmp_path / "logs",
+        )
+        daemon = WatchDaemon(config=config, config_path=tmp_path / "watch.toml")
+        daemon._current_repos = {"repo": config.repos[0]}
+        dead = MagicMock()
+        dead.poll.return_value = 1
+
+        with patch.object(WatchDaemon, "_start_watcher") as restart:
+            daemon._children = {"repo": dead}
+            daemon._check_health()
+            assert restart.call_count == 1, "the first death restarts immediately"
+            assert daemon.restart_count("repo") == 1
+
+            daemon._children = {"repo": dead}
+            daemon._check_health()
+            assert restart.call_count == 1, "the second death inside the window waits"
+            assert daemon.restart_count("repo") == 1
+
+            daemon._restarts["repo"]["next_attempt"] = 0.0  # window elapsed
+            daemon._children = {"repo": dead}
+            daemon._check_health()
+            assert restart.call_count == 2
+            assert daemon.restart_count("repo") == 2
+
+    def test_restart_counter_resets_after_a_healthy_run(self, tmp_path):
+        from code_review_graph.daemon import WatchDaemon
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        config = DaemonConfig(
+            repos=[WatchRepo(path=str(repo), alias="repo")],
+            log_dir=tmp_path / "logs",
+        )
+        daemon = WatchDaemon(config=config, config_path=tmp_path / "watch.toml")
+        daemon._current_repos = {"repo": config.repos[0]}
+        daemon._restarts["repo"] = {
+            "count": 5,
+            "next_attempt": 0.0,
+            "started_at": time.monotonic() - 100000,
+        }
+        dead = MagicMock()
+        dead.poll.return_value = 1
+
+        with patch.object(WatchDaemon, "_start_watcher"):
+            daemon._children = {"repo": dead}
+            daemon._check_health()
+
+        assert daemon.restart_count("repo") == 1, "a long healthy run clears the history"
+
+    def test_reaping_a_child_clears_its_health_file(self, tmp_path):
+        """A killed child cannot clear its own file; the leftover reads as stalled."""
+        from code_review_graph.daemon import WatchDaemon
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _write_health(repo)
+        assert watch_health_path(repo).exists()
+
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        WatchDaemon._terminate_child("repo", proc, str(repo))
+
+        assert not watch_health_path(repo).exists()
 
     def test_daemon_health_check_warns_about_a_stalled_watcher(self, tmp_path, caplog):
         from code_review_graph.daemon import WatchDaemon

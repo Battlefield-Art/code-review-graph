@@ -186,25 +186,59 @@ the age of the last event each watcher processed:
 - `stalled` — the process is up but its observer threads are not, so nothing
   is being indexed. Check `crg-daemon logs --repo ALIAS`, then
   `crg-daemon restart`
+- `partial` — the watcher ran out of watch slots and fell back to one recursive
+  watch. Still complete, just no longer filtering ignored trees; raise
+  `CRG_MAX_WATCH_SCHEDULES` to get the filtering back
 - `unknown` — the watcher has not published health yet (it just started, or it
   predates this feature)
-- `dead` — the process itself exited; the daemon restarts these automatically
+- `dead` — the process itself exited; the daemon restarts these, with an
+  exponential backoff so a repo that cannot start does not repay a full initial
+  build every 30 seconds
 
-A watcher that detects its own dead observer now logs an error and exits
-non-zero so the daemon restarts it, instead of sitting there quietly (#811).
+A watcher that detects its own dead observer logs an error and exits non-zero so
+the daemon restarts it, instead of sitting there quietly (#811). Deleting a
+watched directory is *not* treated as a dead watcher — the watch is simply
+released.
 
 Watch mode only registers OS watches for directories that survive the ignore
 patterns, so `node_modules/`, `.git/` and build output no longer generate
-events at all. Related knobs, all optional:
+events at all. Directories that appear or disappear later are picked up from a
+per-tick listing of each non-recursive watch (roughly 0.1 ms), not from
+directory events: macOS delivers no directory event at all for a child of a
+non-recursive watch, so an event-driven design would never notice a new
+top-level directory. Related knobs, all optional:
 
 - `CRG_MAX_WATCH_SCHEDULES` (default 24) — cap on separate watches; a repo
   needing more falls back to one recursive watch on the root
 - `CRG_WATCH_PLAN_DEPTH` (default 3) — how deep the planner may split
 - `CRG_WATCH_SPLIT_MIN_DIRS` (default 4) — smallest ignored tree worth its own
   watch
-- `CRG_NESTED_OUTPUT_SCAN=0` — stop treating nested `target/`, `build/`,
-  `.next/` and `.nuxt/` as build output even when a sibling `pom.xml`,
-  `Cargo.toml`, `build.gradle` or `next.config.js` says they are
+- `CRG_RESTART_BACKOFF` (default 30s), `CRG_RESTART_BACKOFF_MAX` (default 900s),
+  `CRG_RESTART_HEALTHY_AFTER` (default 600s) — daemon restart backoff
+
+## A directory disappeared from the graph
+
+Nested `target/`, `build/`, `.next/` and `.nuxt/` directories are treated as
+build output when a sibling manifest says so (`pom.xml`, `Cargo.toml`,
+`build.sbt`, `build.gradle`, `next.config.*`, `nuxt.config.*`). Each build logs
+what it excluded:
+
+```
+Excluding 2 nested build-output directories (a sibling manifest marks them as
+build output; keep one with '!<path>' in .code-review-graphignore):
+moduleA/target, moduleB/target
+```
+
+If one of those really is source, keep it with a `!` line in
+`.code-review-graphignore`:
+
+```
+!moduleA/target
+```
+
+`!` lines only opt a path out of this automatic detection; they do not negate
+your explicit ignore patterns. `CRG_NESTED_OUTPUT_SCAN=0` turns the detection
+off for the whole repository.
 
 ## Embeddings not working
 - Install with: `pip install "code-review-graph[embeddings]"`
