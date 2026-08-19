@@ -709,6 +709,158 @@ class TestInjectClaudeMd:
         assert second_content.count(_CLAUDE_MD_SECTION_MARKER) == 1
 
 
+def _legacy_sections(*, copilot: bool) -> list[str]:
+    """Recorded past blocks, longest first. Copilot ones carry YAML front matter."""
+    return [
+        block
+        for block in skills_module.LEGACY_INSTRUCTION_SECTIONS
+        if block.startswith("---\n") is copilot
+    ]
+
+
+class TestManagedBlockUpgrade:
+    """Reinstall must replace an older generated block, not silently skip it.
+
+    Regression test for #314: the injector only checked whether the opening
+    marker was present, so anyone who installed before the guardrails landed
+    kept the old text forever and reinstalling was a no-op.
+    """
+
+    OLDER = _legacy_sections(copilot=False)[0]
+
+    def test_reinstall_upgrades_an_older_generated_section(self, tmp_path):
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text(self.OLDER, encoding="utf-8")
+
+        assert inject_claude_md(tmp_path) == "updated"
+
+        content = claude_md.read_text(encoding="utf-8")
+        assert content == skills_module._CLAUDE_MD_SECTION
+        assert self.OLDER not in content
+        assert "### Verify in the source" in content
+        assert content.count(_CLAUDE_MD_SECTION_MARKER) == 1
+
+    def test_reinstall_over_current_section_is_byte_idempotent(self, tmp_path):
+        claude_md = tmp_path / "CLAUDE.md"
+        assert inject_claude_md(tmp_path) == "created"
+        first = claude_md.read_bytes()
+        stat_before = claude_md.stat().st_mtime_ns
+
+        assert inject_claude_md(tmp_path) == "unchanged"
+
+        assert claude_md.read_bytes() == first
+        # "unchanged" must not rewrite the file at all.
+        assert claude_md.stat().st_mtime_ns == stat_before
+
+    def test_hand_edited_block_is_preserved_and_reported(self, tmp_path):
+        edited = self.OLDER.replace("### Key Tools", "### Key Tools (our notes)")
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text(edited, encoding="utf-8")
+
+        assert inject_claude_md(tmp_path) == "conflict"
+
+        assert claude_md.read_text(encoding="utf-8") == edited
+
+    def test_user_content_around_the_block_survives_an_upgrade(self, tmp_path):
+        head = "# House rules\n\nNever force push.\n\n"
+        tail = "\n## Deploy notes\n\nRun the migration first.\n"
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text(head + self.OLDER + tail, encoding="utf-8")
+
+        assert inject_claude_md(tmp_path) == "updated"
+
+        content = claude_md.read_text(encoding="utf-8")
+        assert content == head + skills_module._CLAUDE_MD_SECTION + tail
+        assert content.startswith(head)
+        assert content.endswith(tail)
+
+    def test_duplicate_stale_blocks_collapse_to_one(self, tmp_path):
+        """#558 left repeat installs stacking blocks; upgrade must not keep both."""
+        older_two = _legacy_sections(copilot=False)[1]
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text(self.OLDER + "\n" + older_two, encoding="utf-8")
+
+        assert inject_claude_md(tmp_path) == "updated"
+
+        content = claude_md.read_text(encoding="utf-8")
+        assert content.count(_CLAUDE_MD_SECTION_MARKER) == 1
+        assert skills_module._CLAUDE_MD_SECTION in content
+
+    def test_missing_file_is_still_created(self, tmp_path):
+        assert not (tmp_path / "CLAUDE.md").exists()
+
+        assert inject_claude_md(tmp_path) == "created"
+
+        assert (tmp_path / "CLAUDE.md").read_text(encoding="utf-8") == (
+            skills_module._CLAUDE_MD_SECTION
+        )
+
+    def test_new_sections_carry_an_end_marker(self, tmp_path):
+        end = skills_module._CLAUDE_MD_SECTION_END_MARKER
+        inject_claude_md(tmp_path)
+        skills_module.inject_platform_instructions(tmp_path, target="all")
+
+        names = ["CLAUDE.md", *skills_module._PLATFORM_INSTRUCTION_FILES]
+        for name in names:
+            content = (tmp_path / name).read_text(encoding="utf-8")
+            assert content.count(end) == 1, name
+            assert content.index(_CLAUDE_MD_SECTION_MARKER) < content.index(end), name
+
+    def test_every_platform_file_upgrades_from_its_older_section(self, tmp_path):
+        older_copilot = _legacy_sections(copilot=True)[0]
+        for name in skills_module._PLATFORM_INSTRUCTION_FILES:
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            custom = name in skills_module._PLATFORM_INSTRUCTION_CUSTOM_SECTIONS
+            path.write_text(older_copilot if custom else self.OLDER, encoding="utf-8")
+
+        outcomes = skills_module.inject_instruction_files(tmp_path, target="all")
+
+        for name in skills_module._PLATFORM_INSTRUCTION_FILES:
+            assert outcomes[name] == "updated", name
+            content = (tmp_path / name).read_text(encoding="utf-8")
+            assert "### Verify in the source" in content, name
+            assert "ALWAYS use the" not in content, name
+
+    def test_legacy_sections_are_exact_and_ordered_longest_first(self):
+        legacy = skills_module.LEGACY_INSTRUCTION_SECTIONS
+        assert len(set(legacy)) == len(legacy)
+        assert all(_CLAUDE_MD_SECTION_MARKER in block for block in legacy)
+        known = skills_module._known_instruction_sections()
+        assert list(known) == sorted(known, key=len, reverse=True)
+        assert skills_module._CLAUDE_MD_SECTION in known
+        assert skills_module._COPILOT_SECTION in known
+
+
+class TestInjectInstructionFilesOutcomes:
+    def test_reports_created_then_unchanged(self, tmp_path):
+        first = skills_module.inject_instruction_files(tmp_path, target="all")
+        assert set(first) == {"CLAUDE.md", *skills_module._PLATFORM_INSTRUCTION_FILES}
+        assert set(first.values()) == {"created"}
+
+        second = skills_module.inject_instruction_files(tmp_path, target="all")
+        assert set(second.values()) == {"unchanged"}
+
+    def test_reports_conflict_without_touching_the_file(self, tmp_path):
+        edited = _CLAUDE_MD_SECTION_MARKER + "\n## Our own rules\n"
+        (tmp_path / "CLAUDE.md").write_text(edited, encoding="utf-8")
+
+        outcomes = skills_module.inject_instruction_files(tmp_path, target="claude")
+
+        assert outcomes == {"CLAUDE.md": "conflict"}
+        assert (tmp_path / "CLAUDE.md").read_text(encoding="utf-8") == edited
+
+    def test_platform_wrapper_still_returns_written_filenames(self, tmp_path):
+        first = inject_platform_instructions(tmp_path, target="windsurf")
+        assert first == [".windsurfrules"]
+        assert inject_platform_instructions(tmp_path, target="windsurf") == []
+
+        (tmp_path / ".windsurfrules").write_text(
+            _legacy_sections(copilot=False)[0], encoding="utf-8"
+        )
+        assert inject_platform_instructions(tmp_path, target="windsurf") == [".windsurfrules"]
+
+
 class TestInjectPlatformInstructionsFiltering:
     def test_all_writes_every_file(self, tmp_path):
         updated = inject_platform_instructions(tmp_path, target="all")
