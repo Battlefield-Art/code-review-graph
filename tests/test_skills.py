@@ -801,6 +801,64 @@ class TestInjectPlatformInstructionsFiltering:
         assert not (tmp_path / "AGENTS.md").exists()
 
 
+class TestInstructionGuardrails:
+    """Every generated instruction file must carry the source-verification guardrails.
+
+    Regression test for #314: the generated text used to tell agents to ALWAYS use
+    the graph before reading source and to fall back to file search ONLY when the
+    graph did not cover the need, which made models act on graph summaries alone.
+    """
+
+    # Each guardrail is asserted by a fragment short enough to survive rewrapping.
+    GUARDRAIL_FRAGMENTS = (
+        "Do not change code from graph output alone",
+        "read the implementation and the relevant tests before concluding",
+        "migrations, retries, fallbacks",
+        "the source wins",
+        'can mean "not indexed" or "not statically visible"',
+    )
+
+    @staticmethod
+    def _instruction_files(tmp_path: Path) -> dict[str, str]:
+        inject_claude_md(tmp_path)
+        inject_platform_instructions(tmp_path, target="all")
+        names = ["CLAUDE.md", *skills_module._PLATFORM_INSTRUCTION_FILES]
+        return {
+            name: (tmp_path / name).read_text(encoding="utf-8") for name in names
+        }
+
+    def test_every_instruction_file_has_all_guardrails(self, tmp_path):
+        written = self._instruction_files(tmp_path)
+        assert len(written) == 9
+        for name, content in written.items():
+            assert "### Verify in the source" in content, name
+            for fragment in self.GUARDRAIL_FRAGMENTS:
+                assert fragment in content, f"{name} is missing: {fragment}"
+
+    def test_no_instruction_file_claims_the_graph_replaces_source(self, tmp_path):
+        for name, content in self._instruction_files(tmp_path).items():
+            assert "ALWAYS use the" not in content, name
+            assert "**only** when the graph" not in content, name
+
+    def test_shared_guardrail_text_is_identical_across_platforms(self, tmp_path):
+        written = self._instruction_files(tmp_path)
+        for name, content in written.items():
+            assert skills_module._INSTRUCTION_GUARDRAILS in content, name
+            assert skills_module._INSTRUCTION_INTRO in content, name
+
+    def test_guardrails_stay_small(self):
+        """The section ships in every user's context, so cap its growth."""
+        assert skills_module._INSTRUCTION_GUARDRAILS.count("\n") + 1 <= 9
+        assert skills_module._CLAUDE_MD_SECTION.count("\n") <= 46
+        assert skills_module._COPILOT_SECTION.count("\n") <= 53
+
+    def test_skill_templates_do_not_demand_graph_only_work(self):
+        for filename, skill in skills_module._SKILLS.items():
+            body = skill["body"]
+            assert "ALWAYS start with" not in body, filename
+            assert "Read the implementation and its tests before changing code." in body, filename
+
+
 class TestCodeBuddyPlatform:
     def test_platform_uses_official_project_mcp_contract(self):
         assert "codebuddy" in PLATFORMS

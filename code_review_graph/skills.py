@@ -891,12 +891,14 @@ _SKILLS: dict[str, dict[str, str]] = {
             "- Use `children_of` on a file to see all its functions and classes.\n"
             "- Use `find_large_functions_tool` to identify complex code.\n\n"
             "## Token Efficiency Rules\n"
-            '- ALWAYS start with `get_minimal_context_tool(task="<your task>")` '
-            "before any other graph tool.\n"
+            '- Start with `get_minimal_context_tool(task="<your task>")` '
+            "before other graph tools.\n"
             '- Use `detail_level="minimal"` on all calls. Only escalate to '
             '"standard" when minimal is insufficient.\n'
             "- Target: complete any review/debug/refactor task in ≤5 tool calls "
-            "and ≤800 total output tokens."
+            "and ≤800 total output tokens.\n"
+            "- Read the implementation and its tests before changing code. The graph "
+            "narrows scope; it does not replace the source."
         ),
     },
     "review-changes.md": {
@@ -919,12 +921,14 @@ _SKILLS: dict[str, dict[str, str]] = {
             "- Suggested improvements\n"
             "- Overall merge recommendation\n\n"
             "## Token Efficiency Rules\n"
-            '- ALWAYS start with `get_minimal_context_tool(task="<your task>")` '
-            "before any other graph tool.\n"
+            '- Start with `get_minimal_context_tool(task="<your task>")` '
+            "before other graph tools.\n"
             '- Use `detail_level="minimal"` on all calls. Only escalate to '
             '"standard" when minimal is insufficient.\n'
             "- Target: complete any review/debug/refactor task in ≤5 tool calls "
-            "and ≤800 total output tokens."
+            "and ≤800 total output tokens.\n"
+            "- Read the implementation and its tests before changing code. The graph "
+            "narrows scope; it does not replace the source."
         ),
     },
     "debug-issue.md": {
@@ -945,12 +949,14 @@ _SKILLS: dict[str, dict[str, str]] = {
             "- Look at affected flows to find the entry point that triggers the bug.\n"
             "- Recent changes are the most common source of new issues.\n\n"
             "## Token Efficiency Rules\n"
-            '- ALWAYS start with `get_minimal_context_tool(task="<your task>")` '
-            "before any other graph tool.\n"
+            '- Start with `get_minimal_context_tool(task="<your task>")` '
+            "before other graph tools.\n"
             '- Use `detail_level="minimal"` on all calls. Only escalate to '
             '"standard" when minimal is insufficient.\n'
             "- Target: complete any review/debug/refactor task in ≤5 tool calls "
-            "and ≤800 total output tokens."
+            "and ≤800 total output tokens.\n"
+            "- Read the implementation and its tests before changing code. The graph "
+            "narrows scope; it does not replace the source."
         ),
     },
     "refactor-safely.md": {
@@ -973,12 +979,14 @@ _SKILLS: dict[str, dict[str, str]] = {
             "- Use `get_affected_flows_tool` to ensure no critical paths are broken.\n"
             "- Run `find_large_functions_tool` to identify decomposition targets.\n\n"
             "## Token Efficiency Rules\n"
-            '- ALWAYS start with `get_minimal_context_tool(task="<your task>")` '
-            "before any other graph tool.\n"
+            '- Start with `get_minimal_context_tool(task="<your task>")` '
+            "before other graph tools.\n"
             '- Use `detail_level="minimal"` on all calls. Only escalate to '
             '"standard" when minimal is insufficient.\n'
             "- Target: complete any review/debug/refactor task in ≤5 tool calls "
-            "and ≤800 total output tokens."
+            "and ≤800 total output tokens.\n"
+            "- Read the implementation and its tests before changing code. The graph "
+            "narrows scope; it does not replace the source."
         ),
     },
 }
@@ -1332,14 +1340,25 @@ def install_codex_hooks(repo_root: Path) -> Path:
 
 _CLAUDE_MD_SECTION_MARKER = "<!-- code-review-graph MCP tools -->"
 
+# Shared across every platform instruction file so the wording stays identical.
+_INSTRUCTION_INTRO = """**This project has a knowledge graph. Start with the code-review-graph
+MCP tools to narrow scope, then read the source.** The graph is cheaper than scanning files and
+gives you structural context (callers, dependents, test coverage) that file search cannot."""
+
+_INSTRUCTION_GUARDRAILS = """### Verify in the source
+
+- Narrow scope with the graph, then read the source. Do not change code from graph output alone.
+- For any non-trivial change, read the implementation and the relevant tests before concluding.
+- Verify the exact source when touching behavior, database logic, migrations, retries, fallbacks,
+  recovery, or compatibility code.
+- When the graph and the source disagree, the source wins. The graph may be stale or may not
+  model that relationship.
+- An empty graph result can mean "not indexed" or "not statically visible", not "does not exist"."""
+
 _CLAUDE_MD_SECTION = f"""{_CLAUDE_MD_SECTION_MARKER}
 ## MCP Tools: code-review-graph
 
-**IMPORTANT: This project has a knowledge graph. ALWAYS use the
-code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
-the codebase.** The graph is faster, cheaper (fewer tokens), and gives
-you structural context (callers, dependents, test coverage) that file
-scanning cannot.
+{_INSTRUCTION_INTRO}
 
 ### When to use graph tools FIRST
 
@@ -1349,7 +1368,7 @@ scanning cannot.
 - **Finding relationships**: `query_graph_tool` with callers_of/callees_of/imports_of/tests_for
 - **Architecture questions**: `get_architecture_overview_tool` + `list_communities_tool`
 
-Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
+{_INSTRUCTION_GUARDRAILS}
 
 ### Key Tools
 
@@ -1384,11 +1403,7 @@ description: >-
 {_CLAUDE_MD_SECTION_MARKER}
 ## MCP Tools: code-review-graph
 
-**IMPORTANT: This project has a knowledge graph. ALWAYS use the
-code-review-graph MCP tools BEFORE using file/search tools to
-explore the codebase.** The graph is faster, cheaper (fewer
-tokens), and gives you structural context (callers, dependents,
-test coverage) that file scanning cannot.
+{_INSTRUCTION_INTRO}
 
 ### When to use graph tools FIRST
 
@@ -1398,8 +1413,7 @@ test coverage) that file scanning cannot.
 - **Finding relationships**: `query_graph_tool` callers_of/callees_of
 - **Architecture questions**: `get_architecture_overview_tool`
 
-Fall back to file/search tools **only** when the graph doesn't
-cover what you need.
+{_INSTRUCTION_GUARDRAILS}
 
 ### Key Tools
 

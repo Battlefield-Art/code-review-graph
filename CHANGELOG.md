@@ -23,6 +23,14 @@
 
 ### Fixed
 
+- The generated instruction sections no longer tell agents to always use the
+  graph before reading source and to fall back to file search only when the
+  graph misses. Every platform instruction file now carries the same short
+  guardrails: narrow scope with the graph, read the implementation and its
+  tests before a non-trivial change, prefer the source when the two disagree,
+  and treat an empty graph result as possibly unindexed rather than absent.
+  CONTRIBUTING.md also states what a new platform target must include before
+  it will be reviewed (#314).
 - C# receiver calls (`Service.StaticCall()`, `obj.Method()`, `obj?.Method()`)
   now resolve to canonical method nodes using receiver-type and namespace
   evidence recorded at parse time, so `callers_of`, `get_impact_radius`, and
