@@ -233,6 +233,28 @@ class TestGoParsing:
         assert len(calls) == 200
         assert builds == ["ManyCalls"]
 
+    def test_generic_methods_attached_to_receiver(self):
+        nodes, edges = self.parser.parse_bytes(
+            Path("generic.go"),
+            b"""package sample
+type Box[T any] struct{}
+func (b Box[T]) Value() {}
+func (b *Box[T]) Pointer() {}
+""",
+        )
+
+        parents = {
+            node.name: node.parent_name
+            for node in nodes
+            if node.kind == "Function"
+        }
+        assert parents == {"Value": "Box", "Pointer": "Box"}
+        assert {
+            edge.target.rsplit("::", 1)[-1]
+            for edge in edges
+            if edge.kind == "CONTAINS" and edge.source.endswith("::Box")
+        } == {"Box.Value", "Box.Pointer"}
+
 
 class TestRustParsing:
     def setup_method(self):
@@ -360,6 +382,42 @@ class TestJavaParsing:
     def test_finds_calls(self):
         calls = [e for e in self.edges if e.kind == "CALLS"]
         assert len(calls) >= 3
+
+
+class TestJavaMethodNames:
+    """Regression tests for #804: Java method/constructor names come from the
+    grammar ``name`` field (same approach as C# after #794), not the first
+    ``identifier`` child walk.
+    """
+
+    def _parse(self, source: str, tmp_path):
+        p = tmp_path / "x.java"
+        p.write_text(source, encoding="utf-8")
+        return CodeParser().parse_file(p)
+
+    def test_methods_and_constructors_use_name_field(self, tmp_path):
+        nodes, _ = self._parse(
+            "public class Suite {\n"
+            "    public Suite() { }\n"
+            "    public String getLabel() { return \"\"; }\n"
+            "    public User createUser() { return null; }\n"
+            "    public void plainVoid() { }\n"
+            "    public List<String> genericReturn() { return null; }\n"
+            "}\n",
+            tmp_path,
+        )
+        funcs = [n for n in nodes if n.kind == "Function"]
+        assert {f.name for f in funcs} == {
+            "Suite",
+            "getLabel",
+            "createUser",
+            "plainVoid",
+            "genericReturn",
+        }
+        assert len(funcs) == 5
+        assert "String" not in {f.name for f in funcs}
+        assert "User" not in {f.name for f in funcs}
+        assert "List" not in {f.name for f in funcs}
 
 
 class TestJavaImportResolution:
@@ -3786,6 +3844,17 @@ class TestSQLParsing:
         targets = {e.target for e in imports}
         # active_orders view and archive procedure both reference orders/users
         assert "orders" in targets or "users" in targets
+
+    def test_multiple_if_not_exists_creates_keep_distinct_references(self):
+        _, edges = self.parser.parse_bytes(
+            Path("idempotent_schema.sql"),
+            b"CREATE TABLE IF NOT EXISTS customers (id INT);\n"
+            b"CREATE TABLE IF NOT EXISTS invoices (id INT);\n",
+        )
+        targets = [e.target for e in edges if e.kind == "IMPORTS_FROM"]
+        assert targets == ["customers", "invoices"]
+
+
 class TestZigParsing:
     def setup_method(self):
         self.parser = CodeParser()
