@@ -410,6 +410,39 @@ class TestNewDirectoryAdoption:
             "node_modules" in path for path, _ in observer.scheduled
         ), "the adopted module's node_modules was handed to the OS"
 
+    def test_a_tight_budget_narrows_the_plan_before_promoting(self, tmp_path):
+        """A fix for #811 must not be able to re-create #811.
+
+        Promoting the parent — usually the repository root — hands every
+        ignored tree in the repository back to the OS. A coarser plan for the
+        new directory alone costs one slot and leaves the rest filtered.
+        """
+        for index in range(6):
+            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        (tmp_path / "keep").mkdir()
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer,
+            tmp_path,
+            _load_ignore_patterns(tmp_path),
+            health_path=None,
+            max_schedules=3,
+        )
+        supervisor.schedule_initial(MagicMock())
+        assert len(supervisor.watched_paths) == 2, "precondition: one slot left"
+
+        module = tmp_path / "moduleA"
+        (module / "src" / "lib").mkdir(parents=True)
+        for index in range(6):
+            (module / "src" / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        adopted, _ = supervisor.sync_watches()
+
+        assert adopted == [str(module)]
+        assert supervisor.degraded is False, "the repository root was promoted"
+        assert (str(tmp_path), True) not in observer.scheduled
+        assert str(tmp_path) in supervisor._shallow, "the root lost its filtering"
+        assert (str(module), True) in observer.scheduled, "the new module is unwatched"
+
     def test_promotion_releases_grandchildren_too(self, tmp_path):
         """A stale grandchild watch duplicates every event and burns a slot."""
         (tmp_path / "src").mkdir()
@@ -582,6 +615,20 @@ class TestObserverLiveness:
         thread.join(timeout=5)
 
         assert supervisor.check_liveness() == ([], [])
+
+    def test_failed_reschedule_is_reported_rather_than_counted_as_repaired(self, tmp_path):
+        """ENOSPC from inotify is #811's own trigger; it must not pass as a repair."""
+        supervisor, observer, watched, thread, gate = self._watched(tmp_path)
+        assert supervisor.check_liveness() == ([], [])
+
+        gate.set()
+        thread.join(timeout=5)
+        observer.schedule = MagicMock(side_effect=OSError("No space left on device"))
+        dead, repaired = supervisor.check_liveness()
+
+        assert repaired == [], "an unwatched directory was reported as repaired"
+        assert dead == ["fake-inotify-buffer"]
+        assert str(watched) not in supervisor._repaired_roots, "bookkeeping outlived the watch"
 
     def test_replaced_directory_is_released_and_re_adopted(self, tmp_path):
         """The identity change has to reach the watch list, not just liveness."""
@@ -798,6 +845,72 @@ class TestWatchLoop:
             observer.assert_not_called()
         finally:
             store.close()
+
+    def test_repair_reconciles_files_deleted_during_the_outage(self, tmp_path):
+        """A repaired watch must re-read the directory in both directions.
+
+        Only the deletion event contributes the *stored* descendants, and watch
+        batches run with ``reconcile_stale=False``, so a file removed while the
+        watch was down keeps its rows forever if the repair only announces a
+        creation — the silent divergence this whole issue is about.
+        """
+        source_dir = tmp_path / "src"
+        source_dir.mkdir()
+        for index in range(6):
+            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        (source_dir / "doomed.py").write_text("def doomed():\n    return 1\n", encoding="utf-8")
+        (source_dir / "keeper.py").write_text("def keeper():\n    return 2\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        incremental_update(
+            tmp_path, store, changed_files=["src/doomed.py", "src/keeper.py"]
+        )
+        assert any(p.endswith("doomed.py") for p in store.get_all_files())
+
+        observer = FakeObserver()
+        thread, gate = _live_thread()
+        reader = GraphStore(tmp_path / "graph.db")
+        # The tick driver replaces time.sleep; keep the real one for polling.
+        real_sleep = time.sleep
+
+        def emitter_appears():
+            observer.emitters = [FakeEmitter(thread, root=str(source_dir))]
+
+        def outage():
+            gate.set()
+            thread.join(timeout=5)
+            (source_dir / "doomed.py").unlink()
+            (source_dir / "arrived.py").write_text(
+                "def arrived():\n    return 3\n", encoding="utf-8"
+            )
+
+        def settle():
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                files = reader.get_all_files()
+                if any(p.endswith("arrived.py") for p in files) and not any(
+                    p.endswith("doomed.py") for p in files
+                ):
+                    return
+                real_sleep(0.05)
+
+        try:
+            with patch("code_review_graph.incremental._DEBOUNCE_SECONDS", 0.01):
+                self._watch_with(
+                    tmp_path,
+                    store,
+                    observer,
+                    _tick_driver(emitter_appears, outage, settle),
+                )
+            files = reader.get_all_files()
+        finally:
+            store.close()
+            reader.close()
+
+        assert any(p.endswith("arrived.py") for p in files), "the repair never re-read the tree"
+        assert any(p.endswith("keeper.py") for p in files), "an untouched file was dropped"
+        assert not any(
+            p.endswith("doomed.py") for p in files
+        ), "a file deleted during the outage kept its rows"
 
     def test_health_is_published_before_the_first_build(self, tmp_path):
         """A repo whose first build takes minutes must not read as stalled."""

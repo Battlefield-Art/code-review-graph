@@ -1887,18 +1887,38 @@ class _WatchSupervisor:
         if _should_ignore(relative, self._ignore_patterns):
             logger.debug("Not watching ignored directory %s", relative)
             return False
-        _, plan = _plan_watch_subtree(
-            Path(candidate), self._repo_root, self._ignore_patterns, 0, _WATCH_PLAN_DEPTH, {}
-        )
-        if len(self._watches) + len(plan) > self._max_schedules:
-            # Covering less would be silent blindness; a recursive watch on the
-            # parent covers everything, at the price of watching ignored trees.
+        plan = self._affordable_plan(Path(candidate))
+        if plan is None:
+            # Promoting the parent — often the repository root — hands every
+            # ignored tree under it back to the OS, which is the condition
+            # #811 is about.  It is the last resort, never the first.
             self._promote_to_recursive(os.path.dirname(candidate))
             return True
         for path, recursive in plan:
             self._schedule(path, recursive=recursive)
         logger.info("Watching new directory %s (%d watch(es))", relative, len(plan))
         return True
+
+    def _affordable_plan(self, directory: Path) -> list[tuple[Path, bool]] | None:
+        """The most selective plan for *directory* that fits the budget.
+
+        Mirrors :func:`_plan_watch_paths`: try the deepest split first, then
+        shallower ones, then a single recursive watch on the directory itself.
+        Only when even one slot is unavailable does the caller fall back to
+        promoting the parent.
+        """
+        cache: dict[Path, list[Path]] = {}
+        available = self._max_schedules - len(self._watches)
+        if available <= 0:
+            return None
+        for depth in range(max(1, _WATCH_PLAN_DEPTH), 0, -1):
+            _, plan = _plan_watch_subtree(
+                directory, self._repo_root, self._ignore_patterns, 0, depth, cache
+            )
+            if len(plan) <= available:
+                return plan
+        # One recursive watch still filters every other directory in the repo.
+        return [(directory, True)]
 
     def _promote_to_recursive(self, parent: str) -> None:
         """Trade filtering for coverage when the watch budget runs out."""
@@ -2016,6 +2036,14 @@ class _WatchSupervisor:
             recursive = root not in self._shallow
             self._release_directory(root)  # also clears the repair mark
             self._schedule(Path(root), recursive=recursive)
+            if root not in self._watches:
+                # Rescheduling failed — ENOSPC from inotify is the very trigger
+                # behind #811 — so the directory is now unwatched.  That is a
+                # loss of coverage, and the one thing it must not do is pass
+                # quietly as a repair.
+                logger.error("Could not reschedule the watch on %s", root)
+                dead.append(thread.name)
+                continue
             self._repaired_roots.add(root)
             repaired.append(root)
         self._live_threads = still_present
@@ -2345,7 +2373,7 @@ def watch(
         RuntimeError: if a watch update fails, or if the filesystem observer
             stops running.
     """
-    from watchdog.events import DirCreatedEvent
+    from watchdog.events import DirCreatedEvent, DirDeletedEvent
     from watchdog.observers import Observer
 
     # One boundary, once: ``--repo .`` reaches here relative, and every path
@@ -2394,6 +2422,12 @@ def watch(
             for path in repaired:
                 # A rescheduled watch missed whatever happened while it was
                 # down, so re-read the directory rather than trust the gap.
+                # Both halves are needed: the deletion contributes the stored
+                # descendants, without which a file removed during the outage
+                # keeps its rows, and the creation contributes what is on disk
+                # now.  Watch batches run with reconcile_stale=False, so
+                # nothing else would ever catch the stale side.
+                handler.dispatch(DirDeletedEvent(path))
                 handler.dispatch(DirCreatedEvent(path))
             if dead:
                 names = ", ".join(dead)
