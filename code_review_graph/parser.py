@@ -12194,13 +12194,17 @@ class CodeParser:
     ) -> None:
         """Extract REFERENCES from identifier arguments (callbacks)."""
         for ch in args_node.children:
-            if ch.type == "identifier":
-                name = ch.text.decode("utf-8", errors="replace")
-                self._emit_reference_if_known(
-                    name, language, file_path, caller, edges,
-                    import_map, defined_names,
-                    line=ch.start_point[0] + 1,
-                )
+            reference_node = ch
+            if ch.type == "keyword_argument" and language == "python":
+                reference_node = ch.child_by_field_name("value")
+            if reference_node is None or reference_node.type != "identifier":
+                continue
+            name = reference_node.text.decode("utf-8", errors="replace")
+            self._emit_reference_if_known(
+                name, language, file_path, caller, edges,
+                import_map, defined_names,
+                line=reference_node.start_point[0] + 1,
+            )
 
     def _extract_solidity_constructs(
         self,
