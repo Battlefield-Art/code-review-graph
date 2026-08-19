@@ -466,3 +466,90 @@ def test_direct_call_returns_none_on_failure(repo, monkeypatch):
         assert empty_query_confidence(
             store, repo, "callers_of", "whatever", None,
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# The not_found branch
+#
+# For every pattern except consumers_of and file_summary, an unresolved target
+# returns early with status "not_found" and never reaches the empty-result
+# path. That branch is where an unindexed target actually lands in production,
+# so the marker has to be attached there too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["callers_of", "callees_of", "imports_of", "tests_for", "inheritors_of"],
+)
+def test_not_found_response_carries_a_marker(repo, pattern):
+    """An unresolved target must never come back as a bare not_found."""
+    result = query_graph(
+        pattern=pattern, target="NoSuchSymbol", repo_root=str(repo),
+    )
+
+    assert result["status"] == "not_found"
+    assert result["confidence"]
+    assert "NoSuchSymbol" in result["confidence"]
+
+
+def test_unresolved_target_on_a_stale_graph_says_stale_not_unindexed(repo, monkeypatch):
+    """A stale graph explains the miss and has a remedy, so it must win.
+
+    Calling it "not indexed" reads like a permanent limitation and sends the
+    agent looking for a parser gap that is not there.
+    """
+    with _store(repo) as store:
+        store.set_metadata("git_head_sha", "0" * 40)
+        store.commit()
+
+    monkeypatch.setattr(uncertainty, "_live_git_head", lambda root: "f" * 40)
+    result = query_graph(
+        pattern="callers_of", target="NoSuchSymbol", repo_root=str(repo),
+    )
+
+    assert "stale" in result["confidence"]
+    assert "update" in result["confidence"]
+    assert "not indexed" not in result["confidence"]
+
+
+def test_unresolved_target_on_a_current_graph_says_not_indexed(repo, monkeypatch):
+    """With currency established, not-indexed is the honest answer."""
+    with _store(repo) as store:
+        store.set_metadata("git_head_sha", "a" * 40)
+        store.commit()
+
+    monkeypatch.setattr(uncertainty, "_live_git_head", lambda root: "a" * 40)
+    result = query_graph(
+        pattern="callers_of", target="NoSuchSymbol", repo_root=str(repo),
+    )
+
+    assert "not indexed" in result["confidence"]
+    assert "stale" not in result["confidence"]
+
+
+def test_unresolved_target_on_an_empty_graph_says_build(tmp_path):
+    """Nothing indexed at all is a build problem, not a missing symbol."""
+    root = (tmp_path / "empty").resolve()
+    (root / ".code-review-graph").mkdir(parents=True)
+    (root / ".git").mkdir()
+    GraphStore(root / ".code-review-graph" / "graph.db").close()
+
+    result = query_graph(
+        pattern="callers_of", target="Anything", repo_root=str(root),
+    )
+
+    assert "graph is empty" in result["confidence"]
+    assert "build" in result["confidence"]
+
+
+def test_resolved_target_with_results_still_has_no_marker(repo):
+    """The token-budget guarantee holds on the not_found-adjacent path too."""
+    result = query_graph(
+        pattern="callers_of",
+        target=f"{(repo / 'auth.py').as_posix()}::login",
+        repo_root=str(repo),
+    )
+
+    assert result["result_count"] >= 1
+    assert "confidence" not in result

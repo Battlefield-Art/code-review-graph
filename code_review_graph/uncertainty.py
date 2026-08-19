@@ -245,6 +245,19 @@ def not_indexed_note(target: str) -> str:
     )
 
 
+def unresolved_stale_note(target: str) -> str:
+    """Say the target is missing from a graph that predates HEAD.
+
+    A stale graph explains the miss and has a remedy, so it outranks the
+    flat "not indexed" wording, which reads like a permanent limitation.
+    """
+    return _interpolated_target(
+        "graph is stale: no node matching '",
+        target,
+        "'; the graph predates HEAD, so run `code-review-graph update` first",
+    )
+
+
 def _confirmed_note(target: str, current: bool) -> str:
     """Say the zero is a real absence, so the agent can stop searching.
 
@@ -343,6 +356,14 @@ def empty_query_confidence(
     """
     try:
         if node is None:
+            if store.get_stats().total_nodes == 0:
+                return _bounded(
+                    "graph is empty: nothing is indexed, so this 0 says "
+                    "nothing about the code; run `code-review-graph build`"
+                )
+            stale, _unused = _staleness(store, root, None)
+            if stale:
+                return _bounded(unresolved_stale_note(target))
             return _bounded(not_indexed_note(target))
 
         stale, current = _staleness(store, root, getattr(node, "file_path", None))
