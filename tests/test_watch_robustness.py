@@ -94,6 +94,13 @@ class FakeObserver:
 
     def unschedule(self, watch_handle) -> None:
         self.unscheduled.append(watch_handle.path)
+        # watchdog drops the emitter (and its threads) with the watch; the
+        # liveness check depends on that, so the double must do it too.
+        self.emitters = [
+            emitter
+            for emitter in self.emitters
+            if getattr(getattr(emitter, "watch", None), "path", None) != watch_handle.path
+        ]
 
     def start(self) -> None:
         self.started = True
@@ -111,6 +118,7 @@ def _live_thread() -> tuple[threading.Thread, threading.Event]:
     thread = threading.Thread(target=gate.wait, name="fake-inotify-buffer", daemon=True)
     thread.start()
     return thread, gate
+
 
 
 def _tick_driver(*actions):
@@ -380,6 +388,54 @@ class TestNewDirectoryAdoption:
 
         assert vanished == [str(tmp_path / "services")]
 
+    def test_adopted_subtree_is_planned_like_the_repository(self, tmp_path):
+        """A module arriving from a branch switch must not re-register its junk.
+
+        Watching an adopted directory recursively would hand `node_modules`
+        and `target` straight back to the OS — the exposure #811 is about, for
+        everything created after startup.
+        """
+        supervisor, observer = self._supervisor(tmp_path)
+
+        module = tmp_path / "moduleA"
+        (module / "src").mkdir(parents=True)
+        for index in range(6):
+            (module / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        adopted, _ = supervisor.sync_watches()
+
+        assert adopted == [str(module)]
+        assert (str(module), False) in observer.scheduled, "module needs a shallow watch"
+        assert (str(module / "src"), True) in observer.scheduled
+        assert not any(
+            "node_modules" in path for path, _ in observer.scheduled
+        ), "the adopted module's node_modules was handed to the OS"
+
+    def test_promotion_releases_grandchildren_too(self, tmp_path):
+        """A stale grandchild watch duplicates every event and burns a slot."""
+        (tmp_path / "src").mkdir()
+        for index in range(6):
+            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        module = tmp_path / "moduleA"
+        (module / "src").mkdir(parents=True)
+        for index in range(6):
+            (module / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer,
+            tmp_path,
+            _load_ignore_patterns(tmp_path),
+            health_path=None,
+            max_schedules=4,
+        )
+        supervisor.schedule_initial(MagicMock())
+        assert str(module / "src") in supervisor.watched_paths, "precondition: grandchild watch"
+
+        (tmp_path / "services").mkdir()
+        supervisor.sync_watches()
+
+        assert supervisor.degraded is True
+        assert supervisor.watched_paths == [str(tmp_path)], "grandchildren outlived the promotion"
+
     def test_budget_exhaustion_degrades_to_a_recursive_watch(self, tmp_path):
         """Covering less would be silent blindness; cover more instead."""
         supervisor, observer = self._supervisor(tmp_path, max_schedules=2)
@@ -413,19 +469,44 @@ class TestNewDirectoryAdoption:
 
 
 class TestObserverLiveness:
+    def _watched(self, tmp_path, name="lib"):
+        """A supervisor with one real watch on tmp_path/<name>, plus its emitter."""
+        watched = tmp_path / name
+        watched.mkdir(exist_ok=True)
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(observer, tmp_path, [], health_path=None)
+        supervisor._handler = MagicMock()
+        supervisor._schedule(watched, recursive=True)
+        thread, gate = _live_thread()
+        observer.emitters = [FakeEmitter(thread, root=str(watched))]
+        return supervisor, observer, watched, thread, gate
+
     def test_dead_backend_reader_thread_is_reported(self, tmp_path):
         """The inotify shape: the emitter lives on, its buffer thread does not."""
-        thread, gate = _live_thread()
-        observer = FakeObserver()
-        observer.emitters = [FakeEmitter(thread)]
-        supervisor = _WatchSupervisor(observer, tmp_path, [], health_path=None)
+        supervisor, observer, watched, thread, gate = self._watched(tmp_path)
 
-        assert supervisor.dead_threads() == []
+        assert supervisor.check_liveness() == ([], [])
 
         gate.set()
         thread.join(timeout=5)
 
-        assert supervisor.dead_threads() == ["fake-inotify-buffer"]
+        # The directory is untouched, so the first death buys one reschedule.
+        dead, repaired = supervisor.check_liveness()
+        assert dead == []
+        assert repaired == [str(watched)]
+
+        # watchdog gives the rescheduled watch a fresh emitter; if that one
+        # dies too, the fault is real and has to stay loud.
+        replacement, replacement_gate = _live_thread()
+        observer.emitters = [FakeEmitter(replacement, root=str(watched))]
+        assert supervisor.check_liveness() == ([], [])
+
+        replacement_gate.set()
+        replacement.join(timeout=5)
+        dead, repaired = supervisor.check_liveness()
+
+        assert dead == ["fake-inotify-buffer"]
+        assert repaired == []
 
     def test_dead_emitter_thread_is_reported(self, tmp_path):
         """The Windows shape: the dispatch/emitter thread itself ends."""
@@ -444,12 +525,13 @@ class TestObserverLiveness:
         observer.emitters = [emitter]
         supervisor = _WatchSupervisor(observer, tmp_path, [], health_path=None)
 
-        assert supervisor.dead_threads() == []
+        assert supervisor.check_liveness() == ([], [])
 
         gate.set()
         emitter.join(timeout=5)
 
-        assert supervisor.dead_threads() == ["fake-emitter"]
+        # No watch root to attribute it to, so there is nothing to reschedule.
+        assert supervisor.check_liveness() == (["fake-emitter"], [])
 
     def test_unstarted_thread_is_never_mistaken_for_a_dead_one(self, tmp_path):
         """A watch scheduled mid-tick must not read as a corpse."""
@@ -457,14 +539,14 @@ class TestObserverLiveness:
         observer.emitters = [FakeEmitter(threading.Thread(target=lambda: None))]
         supervisor = _WatchSupervisor(observer, tmp_path, [], health_path=None)
 
-        assert supervisor.dead_threads() == []
-        assert supervisor.dead_threads() == []
+        assert supervisor.check_liveness() == ([], [])
+        assert supervisor.check_liveness() == ([], [])
 
     def test_unschedulable_observer_reports_no_deaths(self, tmp_path):
         """A mock or stub observer must not fake a death every tick."""
         supervisor = _WatchSupervisor(MagicMock(), tmp_path, [], health_path=None)
 
-        assert supervisor.dead_threads() == []
+        assert supervisor.check_liveness() == ([], [])
 
     def test_deleting_a_watched_directory_is_not_a_death(self, tmp_path):
         """Both backends stop an emitter whose own root disappears.
@@ -473,36 +555,55 @@ class TestObserverLiveness:
         daemon restarting on every exit, that is a restart loop paying for a
         full initial update each time.
         """
-        watched = tmp_path / "lib"
-        watched.mkdir()
-        thread, gate = _live_thread()
-        observer = FakeObserver()
-        observer.emitters = [FakeEmitter(thread, root=str(watched))]
-        supervisor = _WatchSupervisor(observer, tmp_path, [], health_path=None)
+        supervisor, _, watched, thread, gate = self._watched(tmp_path)
 
-        assert supervisor.dead_threads() == []
+        assert supervisor.check_liveness() == ([], [])
 
         shutil.rmtree(watched)
         gate.set()
         thread.join(timeout=5)
 
-        assert supervisor.dead_threads() == []
+        assert supervisor.check_liveness() == ([], [])
 
-    def test_dead_thread_whose_root_still_exists_is_a_death(self, tmp_path):
-        """The guard must not swallow the failure it was written for."""
-        watched = tmp_path / "lib"
-        watched.mkdir()
-        thread, gate = _live_thread()
-        observer = FakeObserver()
-        observer.emitters = [FakeEmitter(thread, root=str(watched))]
-        supervisor = _WatchSupervisor(observer, tmp_path, [], health_path=None)
+    def test_recreated_directory_is_not_a_death(self, tmp_path):
+        """`rm -rf src && mkdir src` inside one tick: same name, new directory.
 
-        assert supervisor.dead_threads() == []
+        Calling that a death exits the watcher *and* loses the recreated
+        contents, because the restarted watcher only reconciles stale rows
+        away. The watch is stale, not the watcher.
+        """
+        supervisor, _, watched, thread, gate = self._watched(tmp_path, name="src")
 
+        assert supervisor.check_liveness() == ([], [])
+
+        shutil.rmtree(watched)
+        watched.mkdir()  # same path, different inode — one tick, no gap
         gate.set()
         thread.join(timeout=5)
 
-        assert supervisor.dead_threads() == ["fake-inotify-buffer"]
+        assert supervisor.check_liveness() == ([], [])
+
+    def test_replaced_directory_is_released_and_re_adopted(self, tmp_path):
+        """The identity change has to reach the watch list, not just liveness."""
+        (tmp_path / "node_modules").mkdir()
+        for index in range(6):
+            (tmp_path / "node_modules" / f"pkg{index}").mkdir()
+        watched = tmp_path / "src"
+        watched.mkdir()
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer, tmp_path, _load_ignore_patterns(tmp_path), health_path=None
+        )
+        supervisor.schedule_initial(MagicMock())
+        assert (str(watched), True) in observer.scheduled
+
+        shutil.rmtree(watched)
+        watched.mkdir()
+        adopted, vanished = supervisor.sync_watches()
+
+        assert vanished == [str(watched)], "the stale watch was not released"
+        assert adopted == [str(watched)], "the replacement was not adopted"
+        assert observer.scheduled.count((str(watched), True)) == 2
 
 
 class TestWatchLoop:
@@ -832,6 +933,60 @@ class TestRealObserver:
         assert indexed, (
             "a top-level directory created after startup was never watched or indexed"
         )
+
+    def test_recreated_directory_survives_and_is_reindexed(self, tmp_path):
+        """`rm -rf src && mkdir src` inside one tick, on a real Observer.
+
+        Both halves matter and only fail together: the emitter stops itself on
+        the delete, so a path-keyed watch list calls it a death and exits 1,
+        and nothing re-adopts the replacement, so its files never reach the
+        graph — while ``crg-daemon status`` still reports ok.
+        """
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        for index in range(6):
+            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        (repo / "src" / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+
+        store = GraphStore(repo / "graph.db")
+        incremental_update(repo, store, changed_files=["src/app.py"])
+        assert store.get_all_files(), "precondition: the graph knows the original file"
+        reader = GraphStore(repo / "graph.db")
+        stop = threading.Event()
+        failure: list[BaseException] = []
+
+        def run_watch():
+            try:
+                watch(repo, store, stop_event=stop)
+            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions
+                failure.append(exc)
+
+        with patch("code_review_graph.incremental._WATCH_TICK_SECONDS", 0.05):
+            thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
+            thread.start()
+            try:
+                assert self._wait_for(lambda: watch_health_path(repo).exists())
+
+                # Delete and recreate back to back, well inside one tick.
+                shutil.rmtree(repo / "src")
+                (repo / "src").mkdir()
+                (repo / "src" / "reborn.py").write_text(
+                    "def reborn():\n    return 5\n", encoding="utf-8"
+                )
+
+                reindexed = self._wait_for(
+                    lambda: any(p.endswith("reborn.py") for p in reader.get_all_files())
+                )
+                survived = thread.is_alive()
+            finally:
+                stop.set()
+                thread.join(timeout=20)
+                store.close()
+                reader.close()
+
+        assert not failure, f"delete-and-recreate killed the watcher: {failure[0]!r}"
+        assert survived, "the watcher exited on a recreated directory"
+        assert reindexed, "the recreated directory's files never reached the graph"
 
     def test_deleting_a_watched_directory_does_not_kill_the_watcher(self, tmp_path):
         """The emitter stops itself when its root vanishes; that is not a death."""

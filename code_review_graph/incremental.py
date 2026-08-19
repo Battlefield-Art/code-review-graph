@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
@@ -1712,6 +1712,28 @@ def _watch_health_path(repo_root: Path) -> Path | None:
         return None
 
 
+def _watch_identity(path: str | Path) -> tuple[int, int, float] | None:
+    """Identify a directory by inode, not by name.
+
+    ``rm -rf src && mkdir src`` leaves the path spelled exactly as before while
+    the watch on it is dead, so a name is not an identity.  ``st_birthtime``
+    joins the tuple where the platform has it (macOS, Windows), which catches
+    the recreated directory that happens to reuse an inode.
+    """
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino, float(getattr(status, "st_birthtime", 0.0)))
+
+
+class _WatchEntry(NamedTuple):
+    """One scheduled watch: the watchdog handle and the directory it covers."""
+
+    handle: Any
+    identity: tuple[int, int, float] | None
+
+
 class _WatchSupervisor:
     """Owns the observer's watches and reports whether they still work.
 
@@ -1719,7 +1741,9 @@ class _WatchSupervisor:
 
     * schedule only the directories that survive the ignore patterns, so the OS
       never registers a watch inside an ignored tree;
-    * adopt directories created later underneath a non-recursive watch;
+    * adopt directories created later underneath a non-recursive watch, and
+      notice when a watched directory has been replaced by a new one wearing
+      the same name;
     * notice a dead watchdog thread and publish watcher health, so a stalled
       watcher stops looking healthy to ``crg-daemon status``.
     """
@@ -1741,9 +1765,10 @@ class _WatchSupervisor:
         self._health_path = health_path
         self._max_schedules = max(1, max_schedules)
         self._handler: Any = None
-        self._watches: dict[str, Any] = {}
+        self._watches: dict[str, _WatchEntry] = {}
         self._shallow: set[str] = set()
         self._live_threads: dict[int, threading.Thread] = {}
+        self._repaired_roots: set[str] = set()
         self._degraded = False
         self._last_health_write = 0.0
         self._last_health_state: tuple[bool, bool, tuple[str, ...]] | None = None
@@ -1790,7 +1815,7 @@ class _WatchSupervisor:
         except OSError as exc:
             logger.warning("Could not watch %s: %s", key, exc)
             return
-        self._watches[key] = handle
+        self._watches[key] = _WatchEntry(handle, _watch_identity(key))
         if recursive:
             self._shallow.discard(key)
         else:
@@ -1820,6 +1845,13 @@ class _WatchSupervisor:
                 if os.path.basename(child) not in present:
                     self._release_directory(child)
                     vanished.append(child)
+                elif self._watches[child].identity != _watch_identity(child):
+                    # Same name, different directory: the watch on it died with
+                    # the old inode.  Release it now so the loop below adopts
+                    # the replacement, instead of mistaking it for a corpse.
+                    logger.info("Directory %s was replaced; re-watching it", child)
+                    self._release_directory(child)
+                    vanished.append(child)
             for name in sorted(present):
                 if parent not in self._shallow:
                     # A promotion replaced this parent with one recursive
@@ -1836,8 +1868,18 @@ class _WatchSupervisor:
         """Watched paths directly underneath *parent*."""
         return [path for path in self._watches if os.path.dirname(path) == parent]
 
+    def _descendants_of(self, parent: str) -> list[str]:
+        """Watched paths anywhere underneath *parent*, at any depth."""
+        prefix = parent.rstrip(os.sep) + os.sep
+        return [path for path in self._watches if path.startswith(prefix)]
+
     def _adopt_directory(self, candidate: str) -> bool:
-        """Watch a directory that appeared under a non-recursive watch."""
+        """Watch a directory that appeared under a non-recursive watch.
+
+        Planned the same way startup plans the repository: a module arriving
+        from a branch switch must not hand its ``node_modules`` and ``target``
+        straight back to the OS, which is the exposure #811 is about.
+        """
         try:
             relative = Path(candidate).relative_to(self._repo_root).as_posix()
         except ValueError:
@@ -1845,18 +1887,22 @@ class _WatchSupervisor:
         if _should_ignore(relative, self._ignore_patterns):
             logger.debug("Not watching ignored directory %s", relative)
             return False
-        if len(self._watches) >= self._max_schedules:
+        _, plan = _plan_watch_subtree(
+            Path(candidate), self._repo_root, self._ignore_patterns, 0, _WATCH_PLAN_DEPTH, {}
+        )
+        if len(self._watches) + len(plan) > self._max_schedules:
             # Covering less would be silent blindness; a recursive watch on the
             # parent covers everything, at the price of watching ignored trees.
             self._promote_to_recursive(os.path.dirname(candidate))
             return True
-        self._schedule(Path(candidate), recursive=True)
-        logger.info("Watching new directory %s", relative)
+        for path, recursive in plan:
+            self._schedule(path, recursive=recursive)
+        logger.info("Watching new directory %s (%d watch(es))", relative, len(plan))
         return True
 
     def _promote_to_recursive(self, parent: str) -> None:
         """Trade filtering for coverage when the watch budget runs out."""
-        for path in [parent, *self._children_of(parent)]:
+        for path in [parent, *self._descendants_of(parent)]:
             self._release_directory(path)
         self._schedule(Path(parent), recursive=True)
         self._degraded = True
@@ -1869,14 +1915,15 @@ class _WatchSupervisor:
         )
 
     def _release_directory(self, path: str) -> None:
-        handle = self._watches.pop(path, None)
+        entry = self._watches.pop(path, None)
         self._shallow.discard(path)
-        if handle is None:
+        self._repaired_roots.discard(path)
+        if entry is None:
             return
         # unschedule() joins the emitter thread with no timeout, and a wedged
         # emitter is the very thing this class exists to survive.
         _run_time_boxed(
-            lambda: self._observer.unschedule(handle),
+            lambda: self._observer.unschedule(entry.handle),
             f"unschedule {path}",
             timeout=_WATCH_STOP_TIMEOUT,
         )
@@ -1914,32 +1961,65 @@ class _WatchSupervisor:
             )
         return threads
 
-    def dead_threads(self) -> list[str]:
-        """Names of watchdog threads that were running and have since died.
+    def check_liveness(self) -> tuple[list[str], list[str]]:
+        """Return ``(dead_thread_names, repaired_roots)``.
 
-        Two things are deliberately not deaths:
+        A thread that stopped is only a death if the watch it belonged to is
+        still the live watch for a directory that is still the same directory.
+        Three things are deliberately not deaths:
 
         * a thread never seen alive — an emitter caught between construction
           and start is not a corpse;
-        * a thread whose watch root has been deleted.  Both backends stop the
-          emitter when its own root disappears, and the emitter lingers in
-          ``observer.emitters`` until it is unscheduled, so a plain
-          ``rm -rf lib/`` would otherwise read as a dead watcher and restart
-          the process in a loop.
+        * a thread whose watch we have already released, or whose root is gone.
+          Both backends stop an emitter when its own root disappears, so a
+          plain ``rm -rf lib/`` would otherwise exit the watcher, and the
+          daemon would restart it every 30s forever;
+        * a thread whose root has been replaced since we scheduled it.
+          ``rm -rf src && mkdir src`` inside one tick leaves the name in place
+          but kills the watch, and calling that a death both exits the process
+          and loses the recreated directory's contents.
+
+        The remaining case — the watch is current, the directory is the same
+        one, and its thread died anyway — is repaired once per root by
+        rescheduling it, so an inode the filesystem handed straight back does
+        not cost a restart.  A second death of the same root is reported, and
+        the caller exits: that is #811's crash, and it must stay loud.
         """
         dead: list[str] = []
+        repaired: list[str] = []
         still_present: dict[int, threading.Thread] = {}
         for thread, root in self._watchdog_threads():
             key = id(thread)
             if thread.is_alive():
                 still_present[key] = thread
-            elif key in self._live_threads:
-                if root is not None and not os.path.isdir(root):
-                    logger.info("Watch root %s is gone; releasing its watch", root)
-                    continue
+                continue
+            if key not in self._live_threads:
+                continue
+            if root is None:
                 dead.append(thread.name)
+                continue
+            entry = self._watches.get(root)
+            if entry is None:
+                logger.debug("Watch on %s was already released; not a death", root)
+                continue
+            if entry.identity != _watch_identity(root):
+                logger.info("Watch root %s is gone or replaced; releasing its watch", root)
+                continue
+            if root in self._repaired_roots:
+                dead.append(thread.name)
+                continue
+            logger.warning(
+                "Watch on %s stopped while the directory is still there; "
+                "rescheduling it once before giving up",
+                root,
+            )
+            recursive = root not in self._shallow
+            self._release_directory(root)  # also clears the repair mark
+            self._schedule(Path(root), recursive=recursive)
+            self._repaired_roots.add(root)
+            repaired.append(root)
         self._live_threads = still_present
-        return dead
+        return dead, repaired
 
     # -- health reporting ------------------------------------------------
 
@@ -2265,6 +2345,7 @@ def watch(
         RuntimeError: if a watch update fails, or if the filesystem observer
             stops running.
     """
+    from watchdog.events import DirCreatedEvent
     from watchdog.observers import Observer
 
     # One boundary, once: ``--repo .`` reaches here relative, and every path
@@ -2309,7 +2390,11 @@ def watch(
                 _time.sleep(_WATCH_TICK_SECONDS)
             handler.raise_if_failed()
             _sync_watch_tree(supervisor, handler)
-            dead = supervisor.dead_threads()
+            dead, repaired = supervisor.check_liveness()
+            for path in repaired:
+                # A rescheduled watch missed whatever happened while it was
+                # down, so re-read the directory rather than trust the gap.
+                handler.dispatch(DirCreatedEvent(path))
             if dead:
                 names = ", ".join(dead)
                 supervisor.report_health(

@@ -48,6 +48,13 @@
   root is merely released. `crg-daemon status` gained a `Watcher` column
   (ok/partial/stalled/unknown/dead) and last-event age, and the daemon now backs
   off exponentially between restarts of a watcher that keeps dying (#811).
+- Deleting and recreating a watched directory (`rm -rf src && mkdir src`, or two
+  branch switches in a row) no longer kills the watcher or silently drops the
+  recreated directory from the graph. Watches are tracked by inode rather than
+  by path, so a replacement is released and re-adopted instead of being read as
+  a dead watcher, and a directory adopted after startup is planned the same way
+  startup plans the repository — its own `node_modules` and `target` stay
+  unwatched (#811).
 - `code-review-graph watch --repo .` no longer empties the graph on startup. The
   watcher resolves its repository root before reconciling, so stored absolute
   paths are no longer all treated as stale, and a graph built under a genuinely

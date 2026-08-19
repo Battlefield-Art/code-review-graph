@@ -196,9 +196,12 @@ the age of the last event each watcher processed:
   build every 30 seconds
 
 A watcher that detects its own dead observer logs an error and exits non-zero so
-the daemon restarts it, instead of sitting there quietly (#811). Deleting a
-watched directory is *not* treated as a dead watcher — the watch is simply
-released.
+the daemon restarts it, instead of sitting there quietly (#811). Two things are
+not treated as a dead watcher, because they are ordinary work: deleting a
+watched directory (the watch is released), and deleting then recreating one
+(watches are tracked by inode, so the replacement is re-watched and re-indexed
+rather than mistaken for a corpse). A watch that dies while its directory is
+genuinely unchanged is rescheduled once before the watcher gives up.
 
 Watch mode only registers OS watches for directories that survive the ignore
 patterns, so `node_modules/`, `.git/` and build output no longer generate
