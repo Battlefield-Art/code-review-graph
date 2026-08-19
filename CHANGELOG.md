@@ -35,6 +35,29 @@
 
 ### Fixed
 
+- The generated instruction sections no longer tell agents to always use the
+  graph before reading source and to fall back to file search only when the
+  graph misses. Every platform instruction file now carries the same short
+  guardrails: narrow scope with the graph, read the implementation and its
+  tests before a non-trivial change, prefer the source when the two disagree,
+  and treat an empty graph result as possibly unindexed rather than absent.
+  CONTRIBUTING.md also states what a new platform target must include before
+  it will be reviewed (#314).
+- Reinstalling now upgrades an instruction section written by an older release
+  instead of skipping the file because the opening marker was already there,
+  which is what made every wording fix invisible to existing users. Generated
+  sections carry a closing marker so the block has real boundaries; blocks from
+  before that marker existed are matched by their exact recorded text, so
+  anything written around them survives byte for byte. A section someone edited
+  by hand is left alone and named in the install output instead of being
+  overwritten, and `install` now reports created, updated and left-alone files
+  separately (#314, #558).
+- `uninstall` now removes an instruction section written by any past release,
+  not only one written by the running version, so asking for the instructions
+  to go no longer leaves orphaned text behind. It matches the same recorded
+  block texts install uses, clears duplicate blocks, keeps the text on both
+  sides of the block, closes the gap without leaving a run of blank lines, and
+  still refuses to touch a section that was edited by hand (#314).
 - C# receiver calls (`Service.StaticCall()`, `obj.Method()`, `obj?.Method()`)
   now resolve to canonical method nodes using receiver-type and namespace
   evidence recorded at parse time, so `callers_of`, `get_impact_radius`, and
