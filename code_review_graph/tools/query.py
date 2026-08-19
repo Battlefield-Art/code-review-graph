@@ -373,10 +373,17 @@ def query_graph(
                     }
 
         if not node and pattern not in ("consumers_of", "file_summary"):
-            return {
+            # This branch, not the empty-result path below, is where an
+            # unresolved target actually lands for most patterns, so the
+            # not-indexed marker has to be attached here too.
+            unresolved: dict[str, Any] = {
                 "status": "not_found",
                 "summary": f"No node found matching '{target}'.",
             }
+            unresolved_note = empty_query_confidence(store, root, pattern, target, None)
+            if unresolved_note:
+                unresolved["confidence"] = unresolved_note
+            return unresolved
 
         qn = node.qualified_name if node else target
 
