@@ -10,6 +10,7 @@ No external dependencies beyond Python stdlib — no tmux required.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -526,6 +527,80 @@ def _is_pid_alive(pid: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Watcher health (written by each watch child, read here)
+# ---------------------------------------------------------------------------
+
+# A watcher whose observer thread died keeps its process alive, so ``poll()``
+# alone reports it healthy forever.  Each watch child publishes its observer
+# state and last-event time here instead; anything older than this is a stall.
+# See: #811.
+_WATCH_HEALTH_STALE_SECONDS = float(os.environ.get("CRG_WATCH_HEALTH_STALE", "90"))
+
+
+def watch_health_dir() -> Path:
+    """Directory holding one health file per watched repository."""
+    return crg_home() / "watch-health"
+
+
+def watch_health_path(repo_root: str | Path) -> Path:
+    """Health file for *repo_root*.
+
+    Keyed by the real path so the watch child and the daemon agree even when
+    one of them was handed a symlinked or relative path.  Deliberately free of
+    heavy imports: ``crg-daemon status`` must stay instant.
+    """
+    key = os.path.realpath(os.path.expanduser(str(repo_root)))
+    digest = hashlib.sha256(key.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+    return watch_health_dir() / f"{digest}.json"
+
+
+def read_watch_health(
+    repo_root: str | Path,
+    *,
+    stale_after: float = _WATCH_HEALTH_STALE_SECONDS,
+) -> dict[str, Any] | None:
+    """Read a watcher's published health, or None when it never published any.
+
+    The returned dict gains ``age`` (seconds since the last heartbeat) and
+    ``stalled`` (observer reported dead, or heartbeat too old).
+    """
+    try:
+        raw = watch_health_path(repo_root).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    updated_at = data.get("updated_at")
+    age = time.time() - updated_at if isinstance(updated_at, (int, float)) else None
+    data["age"] = age
+    data["stalled"] = bool(
+        data.get("observer_alive") is False or (age is not None and age > stale_after)
+    )
+    return data
+
+
+def watcher_status(alive: bool, health: dict[str, Any] | None) -> str:
+    """Summarise one watcher: ``dead``, ``stalled``, ``unknown`` or ``ok``."""
+    if not alive:
+        return "dead"
+    if health is None:
+        return "unknown"
+    return "stalled" if health.get("stalled") else "ok"
+
+
+def _health_fields(repo_path: str, alive: bool) -> dict[str, Any]:
+    """Watcher-health columns for one repo entry in :meth:`WatchDaemon.status`."""
+    health = read_watch_health(repo_path)
+    return {
+        "watcher": watcher_status(alive, health),
+        "observer_alive": None if health is None else health.get("observer_alive"),
+        "last_event_at": None if health is None else health.get("last_event_at"),
+        "health_age": None if health is None else health.get("age"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # ConfigWatcher — monitors config file for live changes
 # ---------------------------------------------------------------------------
 
@@ -799,6 +874,10 @@ class WatchDaemon:
         ``_children`` dict.  When called from a separate process (e.g. the
         CLI ``status`` command), falls back to the persisted state file and
         checks liveness via ``os.kill(pid, 0)``.
+
+        A live process is not the same as a working watcher, so every entry
+        also carries the watcher health the child publishes: ``watcher``
+        (ok/stalled/unknown/dead), ``observer_alive`` and ``last_event_at``.
         """
         repos: list[dict[str, Any]] = []
         with self._lock:
@@ -813,6 +892,7 @@ class WatchDaemon:
                             "path": repo.path,
                             "alive": alive,
                             "pid": proc.pid if proc is not None else None,
+                            **_health_fields(repo.path, alive),
                         }
                     )
             else:
@@ -828,6 +908,7 @@ class WatchDaemon:
                             "path": repo.path,
                             "alive": alive,
                             "pid": pid,
+                            **_health_fields(repo.path, alive),
                         }
                     )
         return {
@@ -902,7 +983,13 @@ class WatchDaemon:
             self._check_health()
 
     def _check_health(self) -> None:
-        """Check each watcher child and restart if dead."""
+        """Check each watcher child and restart if dead.
+
+        A watcher that died takes the process with it and is restarted here.
+        One that is merely stalled — observer threads gone, heartbeat frozen —
+        is reported, not restarted: the child exits on its own when it detects
+        that, and restarting on a stale heartbeat alone risks a restart loop.
+        """
         restarted = False
         with self._lock:
             for alias, repo in list(self._current_repos.items()):
@@ -913,6 +1000,18 @@ class WatchDaemon:
                     self._children.pop(alias, None)
                     self._start_watcher(repo)
                     restarted = True
+                    continue
+                health = read_watch_health(repo.path)
+                if health is not None and health.get("stalled"):
+                    age = health.get("age")
+                    logger.warning(
+                        "Watcher for '%s' is running but stalled "
+                        "(observer_alive=%s, last heartbeat %s) — "
+                        "the graph is not being updated",
+                        alias,
+                        health.get("observer_alive"),
+                        f"{age:.0f}s ago" if isinstance(age, (int, float)) else "unknown",
+                    )
         if restarted:
             self._save_state()
 

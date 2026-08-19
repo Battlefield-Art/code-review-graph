@@ -172,6 +172,40 @@ flag). After that, `update` / hooks / `watch` can safely stay incremental.
 - If stale, run `/code-review-graph:build-graph` manually
 - Check that hooks are configured in `.claude/settings.json` (re-run `code-review-graph install` to regenerate)
 
+## Watcher is running but the graph stopped updating
+
+`crg-daemon status` has a `Watcher` column next to the process `Status`, plus
+the age of the last event each watcher processed:
+
+```
+  Alias     Status    Watcher   PID       Event   Path
+  backend   alive     stalled   48213     3d      /work/backend
+```
+
+- `ok` — the filesystem observer is running and publishing a heartbeat
+- `stalled` — the process is up but its observer threads are not, so nothing
+  is being indexed. Check `crg-daemon logs --repo ALIAS`, then
+  `crg-daemon restart`
+- `unknown` — the watcher has not published health yet (it just started, or it
+  predates this feature)
+- `dead` — the process itself exited; the daemon restarts these automatically
+
+A watcher that detects its own dead observer now logs an error and exits
+non-zero so the daemon restarts it, instead of sitting there quietly (#811).
+
+Watch mode only registers OS watches for directories that survive the ignore
+patterns, so `node_modules/`, `.git/` and build output no longer generate
+events at all. Related knobs, all optional:
+
+- `CRG_MAX_WATCH_SCHEDULES` (default 24) — cap on separate watches; a repo
+  needing more falls back to one recursive watch on the root
+- `CRG_WATCH_PLAN_DEPTH` (default 3) — how deep the planner may split
+- `CRG_WATCH_SPLIT_MIN_DIRS` (default 4) — smallest ignored tree worth its own
+  watch
+- `CRG_NESTED_OUTPUT_SCAN=0` — stop treating nested `target/`, `build/`,
+  `.next/` and `.nuxt/` as build output even when a sibling `pom.xml`,
+  `Cargo.toml`, `build.gradle` or `next.config.js` says they are
+
 ## Embeddings not working
 - Install with: `pip install "code-review-graph[embeddings]"`
 - Run `embed_graph_tool` to compute vectors

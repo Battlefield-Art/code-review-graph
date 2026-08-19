@@ -9,6 +9,7 @@ from __future__ import annotations
 import concurrent.futures
 import fnmatch
 import hashlib
+import json
 import logging
 import os
 import re
@@ -16,8 +17,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path, PurePosixPath
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
@@ -205,6 +207,41 @@ DEFAULT_IGNORE_PATTERNS = [
     "*.db-journal",
     "*.db-wal",
 ]
+
+# Build-output directories that ``DEFAULT_IGNORE_PATTERNS`` only anchors at the
+# repository root.  A nested copy is ignored as well, but only when a sibling
+# manifest proves the directory is that module's build output — ``moduleA/pom.xml``
+# next to ``moduleA/target/``.  Without that evidence the nested directory keeps
+# being parsed and watched, so the root anchoring from #91/#92 still protects
+# everyone whose nested ``build/`` or ``dist/`` holds real sources.  See: #811.
+NESTED_OUTPUT_DIR_MARKERS: dict[str, frozenset[str]] = {
+    "target": frozenset({"pom.xml", "Cargo.toml", "build.sbt"}),
+    "build": frozenset({
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+    }),
+    ".next": frozenset({
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.cjs",
+        "next.config.ts",
+    }),
+    ".nuxt": frozenset({"nuxt.config.js", "nuxt.config.mjs", "nuxt.config.ts"}),
+}
+
+# Bounds for the nested build-output scan.  The scan only lists directories
+# (no file stats), stops at ``CRG_MODULE_SCAN_DEPTH`` levels, never descends
+# into an already-ignored tree, and its result is cached per repository so
+# incremental updates never pay for it twice inside the TTL.
+_MODULE_SCAN_DEPTH = int(os.environ.get("CRG_MODULE_SCAN_DEPTH", "3"))
+_MODULE_SCAN_MAX_DIRS = int(os.environ.get("CRG_MODULE_SCAN_MAX_DIRS", "2000"))
+_MAX_NESTED_OUTPUT_PATTERNS = 200
+_NESTED_IGNORE_TTL_SECONDS = float(os.environ.get("CRG_NESTED_IGNORE_TTL", "300"))
+
+_nested_ignore_cache: dict[str, tuple[float, list[str]]] = {}
+_nested_ignore_lock = threading.Lock()
 
 
 def find_svn_root(start: Path | None = None) -> Optional[Path]:
@@ -455,6 +492,7 @@ def _load_ignore_patterns(repo_root: Path) -> list[str]:
                         line = f"**/{line}"
                 if line:
                     patterns.append(line)
+    patterns.extend(_nested_output_ignore_patterns(repo_root, patterns))
     return patterns
 
 
@@ -490,6 +528,102 @@ def _should_ignore(path: str, patterns: list[str]) -> bool:
         if fnmatch.fnmatch(normalized, candidate):
             return True
     return False
+
+
+def _child_directories(directory: Path) -> list[tuple[str, bool]]:
+    """List ``directory`` once, returning ``(name, is_dir)`` for its entries.
+
+    Symlinked directories are reported as non-directories so no walk follows
+    them out of the repository.  Returns an empty list for anything that
+    cannot be listed — an unreadable directory is not worth a failed watch.
+    """
+    try:
+        with os.scandir(directory) as entries:
+            listing: list[tuple[str, bool]] = []
+            for entry in entries:
+                try:
+                    listing.append((entry.name, entry.is_dir(follow_symlinks=False)))
+                except OSError:  # pragma: no cover - vanished mid-scan
+                    continue
+    except OSError as exc:
+        logger.debug("Cannot list %s: %s", directory, exc)
+        return []
+    listing.sort()
+    return listing
+
+
+def _scan_nested_output_dirs(
+    repo_root: Path,
+    base_patterns: list[str],
+    max_depth: int = _MODULE_SCAN_DEPTH,
+    max_dirs: int = _MODULE_SCAN_MAX_DIRS,
+) -> list[str]:
+    """Find nested build-output directories that a sibling manifest confirms.
+
+    Returns root-anchored ignore patterns such as ``/moduleA/target/**``.  The
+    walk lists directories only, skips trees the base patterns already ignore,
+    and is bounded by *max_depth* and *max_dirs*.
+    """
+    patterns: list[str] = []
+    queue: list[tuple[Path, int]] = [(repo_root, 0)]
+    visited = 0
+    while queue:
+        directory, depth = queue.pop()
+        visited += 1
+        if visited > max_dirs:
+            logger.debug("Nested output scan hit the %d directory cap", max_dirs)
+            break
+        listing = _child_directories(directory)
+        subdirectories = {name for name, is_dir in listing if is_dir}
+        file_names = {name for name, is_dir in listing if not is_dir}
+        flagged: set[str] = set()
+        if depth > 0:
+            for output_dir, markers in NESTED_OUTPUT_DIR_MARKERS.items():
+                if output_dir in subdirectories and file_names & markers:
+                    relative = (directory / output_dir).relative_to(repo_root).as_posix()
+                    patterns.append(f"/{relative}/**")
+                    flagged.add(output_dir)
+                    if len(patterns) >= _MAX_NESTED_OUTPUT_PATTERNS:
+                        logger.debug("Nested output scan hit the pattern cap")
+                        return patterns
+        if depth >= max_depth:
+            continue
+        for name in subdirectories:
+            if name in flagged:
+                continue
+            child = directory / name
+            if _should_ignore(child.relative_to(repo_root).as_posix(), base_patterns):
+                continue
+            queue.append((child, depth + 1))
+    return patterns
+
+
+def _nested_output_ignore_patterns(repo_root: Path, base_patterns: list[str]) -> list[str]:
+    """Cached wrapper around :func:`_scan_nested_output_dirs`.
+
+    The result is reused for ``_NESTED_IGNORE_TTL_SECONDS`` so a long-running
+    watch pays for the scan once, not on every incremental update, while a
+    module added later is still picked up without a restart.  Set
+    ``CRG_NESTED_OUTPUT_SCAN=0`` to turn the whole thing off.
+    """
+    if os.environ.get("CRG_NESTED_OUTPUT_SCAN", "1").strip().lower() in ("0", "false", "no"):
+        return []
+    key = str(repo_root)
+    now = time.monotonic()
+    with _nested_ignore_lock:
+        cached = _nested_ignore_cache.get(key)
+        if cached is not None and now - cached[0] < _NESTED_IGNORE_TTL_SECONDS:
+            return list(cached[1])
+    patterns = _scan_nested_output_dirs(repo_root, base_patterns)
+    with _nested_ignore_lock:
+        _nested_ignore_cache[key] = (time.monotonic(), patterns)
+    return list(patterns)
+
+
+def clear_nested_ignore_cache() -> None:
+    """Drop the cached nested build-output patterns (used by tests)."""
+    with _nested_ignore_lock:
+        _nested_ignore_cache.clear()
 
 
 def _is_binary(path: Path) -> bool:
@@ -1384,10 +1518,407 @@ def _raise_watch_postprocess_warnings(result: object) -> None:
         raise RuntimeError(f"post-processing reported warnings: {details}")
 
 
+# ---------------------------------------------------------------------------
+# Watch scheduling and supervision
+# ---------------------------------------------------------------------------
+
+# A single recursive watch on the repository root makes the OS register one
+# watch per directory in the tree — including every temp directory a build tool
+# churns through inside ``target/`` or ``node_modules/``.  Planning the watches
+# ourselves keeps ignored trees off the OS watch list entirely.  See: #811.
+_WATCH_PLAN_DEPTH = int(os.environ.get("CRG_WATCH_PLAN_DEPTH", "3"))
+_MAX_WATCH_SCHEDULES = int(os.environ.get("CRG_MAX_WATCH_SCHEDULES", "24"))
+# Splitting a watch costs one watchdog emitter, so it has to buy more than it
+# costs: an ignored tree is only worth excluding once it holds this many
+# directories.  A lone ``__pycache__`` is not worth a thread; ``target/`` is.
+_WATCH_SPLIT_MIN_DIRS = int(os.environ.get("CRG_WATCH_SPLIT_MIN_DIRS", "4"))
+_WATCH_HEALTH_INTERVAL = float(os.environ.get("CRG_WATCH_HEALTH_INTERVAL", "10"))
+_MAX_PENDING_DIR_EVENTS = 1024
+_WATCH_STOP_TIMEOUT = 10.0
+
+
+def _watch_child_dirs(
+    directory: Path,
+    cache: dict[Path, list[Path]] | None = None,
+) -> list[Path]:
+    """Return the real (non-symlink) subdirectories of *directory*."""
+    if cache is not None and directory in cache:
+        return cache[directory]
+    children = [directory / name for name, is_dir in _child_directories(directory) if is_dir]
+    if cache is not None:
+        cache[directory] = children
+    return children
+
+
+def _ignored_tree_weight(directory: Path, cap: int) -> int:
+    """Count the directories inside an ignored tree, stopping at *cap*.
+
+    Used to decide whether excluding the tree is worth a separate watch.  The
+    count stops as soon as the cap is reached, so probing ``node_modules`` is
+    barely more expensive than probing an empty ``__pycache__``.
+    """
+    if cap <= 0:
+        return 0
+    total = 1
+    queue = [directory]
+    while queue and total < cap:
+        current = queue.pop()
+        for name, is_dir in _child_directories(current):
+            if not is_dir:
+                continue
+            total += 1
+            if total >= cap:
+                return total
+            queue.append(current / name)
+    return total
+
+
+def _plan_watch_subtree(
+    directory: Path,
+    repo_root: Path,
+    ignore_patterns: list[str],
+    depth: int,
+    max_depth: int,
+    cache: dict[Path, list[Path]],
+    split_threshold: int = _WATCH_SPLIT_MIN_DIRS,
+) -> tuple[bool, list[tuple[Path, bool]]]:
+    """Plan the watches covering *directory*.
+
+    Returns ``(clean, plan)``.  ``clean`` means nothing below *directory*
+    within *max_depth* is worth excluding, in which case a single recursive
+    watch covers it.  Otherwise the directory is watched non-recursively and
+    each surviving child is planned in turn, so the ignored subtree is never
+    handed to the OS at all.
+    """
+    ignored_weight = 0
+    kept: list[Path] = []
+    for child in _watch_child_dirs(directory, cache):
+        if _should_ignore(child.relative_to(repo_root).as_posix(), ignore_patterns):
+            if ignored_weight < split_threshold:
+                ignored_weight += _ignored_tree_weight(child, split_threshold - ignored_weight)
+        else:
+            kept.append(child)
+    clean = ignored_weight < split_threshold
+    if depth >= max_depth:
+        if clean:
+            return True, [(directory, True)]
+        return False, [(directory, False)] + [(child, True) for child in kept]
+    child_plans: list[tuple[Path, bool]] = []
+    for child in kept:
+        child_clean, child_plan = _plan_watch_subtree(
+            child, repo_root, ignore_patterns, depth + 1, max_depth, cache, split_threshold
+        )
+        clean = clean and child_clean
+        child_plans.extend(child_plan)
+    if clean:
+        return True, [(directory, True)]
+    return False, [(directory, False)] + child_plans
+
+
+def _plan_watch_paths(
+    repo_root: Path,
+    ignore_patterns: list[str],
+    max_depth: int = _WATCH_PLAN_DEPTH,
+    max_schedules: int = _MAX_WATCH_SCHEDULES,
+    split_threshold: int = _WATCH_SPLIT_MIN_DIRS,
+) -> list[tuple[Path, bool]]:
+    """Return the ``(path, recursive)`` watches that cover the repo.
+
+    Deeper plans exclude more ignored trees but cost one watchdog emitter each,
+    so an over-budget plan is retried at a shallower depth before falling back
+    to the single recursive root watch.
+    """
+    cache: dict[Path, list[Path]] = {}
+    for depth in range(max(1, max_depth), 0, -1):
+        _, plan = _plan_watch_subtree(
+            repo_root, repo_root, ignore_patterns, 0, depth, cache, split_threshold
+        )
+        if len(plan) <= max(1, max_schedules):
+            return plan
+    logger.warning(
+        "%s needs more than %d watches to skip its ignored trees; "
+        "falling back to one recursive watch (raise CRG_MAX_WATCH_SCHEDULES to split it)",
+        repo_root,
+        max_schedules,
+    )
+    return [(repo_root, True)]
+
+
+def _run_time_boxed(operation: Callable[[], Any], description: str, timeout: float = 10.0) -> None:
+    """Run *operation* on a throwaway thread so a wedged watcher cannot hang exit.
+
+    Watchdog's teardown joins its emitter threads, and the whole point of this
+    module's health check is that one of those threads may be stuck.  Every
+    watchdog thread is a daemon thread, so abandoning the join is safe.
+    """
+
+    def _call() -> None:
+        try:
+            operation()
+        except Exception as exc:  # noqa: BLE001 - teardown must not mask the real error
+            logger.debug("%s failed: %s", description, exc)
+
+    thread = threading.Thread(target=_call, name="crg-watch-teardown", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        logger.warning(
+            "%s did not finish in %.0fs; leaving it to process exit", description, timeout
+        )
+
+
+def _watch_health_path(repo_root: Path) -> Path | None:
+    """Where this watcher publishes its health, or None if that is unavailable."""
+    try:
+        from .daemon import watch_health_path
+
+        return watch_health_path(repo_root)
+    except Exception as exc:  # noqa: BLE001 - health reporting is best-effort
+        logger.debug("Watcher health reporting disabled: %s", exc)
+        return None
+
+
+class _WatchSupervisor:
+    """Owns the observer's watches and reports whether they still work.
+
+    Three jobs, all deliberately cheap:
+
+    * schedule only the directories that survive the ignore patterns, so the OS
+      never registers a watch inside an ignored tree;
+    * adopt directories created later underneath a non-recursive watch;
+    * notice a dead watchdog thread and publish watcher health, so a stalled
+      watcher stops looking healthy to ``crg-daemon status``.
+    """
+
+    def __init__(
+        self,
+        observer: Any,
+        repo_root: Path,
+        ignore_patterns: list[str],
+        health_path: Path | None = None,
+        max_schedules: int = _MAX_WATCH_SCHEDULES,
+    ) -> None:
+        self._observer = observer
+        self._repo_root = repo_root
+        self._ignore_patterns = ignore_patterns
+        self._health_path = health_path
+        self._max_schedules = max(1, max_schedules)
+        self._handler: Any = None
+        self._watches: dict[str, Any] = {}
+        self._shallow: set[str] = set()
+        self._pending: deque[tuple[str, str]] = deque(maxlen=_MAX_PENDING_DIR_EVENTS)
+        self._live_threads: dict[int, threading.Thread] = {}
+        self._budget_warned = False
+        self._last_health_write = 0.0
+        self._last_health_state: tuple[bool, tuple[str, ...]] | None = None
+        self._started_at = time.time()
+
+    # -- scheduling -----------------------------------------------------
+
+    @property
+    def watched_paths(self) -> list[str]:
+        return sorted(self._watches)
+
+    def schedule_initial(self, handler: Any) -> None:
+        """Schedule the planned watches for *handler*."""
+        self._handler = handler
+        plan = _plan_watch_paths(
+            self._repo_root,
+            self._ignore_patterns,
+            max_schedules=self._max_schedules,
+        )
+        for path, recursive in plan:
+            self._schedule(path, recursive=recursive)
+        logger.info(
+            "Watching %d path(s) under %s; ignored trees are never registered",
+            len(self._watches),
+            self._repo_root,
+        )
+
+    def _schedule(self, path: Path, *, recursive: bool) -> None:
+        key = str(path)
+        if key in self._watches:
+            return
+        try:
+            handle = self._observer.schedule(self._handler, key, recursive=recursive)
+        except OSError as exc:
+            logger.warning("Could not watch %s: %s", key, exc)
+            return
+        self._watches[key] = handle
+        if recursive:
+            self._shallow.discard(key)
+        else:
+            self._shallow.add(key)
+
+    def note_directory_event(self, event_type: str, path: str) -> None:
+        """Record a directory event.  Runs on watchdog's dispatch thread.
+
+        This must stay a bounded append: the scheduling work itself happens on
+        the watch loop's thread so a slow syscall can never stall dispatch.
+        """
+        self._pending.append((event_type, path))
+
+    def apply_pending(self) -> None:
+        """Adopt or release directories seen since the last tick.
+
+        A move arrives as its source path plus a separate ``created`` for the
+        destination, so the old watch is released and the new one adopted.
+        """
+        while self._pending:
+            event_type, path = self._pending.popleft()
+            if event_type == "created":
+                self._adopt_directory(path)
+            elif event_type in ("deleted", "moved"):
+                self._release_directory(path)
+
+    def _adopt_directory(self, path: str) -> None:
+        candidate = os.path.abspath(path)
+        if candidate in self._watches:
+            return
+        if os.path.dirname(candidate) not in self._shallow:
+            # Anything else is already inside a recursive watch, or outside the
+            # repository entirely.
+            return
+        try:
+            relative = Path(candidate).relative_to(self._repo_root).as_posix()
+        except ValueError:
+            return
+        if _should_ignore(relative, self._ignore_patterns):
+            logger.debug("Not watching ignored directory %s", relative)
+            return
+        if not os.path.isdir(candidate):
+            return
+        if len(self._watches) >= self._max_schedules:
+            if not self._budget_warned:
+                self._budget_warned = True
+                logger.warning(
+                    "Watch budget of %d reached; %s and later directories are not watched "
+                    "(raise CRG_MAX_WATCH_SCHEDULES)",
+                    self._max_schedules,
+                    relative,
+                )
+            return
+        self._schedule(Path(candidate), recursive=True)
+        logger.info("Watching new directory %s", relative)
+
+    def _release_directory(self, path: str) -> None:
+        candidate = os.path.abspath(path)
+        handle = self._watches.pop(candidate, None)
+        self._shallow.discard(candidate)
+        if handle is None:
+            return
+        try:
+            self._observer.unschedule(handle)
+        except Exception as exc:  # noqa: BLE001 - watchdog raises KeyError for stale watches
+            logger.debug("Could not unschedule %s: %s", candidate, exc)
+
+    # -- liveness -------------------------------------------------------
+
+    def _watchdog_threads(self) -> list[threading.Thread]:
+        """Every thread the observer depends on, across watchdog backends.
+
+        The dispatcher, each emitter, and any reader thread an emitter owns
+        (inotify keeps its buffer thread there) can die on their own; the
+        process survives all three, which is what makes the failure silent.
+        """
+        threads: list[threading.Thread] = []
+        observer = self._observer
+        if isinstance(observer, threading.Thread):
+            threads.append(observer)
+        try:
+            emitters = list(getattr(observer, "emitters", ()) or ())
+        except TypeError:  # a stub or mock observer — nothing to inspect
+            return threads
+        for emitter in emitters:
+            if isinstance(emitter, threading.Thread):
+                threads.append(emitter)
+            try:
+                members = list(vars(emitter).values())
+            except TypeError:
+                continue
+            threads.extend(
+                member
+                for member in members
+                if isinstance(member, threading.Thread) and member is not emitter
+            )
+        return threads
+
+    def dead_threads(self) -> list[str]:
+        """Names of watchdog threads that were running and have since died.
+
+        Only threads previously observed alive can be reported, so an emitter
+        caught between construction and start is never mistaken for a corpse.
+        """
+        dead: list[str] = []
+        still_present: dict[int, threading.Thread] = {}
+        for thread in self._watchdog_threads():
+            key = id(thread)
+            if thread.is_alive():
+                still_present[key] = thread
+            elif key in self._live_threads:
+                dead.append(thread.name)
+        self._live_threads = still_present
+        return dead
+
+    # -- health reporting ------------------------------------------------
+
+    def report_health(
+        self,
+        *,
+        observer_alive: bool,
+        last_event_at: float | None = None,
+        events_seen: int = 0,
+        dead_threads: tuple[str, ...] = (),
+        force: bool = False,
+    ) -> None:
+        """Publish watcher health, rate-limited to one write per interval."""
+        if self._health_path is None:
+            return
+        now = time.time()
+        state = (observer_alive, tuple(dead_threads))
+        if (
+            not force
+            and state == self._last_health_state
+            and now - self._last_health_write < _WATCH_HEALTH_INTERVAL
+        ):
+            return
+        payload = {
+            "repo": str(self._repo_root),
+            "pid": os.getpid(),
+            "started_at": self._started_at,
+            "updated_at": now,
+            "observer_alive": observer_alive,
+            "last_event_at": last_event_at,
+            "events_seen": events_seen,
+            "watched_paths": len(self._watches),
+            "dead_threads": list(dead_threads),
+        }
+        try:
+            self._health_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._health_path.with_name(f"{self._health_path.name}.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(temporary, self._health_path)
+        except OSError as exc:
+            logger.debug("Could not write watcher health to %s: %s", self._health_path, exc)
+            return
+        self._last_health_write = now
+        self._last_health_state = state
+
+    def clear_health(self) -> None:
+        """Remove the health file on a clean shutdown."""
+        if self._health_path is None:
+            return
+        try:
+            self._health_path.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - best-effort cleanup
+            pass
+
+
 def _create_watch_handler(
     repo_root: Path,
     store: GraphStore,
     on_files_updated: Optional[Callable],
+    on_directory_event: Optional[Callable[[str, str], None]] = None,
 ):
     """Create the debounced watchdog handler for one repository."""
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -1401,6 +1932,8 @@ def _create_watch_handler(
     class WatchBatchProcessor:
         def __init__(self) -> None:
             self.failure: BaseException | None = None
+            self.last_event_at: float | None = None
+            self.events_seen: int = 0
 
         def _relative_path(self, path: str) -> str | None:
             candidate = Path(os.path.abspath(path))
@@ -1487,6 +2020,10 @@ def _create_watch_handler(
             return paths
 
         def process(self, events: list[FileSystemEvent]) -> None:
+            # Recorded before the work so a stalled watcher is distinguishable
+            # from a watcher whose repository is simply quiet.
+            self.last_event_at = time.time()
+            self.events_seen += len(events)
             try:
                 changed_files = sorted(
                     {path for event in events for path in self._event_paths(event)}
@@ -1517,8 +2054,16 @@ def _create_watch_handler(
         def dispatch(self, event: FileSystemEvent) -> None:
             if event.event_type not in {"created", "modified", "deleted", "moved"}:
                 return
-            if event.is_directory and event.event_type == "modified":
-                return
+            if event.is_directory:
+                if event.event_type == "modified":
+                    return
+                if on_directory_event is not None:
+                    # Directories created under a non-recursive watch need a
+                    # watch of their own; the supervisor decides, off-thread.
+                    on_directory_event(event.event_type, os.fsdecode(event.src_path))
+                    destination = getattr(event, "dest_path", "")
+                    if destination:
+                        on_directory_event("created", os.fsdecode(destination))
             debouncer.handle_event(event)
 
         def start(self) -> None:
@@ -1534,6 +2079,14 @@ def _create_watch_handler(
         def raise_if_failed(self) -> None:
             processor.raise_if_failed()
 
+        @property
+        def last_event_at(self) -> float | None:
+            return processor.last_event_at
+
+        @property
+        def events_seen(self) -> int:
+            return processor.events_seen
+
     return GraphUpdateHandler()
 
 
@@ -1546,6 +2099,11 @@ def watch(
 
     Uses a one-second debounce to batch rapid-fire saves into a single update.
 
+    Ignored trees are never handed to the OS watcher, and every tick checks
+    that watchdog's own threads are still running: a dead one raises, so the
+    process exits non-zero and the daemon restarts it instead of the graph
+    going quietly stale.  See: #811.
+
     Args:
         repo_root: Repository root to watch.
         store: Graph database to update.
@@ -1553,6 +2111,10 @@ def watch(
             batch of file updates completes.  Receives the store as its
             only argument.  Used by the CLI to run post-processing
             (FTS, flows, communities) after watch updates.
+
+    Raises:
+        RuntimeError: if a watch update fails, or if the filesystem observer
+            stops running.
     """
     from watchdog.observers import Observer
 
@@ -1561,11 +2123,23 @@ def watch(
     if initial["files_updated"] > 0 and on_files_updated is not None:
         postprocess_result = on_files_updated(store)
         _raise_watch_postprocess_warnings(postprocess_result)
-    handler = _create_watch_handler(repo_root, store, on_files_updated)
     observer = Observer()
-    observer.schedule(handler, str(repo_root), recursive=True)
+    supervisor = _WatchSupervisor(
+        observer,
+        repo_root,
+        _load_ignore_patterns(repo_root),
+        health_path=_watch_health_path(repo_root),
+    )
+    handler = _create_watch_handler(
+        repo_root,
+        store,
+        on_files_updated,
+        on_directory_event=supervisor.note_directory_event,
+    )
+    supervisor.schedule_initial(handler)
     handler.start()
     observer.start()
+    supervisor.report_health(observer_alive=True, force=True)
 
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
     try:
@@ -1574,11 +2148,35 @@ def watch(
         while True:
             _time.sleep(1)
             handler.raise_if_failed()
+            supervisor.apply_pending()
+            dead = supervisor.dead_threads()
+            if dead:
+                names = ", ".join(dead)
+                supervisor.report_health(
+                    observer_alive=False,
+                    last_event_at=handler.last_event_at,
+                    events_seen=handler.events_seen,
+                    dead_threads=tuple(dead),
+                    force=True,
+                )
+                logger.error(
+                    "Filesystem watcher thread(s) died (%s); %s would stop updating "
+                    "silently, so this watcher is exiting for the daemon to restart it",
+                    names,
+                    repo_root,
+                )
+                raise RuntimeError(f"watch observer stopped: dead thread(s) {names}")
+            supervisor.report_health(
+                observer_alive=True,
+                last_event_at=handler.last_event_at,
+                events_seen=handler.events_seen,
+            )
     except KeyboardInterrupt:
-        observer.stop()
+        supervisor.clear_health()
+        _run_time_boxed(observer.stop, "observer stop")
     finally:
-        observer.stop()
-        observer.join()
+        _run_time_boxed(observer.stop, "observer stop")
+        observer.join(timeout=_WATCH_STOP_TIMEOUT)
         handler.stop()
     logger.info("Watch stopped.")
 
@@ -1598,9 +2196,16 @@ def start_watch_thread(
         logger.warning("watchdog not installed; auto-watch disabled")
         return None
 
+    def _run() -> None:
+        # A thread cannot take the process down, so the one thing it must not
+        # do is die quietly: the server would keep serving a frozen graph.
+        try:
+            watch(repo_root, store)
+        except RuntimeError as exc:
+            logger.error("Auto-watch for %s stopped: %s", repo_root, exc)
+
     thread = threading.Thread(
-        target=watch,
-        args=(repo_root, store),
+        target=_run,
         daemon=daemon,
         name="crg-watch",
     )
