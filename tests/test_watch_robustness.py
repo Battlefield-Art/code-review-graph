@@ -32,6 +32,7 @@ from code_review_graph.daemon import (
 )
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
+    _WATCH_SPLIT_MIN_DIRS,
     _load_ignore_patterns,
     _plan_watch_paths,
     _should_ignore,
@@ -514,6 +515,34 @@ class TestObserverLiveness:
         observer.emitters = [FakeEmitter(thread, root=str(watched))]
         return supervisor, observer, watched, thread, gate
 
+    def _watched_as_planned(self, tmp_path, name="src"):
+        """A supervisor planned the way startup plans a repository.
+
+        The root is watched non-recursively and each top-level directory
+        recursively, which is the shape ``sync_watches`` reconciles.  The
+        bare ``_watched`` fixture has no shallow parent, so a recreated
+        directory there can only be noticed by the liveness check; here both
+        mechanisms are in play, as they are in a real watcher.
+        """
+        # An ignored tree worth excluding is what makes the planner split the
+        # root at all; without one it covers everything with a single
+        # recursive watch and there is no shallow parent to reconcile.
+        (tmp_path / "node_modules").mkdir(exist_ok=True)
+        for index in range(_WATCH_SPLIT_MIN_DIRS + 2):
+            (tmp_path / "node_modules" / f"pkg{index}").mkdir(exist_ok=True)
+        watched = tmp_path / name
+        watched.mkdir(exist_ok=True)
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer, tmp_path, _load_ignore_patterns(tmp_path), health_path=None
+        )
+        supervisor.schedule_initial(MagicMock())
+        assert (str(watched), True) in observer.scheduled
+        assert str(tmp_path) in supervisor._shallow, "the root must be the shallow parent"
+        thread, gate = _live_thread()
+        observer.emitters = [FakeEmitter(thread, root=str(watched))]
+        return supervisor, observer, watched, thread, gate
+
     def test_dead_backend_reader_thread_is_reported(self, tmp_path):
         """The inotify shape: the emitter lives on, its buffer thread does not."""
         supervisor, observer, watched, thread, gate = self._watched(tmp_path)
@@ -603,18 +632,63 @@ class TestObserverLiveness:
 
         Calling that a death exits the watcher *and* loses the recreated
         contents, because the restarted watcher only reconciles stale rows
-        away. The watch is stale, not the watcher.
+        away.  The watch is stale, not the watcher.
+
+        Which mechanism notices is deliberately not asserted, because it is
+        platform-dependent.  Where the inode changes -- macOS, and Linux
+        whenever the filesystem does not hand it straight back --
+        ``sync_watches`` releases the stale watch and adopts the replacement;
+        where it does not, the once-per-root repair reschedules.  The
+        guarantee is the outcome: no death, and the directory still covered by
+        a watch that was scheduled after the swap.
         """
-        supervisor, _, watched, thread, gate = self._watched(tmp_path, name="src")
+        supervisor, observer, watched, thread, gate = self._watched_as_planned(tmp_path)
 
         assert supervisor.check_liveness() == ([], [])
+        scheduled_before = len(observer.scheduled)
 
         shutil.rmtree(watched)
-        watched.mkdir()  # same path, different inode — one tick, no gap
+        watched.mkdir()  # same path, new directory -- one tick, no gap
         gate.set()
         thread.join(timeout=5)
 
+        # The watch loop syncs the watch list first, then checks liveness.
+        supervisor.sync_watches()
+        dead, _ = supervisor.check_liveness()
+
+        assert dead == [], "a recreated directory was reported as a dead watcher"
+        assert str(watched) in supervisor.watched_paths
+        assert len(observer.scheduled) > scheduled_before, "the watch was never renewed"
+
+    def test_recreated_directory_with_a_reused_inode_is_repaired(self, tmp_path, monkeypatch):
+        """The Linux shape: the filesystem hands the same inode straight back.
+
+        Linux has no ``st_birthtime``, so identity is blind to that swap and
+        the once-per-root repair is what has to carry it.  Frozen here rather
+        than left to the filesystem, so the path is pinned on every platform
+        instead of only where inode reuse happens to occur.
+        """
+        monkeypatch.setattr(
+            "code_review_graph.incremental._watch_identity", lambda path: (1, 2, 0.0)
+        )
+        supervisor, observer, watched, thread, gate = self._watched_as_planned(tmp_path)
+
         assert supervisor.check_liveness() == ([], [])
+        scheduled_before = len(observer.scheduled)
+
+        shutil.rmtree(watched)
+        watched.mkdir()
+        gate.set()
+        thread.join(timeout=5)
+
+        assert supervisor.sync_watches() == ([], []), "identity cannot see a reused inode"
+
+        dead, repaired = supervisor.check_liveness()
+
+        assert dead == []
+        assert repaired == [str(watched)], "the repair path did not carry the recreate"
+        assert len(observer.scheduled) > scheduled_before
+        assert (str(watched), True) in observer.scheduled[scheduled_before:]
 
     def test_failed_reschedule_is_reported_rather_than_counted_as_repaired(self, tmp_path):
         """ENOSPC from inotify is #811's own trigger; it must not pass as a repair."""
@@ -631,7 +705,13 @@ class TestObserverLiveness:
         assert str(watched) not in supervisor._repaired_roots, "bookkeeping outlived the watch"
 
     def test_replaced_directory_is_released_and_re_adopted(self, tmp_path):
-        """The identity change has to reach the watch list, not just liveness."""
+        """The identity change has to reach the watch list, not just liveness.
+
+        The replacement is built beside the original and renamed over it, so
+        the two inodes are distinct on every filesystem. Plain delete-then-
+        recreate cannot be used here: Linux commonly hands the same inode back,
+        which is the repair path's job, covered separately.
+        """
         (tmp_path / "node_modules").mkdir()
         for index in range(6):
             (tmp_path / "node_modules" / f"pkg{index}").mkdir()
@@ -644,8 +724,11 @@ class TestObserverLiveness:
         supervisor.schedule_initial(MagicMock())
         assert (str(watched), True) in observer.scheduled
 
+        replacement = tmp_path / "src.incoming"
+        replacement.mkdir()  # allocated while the original still holds its inode
+        assert replacement.stat().st_ino != watched.stat().st_ino
         shutil.rmtree(watched)
-        watched.mkdir()
+        replacement.rename(watched)
         adopted, vanished = supervisor.sync_watches()
 
         assert vanished == [str(watched)], "the stale watch was not released"

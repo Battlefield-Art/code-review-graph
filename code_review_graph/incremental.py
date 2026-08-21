@@ -2023,7 +2023,11 @@ class _WatchSupervisor:
                 logger.debug("Watch on %s was already released; not a death", root)
                 continue
             if entry.identity != _watch_identity(root):
-                logger.info("Watch root %s is gone or replaced; releasing its watch", root)
+                logger.info(
+                    "Watch root %s is gone or replaced; not a death — sync_watches "
+                    "releases the stale watch and adopts the replacement",
+                    root,
+                )
                 continue
             if root in self._repaired_roots:
                 dead.append(thread.name)
