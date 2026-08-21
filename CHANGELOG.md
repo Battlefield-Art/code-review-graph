@@ -35,6 +35,31 @@
 
 ### Fixed
 
+- Watch mode no longer registers OS watches inside ignored trees, and no longer
+  keeps running after its filesystem observer dies. Watches are now planned per
+  directory (ignored trees are skipped, the repo root is watched
+  non-recursively, and directories that appear or disappear later are picked up
+  from a per-tick listing rather than from directory events, which macOS never
+  delivers for a child of a non-recursive watch), nested build output such as
+  `moduleA/target/` is ignored when a sibling `pom.xml` proves it is build
+  output — reported at info level and overridable per path with `!path` in
+  `.code-review-graphignore` — and a dead watchdog thread makes the watcher log
+  an error and exit non-zero so the daemon restarts it, while a deleted watch
+  root is merely released. `crg-daemon status` gained a `Watcher` column
+  (ok/partial/stalled/unknown/dead) and last-event age, and the daemon now backs
+  off exponentially between restarts of a watcher that keeps dying (#811).
+- Deleting and recreating a watched directory (`rm -rf src && mkdir src`, or two
+  branch switches in a row) no longer kills the watcher or silently drops the
+  recreated directory from the graph. Watches are tracked by inode rather than
+  by path, so a replacement is released and re-adopted instead of being read as
+  a dead watcher, and a directory adopted after startup is planned the same way
+  startup plans the repository — its own `node_modules` and `target` stay
+  unwatched (#811).
+- `code-review-graph watch --repo .` no longer empties the graph on startup. The
+  watcher resolves its repository root before reconciling, so stored absolute
+  paths are no longer all treated as stale, and a graph built under a genuinely
+  different root is now refused with a clear error instead of being reconciled
+  away file by file (#811).
 - The generated instruction sections no longer tell agents to always use the
   graph before reading source and to fall back to file search only when the
   graph misses. Every platform instruction file now carries the same short
