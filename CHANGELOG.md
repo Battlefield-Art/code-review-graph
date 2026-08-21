@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.3.8] - 2026-08-21
+
 ### Added
 
 - Empty results from `query_graph`, `get_impact_radius`, and
@@ -35,6 +37,25 @@
 
 ### Fixed
 
+- Every MCP tool response is now bounded. #849 found `get_affected_flows`
+  returning roughly 247k tokens inside a workflow documented as "5 tool calls,
+  800 tokens total"; measuring all 30 registered tools against a real
+  5.6k-node graph found the same shape in ten more places, several of them on
+  the default path. Each list now carries a hard ceiling, keeps its
+  untruncated total, and reports "showing N of M" in the summary, so a caller
+  can tell a short answer from a truncated one. Four query tools are still
+  unbounded and tracked in #888 (#849, #853, #887).
+- A repository is now one graph however its root is spelled. Every
+  path-valued `--repo` is canonicalized at the CLI boundary, and the full
+  build, incremental update and watch entry points each resolve their root, so
+  `.`, a relative path, a trailing slash, a symlinked path and an absolute
+  path no longer split the graph or reconcile each other away. An incremental
+  run whose stored `File` nodes all belong to a different root is refused with
+  a clear error instead of emptying the graph file by file, while orphan-only
+  cleanup from #861 is unchanged (#889).
+- A repository reached through a symlinked path is watched and indexed instead
+  of silently dropping every filesystem event, both through
+  `code-review-graph watch --repo` and through `serve --auto-watch` (#892).
 - Watch mode no longer registers OS watches inside ignored trees, and no longer
   keeps running after its filesystem observer dies. Watches are now planned per
   directory (ignored trees are skipped, the repo root is watched
