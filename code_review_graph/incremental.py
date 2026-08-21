@@ -1109,6 +1109,30 @@ def _reconcile_stale_files(
     return stale_files
 
 
+def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
+    """Refuse an incremental reconciliation anchored to a different root.
+
+    Authoritative File nodes identify the root a graph was built with. If none
+    of them are under the requested root, treating every row as stale is more
+    likely to destroy a usable graph than to clean up orphan rows. Orphan-only
+    databases have no File markers and retain the purge behavior from #861.
+    """
+    file_paths = store.get_file_marker_paths()
+    if not file_paths:
+        return
+    prefix = normalize_file_path(repo_root)
+    prefix = prefix if prefix.endswith("/") else prefix + "/"
+    if any(normalize_file_path(path).startswith(prefix) for path in file_paths):
+        return
+    sample = normalize_file_path(sorted(file_paths)[0])
+    raise RuntimeError(
+        f"the graph holds {len(file_paths)} file(s) such as {sample!r}, none of "
+        f"them under {str(repo_root)!r}; it was built with a different "
+        "repository root. Rebuild it, or retry with the root it was built "
+        "with, instead of reconciling every file away."
+    )
+
+
 _MAX_DEPENDENT_HOPS = int(os.environ.get("CRG_DEPENDENT_HOPS", "2"))
 _MAX_DEPENDENT_FILES = 500
 
@@ -1218,6 +1242,16 @@ def _parse_single_file(
         return (rel_path, [], [], str(e), "")
 
 
+def _canonical_repo_root(repo_root: Path) -> Path:
+    """Return one stable identity for a repository root.
+
+    Graph paths are anchored to the root supplied by the caller. Resolving the
+    root once prevents equivalent spellings (notably ``.`` and an absolute
+    path) from looking like two different repositories during reconciliation.
+    """
+    return Path(repo_root).expanduser().resolve()
+
+
 def full_build(
     repo_root: Path,
     store: GraphStore,
@@ -1231,6 +1265,7 @@ def full_build(
         recurse_submodules: If True, include files from git submodules.
             When *None*, falls back to ``CRG_RECURSE_SUBMODULES`` env var.
     """
+    repo_root = _canonical_repo_root(repo_root)
     parser = CodeParser(repo_root)
     files = collect_all_files(repo_root, recurse_submodules)
     stale_files = _reconcile_stale_files(repo_root, store, files)
@@ -1334,6 +1369,9 @@ def incremental_update(
     reconcile_stale: bool = True,
 ) -> dict:
     """Incremental update: re-parse changed + dependent files only."""
+    repo_root = _canonical_repo_root(repo_root)
+    if reconcile_stale:
+        _assert_graph_matches_root(repo_root, store)
     parser = CodeParser(repo_root)
     ignore_patterns = _load_ignore_patterns(repo_root)
 
@@ -2298,32 +2336,6 @@ def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
         handler.dispatch(DirDeletedEvent(path))
 
 
-def _assert_graph_matches_root(store: GraphStore, repo_root: Path) -> None:
-    """Refuse to reconcile a graph that was built under a different root.
-
-    Stored paths are spelled relative to whatever root built them, and
-    reconciliation deletes every file it cannot place under the current root
-    (#861).  A graph built with an absolute root and watched with a relative
-    one therefore empties itself on startup, silently.  Watch mode is
-    incremental by definition, so a total mismatch is a configuration error,
-    not a repository where every file was deleted at once.
-    """
-    stored = store.get_all_files()
-    if not stored:
-        return
-    prefix = normalize_file_path(repo_root)
-    prefix = prefix if prefix.endswith("/") else prefix + "/"
-    if any(path.startswith(prefix) for path in stored):
-        return
-    sample = normalize_file_path(sorted(stored)[0])
-    raise RuntimeError(
-        f"the graph holds {len(stored)} file(s) such as {sample!r}, none of them under "
-        f"{str(repo_root)!r}; it was built with a different repository root. "
-        "Rebuild it, or start the watcher with the root it was built with, instead of "
-        "reconciling every file away."
-    )
-
-
 def _install_sigterm_interrupt() -> Callable[[], None]:
     """Make SIGTERM unwind like Ctrl+C, and return an undo callable.
 
@@ -2383,8 +2395,7 @@ def watch(
     # One boundary, once: ``--repo .`` reaches here relative, and every path
     # comparison below — stored file paths, watch keys, event paths — assumes
     # they are all spelled the same way.
-    repo_root = Path(os.path.abspath(repo_root))
-    _assert_graph_matches_root(store, repo_root)
+    repo_root = _canonical_repo_root(repo_root)
     supervisor = _WatchSupervisor(
         None,
         repo_root,
