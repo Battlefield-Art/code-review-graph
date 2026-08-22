@@ -279,7 +279,7 @@ off for the whole repository.
 If a tool returns an ImportError, install the relevant optional group:
 - `pip install "code-review-graph[embeddings]"` for semantic search
 - `pip install "code-review-graph[google-embeddings]"` for Google Gemini embeddings
-- OpenAI-compatible and MiniMax embeddings use stdlib HTTP clients and require only their environment variables
+- OpenAI-compatible, MiniMax and Voyage AI embeddings use stdlib HTTP clients and require only their environment variables
 - `pip install "code-review-graph[communities]"` for igraph-based community detection
 - `pip install "code-review-graph[enrichment]"` for Python call-resolution enrichment via Jedi
 - `pip install "code-review-graph[eval]"` for evaluation benchmarks (matplotlib)

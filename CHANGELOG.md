@@ -37,7 +37,7 @@
 
 ### Fixed
 
-- Every MCP tool response is now bounded. #849 found `get_affected_flows`
+- Almost every MCP tool response is now bounded. #849 found `get_affected_flows`
   returning roughly 247k tokens inside a workflow documented as "5 tool calls,
   800 tokens total"; measuring all 30 registered tools against a real
   5.6k-node graph found the same shape in ten more places, several of them on

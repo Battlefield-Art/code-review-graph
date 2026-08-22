@@ -19,6 +19,7 @@ from typing import Optional
 
 from fastmcp import FastMCP
 
+from . import __version__
 from . import incremental as _incremental
 from .graph import GraphStore
 from .incremental import find_project_root, get_db_path, start_watch_thread
@@ -88,6 +89,7 @@ def _resolve_repo_root(repo_root: Optional[str]) -> Optional[str]:
 
 mcp = FastMCP(
     "code-review-graph",
+    version=__version__,
     instructions=(
         "Persistent incremental knowledge graph for token-efficient, "
         "context-aware code reviews. Parses your codebase with Tree-sitter, "

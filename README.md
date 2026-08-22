@@ -298,7 +298,7 @@ The benchmark also runs an honest **co-change mode**: the predictor is seeded wi
 | **Framework-aware PHP parsing** | Repository-bounded Composer PSR-4 imports, Blade template references, and evidence-gated Laravel Route-to-controller and Eloquent relationship edges |
 | **Blast-radius analysis** | Shows which functions, classes, and files are likely affected by a change |
 | **Auto-update hooks** | Hooks and watch mode can update the graph on file saves and supported commit hooks |
-| **Semantic search** | Optional vector embeddings via sentence-transformers, Google Gemini, MiniMax, or any OpenAI-compatible endpoint (real OpenAI, Azure, new-api, LiteLLM, vLLM, LocalAI) |
+| **Semantic search** | Optional vector embeddings via sentence-transformers, Google Gemini, MiniMax, Voyage AI, or any OpenAI-compatible endpoint (real OpenAI, Azure, new-api, LiteLLM, vLLM, LocalAI) |
 | **Interactive visualisation** | D3.js force-directed graph with search, community legend toggles, and degree-scaled nodes |
 | **Hub & bridge detection** | Find most-connected nodes and architectural chokepoints via betweenness centrality |
 | **Surprise scoring** | Detect unexpected coupling: cross-community, cross-language, peripheral-to-hub edges |
