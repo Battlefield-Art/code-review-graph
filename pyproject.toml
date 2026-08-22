@@ -100,6 +100,14 @@ include = [
     "README.md",
     "pyproject.toml",
 ]
+# Hatch adds readme- and licence-named files from anywhere in the tree on top
+# of `include`, which pulled the issue tracker's hooks and the VS Code
+# extension's own README and LICENSE into the source distribution. (Hatchling
+# always ships `.gitignore`; that one cannot be excluded.)
+exclude = [
+    ".beads/",
+    "code-review-graph-vscode/",
+]
 
 [tool.ruff]
 line-length = 100
