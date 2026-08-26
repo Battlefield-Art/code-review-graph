@@ -1024,6 +1024,10 @@ class TestWatchLoop:
         assert seen[0].get("phase") == "initial-build"
         assert seen[0].get("stalled") is False
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="os.kill(SIGTERM) terminates Windows processes before the handler can run",
+    )
     def test_sigterm_clears_the_health_file(self, tmp_path):
         """`crg-daemon stop` sends SIGTERM; a leftover file reads as stalled."""
         import os
