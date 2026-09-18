@@ -203,6 +203,111 @@ def test_test_gaps_section(report):
     assert "(auth/session.py:42)" in body
 
 
+# ---------------------------------------------------------------------------
+# Indirect coverage (#1047): reached through a caller vs. no test in reach
+# ---------------------------------------------------------------------------
+
+
+def _indirect_report() -> dict:
+    """One unreached gap and one reached only through its caller."""
+    return {
+        "risk_score": 0.80,
+        "review_priorities": [
+            {
+                "qualified_name": "code_review_graph/main.py::_offload",
+                "name": "_offload",
+                "file_path": "code_review_graph/main.py",
+                "line_start": 130,
+                "risk_score": 0.62,
+                "is_test": False,
+            },
+            {
+                "qualified_name": "code_review_graph/incremental.py::orphan",
+                "name": "orphan",
+                "file_path": "code_review_graph/incremental.py",
+                "line_start": 900,
+                "risk_score": 0.55,
+                "is_test": False,
+            },
+        ],
+        "affected_flows": [],
+        "test_gaps": [
+            {
+                "name": "orphan",
+                "qualified_name": "code_review_graph/incremental.py::orphan",
+                "file": "code_review_graph/incremental.py",
+                "line_start": 900,
+                "line_end": 929,
+                "coverage": "none",
+            },
+            {
+                "name": "_offload",
+                "qualified_name": "code_review_graph/main.py::_offload",
+                "file": "code_review_graph/main.py",
+                "line_start": 130,
+                "line_end": 140,
+                "coverage": "indirect",
+                "covered_via": "code_review_graph/main.py::_run_off_loop",
+                "covered_depth": 1,
+                "covered_by": ["tests/test_main.py::test_offload"],
+            },
+        ],
+        "test_gaps_uncovered": 1,
+        "test_gaps_indirect": 1,
+    }
+
+
+def test_headline_splits_the_two_gap_kinds():
+    body = render.render_markdown(_indirect_report())
+    assert (
+        "2 test gap(s) (1 with no test in reach, 1 reached only through a caller)"
+    ) in body
+
+
+def test_indirect_gaps_get_their_own_section_naming_the_caller():
+    body = render.render_markdown(_indirect_report())
+    assert "### Test gaps" in body
+    assert "### Covered only through a caller" in body
+    gaps_at = body.index("### Test gaps")
+    indirect_at = body.index("### Covered only through a caller")
+    assert gaps_at < indirect_at
+    # The unreached one is under the first heading, not the second.
+    assert body.index(render.md_escape("incremental.py::orphan")) < indirect_at
+    assert render.md_escape("main.py::_run_off_loop") in body
+    assert "1 hop(s)" in body
+
+
+def test_tested_column_says_indirect_not_no():
+    body = render.render_markdown(_indirect_report())
+    offload_row = next(
+        line for line in body.splitlines() if "_offload" in line and "| 0.62" in line
+    )
+    assert offload_row.rstrip().endswith("| indirect |")
+    orphan_row = next(
+        line for line in body.splitlines() if "orphan" in line and "| 0.55" in line
+    )
+    assert orphan_row.rstrip().endswith("| no |")
+
+
+def test_a_report_without_coverage_keys_renders_as_before(report):
+    """Back-compat: a pre-#1047 report has no ``coverage`` field at all."""
+    body = render.render_markdown(report)
+    assert "### Test gaps" in body
+    assert "Covered only through a caller" not in body
+    assert "1 test gap(s)" in body
+    assert "no test in reach" not in body
+
+
+def test_truncated_report_uses_the_reported_counts():
+    """The gap list is bounded upstream; the split must not be recounted."""
+    payload = _indirect_report()
+    payload["test_gaps"] = payload["test_gaps"][:1]
+    payload["test_gaps_uncovered"] = 60
+    payload["test_gaps_indirect"] = 14
+    body = render.render_markdown(payload)
+    assert "60 with no test in reach, 14 reached only through a caller" in body
+
+
 def test_token_savings_line(report):
     body = render.render_markdown(report)
     assert "**Token savings:**" in body

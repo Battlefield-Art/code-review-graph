@@ -23,6 +23,7 @@ import networkx as nx
 
 from .constants import (
     BFS_ENGINE,
+    CALLER_TEST_ROUTE_DEPTH,
     IMPACT_DEFAULT_EDGE_DIRECTION,
     IMPACT_DEFAULT_EDGE_WEIGHT,
     IMPACT_DEPTH_DECAY,
@@ -367,6 +368,22 @@ def _edge_import_scope(extra: Optional[str]) -> Optional[str]:
         return None
     scope = payload.get(IMPORT_SCOPE_KEY) if isinstance(payload, dict) else None
     return scope if isinstance(scope, str) else None
+
+
+def _edge_extra_is_unresolved(extra: Optional[str]) -> bool:
+    """True when an edge's ``extra`` marks its endpoint as unresolved.
+
+    An edge carrying ``ambiguous_targets`` or ``unresolved_targets`` names a
+    set of candidates rather than one node, so no traversal may treat it as a
+    fact about a specific symbol.
+    """
+    try:
+        payload = json.loads(extra or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and (
+        "ambiguous_targets" in payload or "unresolved_targets" in payload
+    )
 
 
 def _parent_dir(path: Optional[str]) -> Optional[str]:
@@ -1314,16 +1331,6 @@ class GraphStore:
                 "indirect": indirect,
             }
 
-        def _has_unresolved_metadata(raw_extra: str | None) -> bool:
-            try:
-                edge_extra = json.loads(raw_extra or "{}")
-            except (TypeError, json.JSONDecodeError):
-                return False
-            return isinstance(edge_extra, dict) and (
-                "ambiguous_targets" in edge_extra
-                or "unresolved_targets" in edge_extra
-            )
-
         # Direct TESTED_BY (source=production, target=test). See: #515
         for qn in input_qns:
             for row in conn.execute(
@@ -1331,7 +1338,7 @@ class GraphStore:
                 "WHERE source_qualified = ? AND kind = 'TESTED_BY'",
                 (qn,),
             ).fetchall():
-                if _has_unresolved_metadata(row["extra"]):
+                if _edge_extra_is_unresolved(row["extra"]):
                     continue
                 tgt = row["target_qualified"]
                 if tgt not in seen:
@@ -1392,7 +1399,7 @@ class GraphStore:
             "WHERE source_qualified = ? AND kind = 'TESTED_BY'",
             (bare,),
         ).fetchall():
-            if _has_unresolved_metadata(row["extra"]):
+            if _edge_extra_is_unresolved(row["extra"]):
                 continue
             if _candidate_for_context(bare, row["file_path"]) != qualified_name:
                 continue
@@ -1429,7 +1436,7 @@ class GraphStore:
                     "WHERE source_qualified = ? AND kind = 'CALLS'",
                     (qn,),
                 ).fetchall():
-                    if _has_unresolved_metadata(row["extra"]):
+                    if _edge_extra_is_unresolved(row["extra"]):
                         continue
                     next_frontier.add(row["target_qualified"])
             if len(next_frontier) > max_frontier:
@@ -1445,7 +1452,7 @@ class GraphStore:
                     "WHERE source_qualified = ? AND kind = 'TESTED_BY'",
                     (callee,),
                 ).fetchall():
-                    if _has_unresolved_metadata(row["extra"]):
+                    if _edge_extra_is_unresolved(row["extra"]):
                         continue
                     tgt = row["target_qualified"]
                     if tgt not in seen:
@@ -1456,6 +1463,156 @@ class GraphStore:
             frontier = next_frontier
 
         return results
+
+    def get_directly_tested(self, qualified_names: Iterable[str]) -> set[str]:
+        """Which of *qualified_names* carry a TESTED_BY edge of their own.
+
+        One batched query per 450 names instead of one edge fetch per symbol;
+        a test-gap report asks this about every changed symbol at once.
+        """
+        names = [qn for qn in dict.fromkeys(qualified_names) if qn]
+        tested: set[str] = set()
+        for start in range(0, len(names), 450):
+            batch = names[start:start + 450]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                "SELECT DISTINCT source_qualified FROM edges "
+                f"WHERE kind = 'TESTED_BY' AND source_qualified IN ({placeholders})",
+                batch,
+            ).fetchall()
+            tested.update(row["source_qualified"] for row in rows)
+        return tested
+
+    def get_caller_test_routes(
+        self,
+        qualified_names: Iterable[str],
+        max_depth: int = CALLER_TEST_ROUTE_DEPTH,
+        max_frontier: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Find, for each input symbol, a tested *caller* that reaches it.
+
+        This is the opposite direction from :meth:`get_transitive_tests`, which
+        walks *outgoing* CALLS to ask "do the things this symbol calls have
+        tests?". Here the walk is *upwards* over incoming CALLS edges: a
+        private helper that no test names directly is still executed by every
+        test of the public function that calls it, and reporting it as
+        "untested" is wrong (#1047).
+
+        The two claims are not interchangeable, so the caller must keep them
+        apart. Reachability is not execution: a helper can sit under two
+        well-tested callers on a branch none of their tests take. The routes
+        returned here say "a test reaches this", never "a test asserts this",
+        which is why ``analyze_changes`` keeps an indirectly covered symbol in
+        the gap report instead of dropping it.
+
+        Args:
+            qualified_names: Symbols with no direct TESTED_BY edge of their own.
+            max_depth: Maximum CALLS hops to walk upwards. The default of
+                ``CALLER_TEST_ROUTE_DEPTH`` (2) is measured, not guessed: on
+                this repository depths 3-5 rescue no additional symbol while
+                each concedes another ~8% of the codebase to "covered".
+            max_frontier: Cap on the callers examined per hop, across all
+                inputs. Defaults to ``CRG_MAX_CALLER_ROUTE_FRONTIER`` (2000).
+                A hub with thousands of callers must not turn one report into
+                a graph-wide scan.
+
+        Returns:
+            ``{qualified_name: {"via", "depth", "tests"}}`` holding only the
+            inputs that were reached. ``via`` is the tested caller, ``depth``
+            the hop count (1 = a direct caller), ``tests`` up to three of that
+            caller's test symbols. Inputs absent from the mapping have no
+            tested caller within *max_depth*.
+        """
+        if max_frontier is None:
+            max_frontier = env_int("CRG_MAX_CALLER_ROUTE_FRONTIER", 2000)
+        seeds = [qn for qn in dict.fromkeys(qualified_names) if qn]
+        routes: dict[str, dict[str, Any]] = {}
+        if not seeds or max_depth < 1:
+            return routes
+
+        # node -> the seeds whose route currently passes through it. The walk
+        # is level-synchronous and batched over every seed at once: one CALLS
+        # query and one TESTED_BY query per hop, rather than a BFS per symbol.
+        # On a 248-symbol delta that is 4 queries instead of several hundred.
+        frontier: dict[str, set[str]] = {qn: {qn} for qn in seeds}
+        # node -> seeds already expanded through it, so a call cycle
+        # terminates instead of re-walking the same edges each hop.
+        expanded: dict[str, set[str]] = {qn: set(origins) for qn, origins in frontier.items()}
+
+        for depth in range(1, max_depth + 1):
+            callers: dict[str, set[str]] = {}
+            keys = sorted(frontier)
+            for start in range(0, len(keys), 450):
+                batch = keys[start:start + 450]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._conn.execute(  # nosec B608
+                    "SELECT source_qualified, target_qualified, extra FROM edges "
+                    f"WHERE kind = 'CALLS' AND target_qualified IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    if _edge_extra_is_unresolved(row["extra"]):
+                        continue
+                    caller = row["source_qualified"]
+                    # A bare caller name has no stable identity, so its
+                    # TESTED_BY edges belong to no particular node. Crediting
+                    # coverage through one would attribute every same-named
+                    # function's tests to this symbol.
+                    if "::" not in caller:
+                        continue
+                    origins = frontier.get(row["target_qualified"])
+                    if not origins:
+                        continue
+                    fresh = origins - expanded.get(caller, frozenset())
+                    fresh.discard(caller)
+                    if fresh:
+                        callers.setdefault(caller, set()).update(fresh)
+            if not callers:
+                break
+            if len(callers) > max_frontier:
+                # Sorted, so a truncated walk is at least reproducible.
+                callers = {name: callers[name] for name in sorted(callers)[:max_frontier]}
+
+            tests: dict[str, list[str]] = {}
+            caller_names = sorted(callers)
+            for start in range(0, len(caller_names), 450):
+                batch = caller_names[start:start + 450]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._conn.execute(  # nosec B608
+                    "SELECT source_qualified, target_qualified, extra FROM edges "
+                    f"WHERE kind = 'TESTED_BY' AND source_qualified IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    if _edge_extra_is_unresolved(row["extra"]):
+                        continue
+                    bucket = tests.setdefault(row["source_qualified"], [])
+                    if len(bucket) < 3 and row["target_qualified"] not in bucket:
+                        bucket.append(row["target_qualified"])
+
+            for caller in caller_names:
+                covered = tests.get(caller)
+                if not covered:
+                    continue
+                for origin in callers[caller]:
+                    if origin not in routes:
+                        routes[origin] = {
+                            "via": caller,
+                            "depth": depth,
+                            "tests": list(covered),
+                        }
+
+            next_frontier: dict[str, set[str]] = {}
+            for caller in caller_names:
+                remaining = {o for o in callers[caller] if o not in routes}
+                expanded.setdefault(caller, set()).update(callers[caller])
+                if remaining:
+                    next_frontier[caller] = remaining
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        return routes
 
     @staticmethod
     def _python_module_file_index(conn: sqlite3.Connection) -> dict[str, str]:

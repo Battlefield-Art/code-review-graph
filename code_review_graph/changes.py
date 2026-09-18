@@ -35,6 +35,13 @@ _TEST_GAP_EXEMPT_NAMES = frozenset({
     "__construct", "__init__", "__destruct",
 })
 
+# Discount on the 0.30 "no tests" risk term for a symbol that only a tested
+# caller reaches. Smaller than the 0.05 one direct test earns, on purpose:
+# a test whose call chain passes through a symbol proves it is reachable, not
+# that anything checks what it returns. Keeping the credit below one direct
+# test keeps the ordering honest -- own tests always beat borrowed ones.
+_INDIRECT_COVERAGE_CREDIT = 0.03
+
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
 
@@ -571,6 +578,7 @@ def compute_risk_score(
     store: GraphStore,
     node: GraphNode,
     churn_counts: dict[str, int] | None = None,
+    reached_by_tested_caller: bool = False,
 ) -> float:
     """Compute a risk score (0.0 - 1.0) for a single node.
 
@@ -582,6 +590,17 @@ def compute_risk_score(
       - Caller count: callers / 20, capped at 0.10
       - Change frequency (opt-in): commits touching the file / 10, capped
         at 0.15
+
+    Args:
+        reached_by_tested_caller: The node has no test of its own but a tested
+            caller reaches it (see
+            :meth:`~code_review_graph.graph.GraphStore.get_caller_test_routes`).
+            Worth a small, fixed discount and deliberately nothing more: a
+            test that runs through this symbol is more than no test at all,
+            but it asserts nothing about it, so the credit stays strictly
+            smaller than the 0.05 a single direct test earns. It applies only
+            when the node has no direct coverage, so it can never stack on
+            top of real tests.
     """
     score = 0.0
 
@@ -611,7 +630,10 @@ def compute_risk_score(
     # --- Test coverage (direct + transitive) ---
     transitive_tests = store.get_transitive_tests(node.qualified_name)
     test_count = len(transitive_tests)
-    score += 0.30 - (min(test_count / 5.0, 1.0) * 0.25)
+    coverage_risk = 0.30 - (min(test_count / 5.0, 1.0) * 0.25)
+    if test_count == 0 and reached_by_tested_caller:
+        coverage_risk -= _INDIRECT_COVERAGE_CREDIT
+    score += coverage_risk
 
     # --- Security sensitivity ---
     name_lower = node.name.lower()
@@ -669,6 +691,13 @@ def analyze_changes(
         ``churn_status`` (``"ok"``, ``"unavailable"`` when the git history
         could not be read and the scores therefore exclude the
         change-frequency term, or ``"off"`` when it was not requested).
+
+        Each ``test_gaps`` entry carries ``coverage``: ``"none"`` when no test
+        reaches the symbol at all, or ``"indirect"`` when one only reaches it
+        through a caller -- those entries also carry ``covered_via``,
+        ``covered_depth`` and ``covered_by``. Unreached entries sort first, and
+        ``test_gaps_uncovered``/``test_gaps_indirect`` hold the two counts for
+        consumers that truncate the list.
     """
     # Compute changed ranges if not provided.
     ranges_unavailable = ""
@@ -746,10 +775,54 @@ def analyze_changes(
             churn_counts[key] = count
             churn_counts[normalize_file_path(root_path / key)] = count
 
+    # Classify test coverage before scoring: the same answer decides both the
+    # gap report and the coverage term of every node's risk score, and doing
+    # it once for the whole change set keeps it to a handful of batched
+    # queries instead of a walk per symbol.
+    #
+    # Stored file paths are absolute, so test-ness is judged against the path
+    # relative to the repository root: reading ``tests/`` out of an absolute
+    # path would also match a directory above the checkout, and a repository
+    # cloned into a CI workspace named "test" would report no gaps at all
+    # (issue #1023). ``repo_root`` is the caller's; the graph's own recorded
+    # root covers callers that pass none.
+    gap_root = repo_root or store.get_repo_root()
+    # A symbol that lives in a test file is test code and can never be a gap
+    # in production test coverage. The path is checked as well as the stored
+    # flag so a graph built before the parser marked non-function test nodes
+    # still gives the right answer: those rows carry ``is_test = 0`` and used
+    # to be reported back to the author as their own tests needing tests
+    # (issue #1014).
+    gap_candidates = [
+        node for node in changed_funcs
+        if not (node.is_test or is_test_file(node.file_path, gap_root))
+        and node.name not in _TEST_GAP_EXEMPT_NAMES
+    ]
+    # TESTED_BY edges are stored as source=production, target=test by the
+    # parser, so a changed production function finds its tests by source.
+    # See: #515
+    directly_tested = store.get_directly_tested(
+        node.qualified_name for node in gap_candidates
+    )
+    # A private helper that no test names by hand is still executed by every
+    # test of the public function calling it, and calling it "untested" is a
+    # false alarm the author cannot act on (#1047). Walk up the CALLS graph to
+    # find such a caller -- but the answer stays in its own weaker class
+    # below, never a suppression: a reachable symbol is not an asserted one.
+    caller_routes = store.get_caller_test_routes(
+        node.qualified_name for node in gap_candidates
+        if node.qualified_name not in directly_tested
+    )
+
     # Compute per-node risk scores.
     node_risks: list[dict[str, Any]] = []
     for node in changed_funcs:
-        risk = compute_risk_score(store, node, churn_counts)
+        risk = compute_risk_score(
+            store,
+            node,
+            churn_counts,
+            reached_by_tested_caller=node.qualified_name in caller_routes,
+        )
         node_risks.append({
             **node_to_dict(node),
             "risk_score": risk,
@@ -761,70 +834,86 @@ def analyze_changes(
     # Affected flows.
     affected = get_affected_flows(store, changed_files)
 
-    # Detect test gaps: changed functions without TESTED_BY edges.
-    #
-    # Stored file paths are absolute, so test-ness is judged against the path
-    # relative to the repository root: reading ``tests/`` out of an absolute
-    # path would also match a directory above the checkout, and a repository
-    # cloned into a CI workspace named "test" would report no gaps at all
-    # (issue #1023). ``repo_root`` is the caller's; the graph's own recorded
-    # root covers callers that pass none.
-    gap_root = repo_root or store.get_repo_root()
+    # Split the gaps into the two claims a reader has to tell apart: no test
+    # comes near this symbol, versus a test only reaches it through a caller.
     test_gaps: list[dict[str, Any]] = []
-    for node in changed_funcs:
-        # A symbol that lives in a test file is test code and can never be a
-        # gap in production test coverage. The path is checked as well as the
-        # stored flag so a graph built before the parser marked non-function
-        # test nodes still gives the right answer: those rows carry
-        # ``is_test = 0`` and used to be reported back to the author as their
-        # own tests needing tests (issue #1014).
-        if node.is_test or is_test_file(node.file_path, gap_root):
+    indirect_gaps: list[dict[str, Any]] = []
+    for node in gap_candidates:
+        if node.qualified_name in directly_tested:
             continue
-        if node.name in _TEST_GAP_EXEMPT_NAMES:
-            continue
-        # TESTED_BY edges are stored as source=production, target=test by the
-        # parser, so a changed production function finds its tests by source.
-        # See: #515
-        tested = store.get_edges_by_source(node.qualified_name)
-        if not any(e.kind == "TESTED_BY" for e in tested):
-            test_gaps.append({
-                "name": _sanitize_name(node.name),
-                "qualified_name": _sanitize_name(node.qualified_name),
-                "file": node.file_path,
-                "line_start": node.line_start,
-                "line_end": node.line_end,
-            })
+        entry: dict[str, Any] = {
+            "name": _sanitize_name(node.name),
+            "qualified_name": _sanitize_name(node.qualified_name),
+            "file": node.file_path,
+            "line_start": node.line_start,
+            "line_end": node.line_end,
+        }
+        route = caller_routes.get(node.qualified_name)
+        if route is None:
+            entry["coverage"] = "none"
+            test_gaps.append(entry)
+        else:
+            entry["coverage"] = "indirect"
+            entry["covered_via"] = _sanitize_name(str(route["via"]))
+            entry["covered_depth"] = route["depth"]
+            entry["covered_by"] = [_sanitize_name(str(t)) for t in route["tests"]]
+            indirect_gaps.append(entry)
+    uncovered_count = len(test_gaps)
+    indirect_count = len(indirect_gaps)
+    # Unreached first: every consumer bounds this list, and the rows that must
+    # survive truncation are the ones with no test anywhere near them.
+    test_gaps.extend(indirect_gaps)
 
     # Review priorities: top 10 by risk score.
     review_priorities = sorted(node_risks, key=lambda x: x["risk_score"], reverse=True)[:10]
 
     # Build summary.
+    gap_line = f"  - {len(test_gaps)} test gap(s)"
+    if indirect_count:
+        gap_line += (
+            f" ({uncovered_count} with no test in reach, "
+            f"{indirect_count} reached only through a caller)"
+        )
     summary_parts = [
         f"Analyzed {len(changed_files)} changed file(s):",
         f"  - {len(changed_funcs)} changed function(s)/class(es)",
         f"  - {affected['total']} affected flow(s)",
-        f"  - {len(test_gaps)} test gap(s)",
+        gap_line,
         f"  - Overall risk score: {overall_risk:.2f}",
     ]
-    if test_gaps:
-        # Dedup by bare name in the human summary. The underlying test_gaps
-        # list keeps every entry (a downstream consumer needs precision via
-        # qualified_name), but a graph that ended up with the same function
-        # stored under two qualified_names (e.g. relative + absolute path
-        # variants) would otherwise print "X, X, Y, Y" — surfacing graph
-        # corruption as a UX bug. The root cause is path normalization;
-        # this is the defensive last line.
+
+    # Dedup by bare name in the human summary. The underlying test_gaps list
+    # keeps every entry (a downstream consumer needs precision via
+    # qualified_name), but a graph that ended up with the same function
+    # stored under two qualified_names (e.g. relative + absolute path
+    # variants) would otherwise print "X, X, Y, Y" — surfacing graph
+    # corruption as a UX bug. The root cause is path normalization;
+    # this is the defensive last line.
+    def _gap_names(entries: list[dict[str, Any]], limit: int = 5) -> list[str]:
         seen_names: set[str] = set()
-        gap_names: list[str] = []
-        for g in test_gaps:
+        names: list[str] = []
+        for g in entries:
             n = g["name"]
             if n in seen_names:
                 continue
             seen_names.add(n)
-            gap_names.append(n)
-            if len(gap_names) >= 5:
+            names.append(n)
+            if len(names) >= limit:
                 break
-        summary_parts.append(f"  - Untested: {', '.join(gap_names)}")
+        return names
+
+    if uncovered_count:
+        summary_parts.append(
+            f"  - Untested: {', '.join(_gap_names(test_gaps[:uncovered_count]))}"
+        )
+    if indirect_count:
+        # Named separately, because acting on the two lists differs: these
+        # symbols run under an existing test and need an assertion of their
+        # own, not a test written from nothing.
+        summary_parts.append(
+            "  - Reached only through a caller: "
+            f"{', '.join(_gap_names(indirect_gaps))}"
+        )
     if funcs_truncated:
         summary_parts.append(
             f"  - Warning: analysis capped at {_max_funcs} functions "
@@ -852,6 +941,11 @@ def analyze_changes(
         "changed_functions": node_risks,
         "affected_flows": affected["affected_flows"],
         "test_gaps": test_gaps,
+        # Counts, not just the list: every consumer bounds ``test_gaps``, and
+        # the split between "no test in reach" and "reached through a caller"
+        # must survive that truncation.
+        "test_gaps_uncovered": uncovered_count,
+        "test_gaps_indirect": indirect_count,
         "review_priorities": review_priorities,
         "functions_truncated": funcs_truncated,
         "diff_ranges_unavailable": ranges_unavailable,
