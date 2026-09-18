@@ -576,6 +576,15 @@ class TestGitOperations:
         assert "-z" in mock_run.call_args_list[1].args[0]
 
     @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_changed_files_strict_failure_does_not_fallback(self, mock_run, tmp_path):
+        mock_run.return_value = MagicMock(returncode=128, stdout=b"")
+
+        with pytest.raises(RuntimeError, match="git diff failed"):
+            get_changed_files(tmp_path, strict=True)
+
+        mock_run.assert_called_once()
+
+    @patch("code_review_graph.incremental.subprocess.run")
     def test_get_changed_files_rejects_failed_fallback(self, mock_run, tmp_path):
         mock_run.side_effect = [
             MagicMock(returncode=128, stdout=b""),
@@ -637,10 +646,30 @@ class TestGitOperations:
     def test_get_all_tracked_files(self, mock_run, tmp_path):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\nb.py\nc.go\n",
+            stdout="a.py\0b.py\0c.go\0",
         )
         result = get_all_tracked_files(tmp_path)
         assert result == ["a.py", "b.py", "c.go"]
+        assert "-z" in mock_run.call_args[0][0]
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_all_tracked_files_keeps_paths_git_would_quote(
+        self, mock_run, tmp_path
+    ):
+        """-z means no C-quoting, so odd paths arrive usable.
+
+        Without it core.quotePath makes git answer
+        '"src/caf\\303\\251.py"' — quotes and backslashes included — and the
+        file is dropped from the inventory because that spelling is not on
+        disk. A newline in a path would also end a record.
+        """
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="src/caf\u00e9.py\0src/my module.py\0src/two\nlines.py\0",
+        )
+        assert get_all_tracked_files(tmp_path) == [
+            "src/caf\u00e9.py", "src/my module.py", "src/two\nlines.py",
+        ]
 
     @patch("code_review_graph.incremental.subprocess.run")
     def test_get_all_tracked_files_recurse_submodules_param(
@@ -648,7 +677,7 @@ class TestGitOperations:
     ):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\nsub/b.py\n",
+            stdout="a.py\0sub/b.py\0",
         )
         result = get_all_tracked_files(tmp_path, recurse_submodules=True)
         assert result == ["a.py", "sub/b.py"]
@@ -661,7 +690,7 @@ class TestGitOperations:
     ):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\n",
+            stdout="a.py\0",
         )
         result = get_all_tracked_files(tmp_path)
         assert result == ["a.py"]
@@ -675,7 +704,7 @@ class TestGitOperations:
     ):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\nsub/c.py\n",
+            stdout="a.py\0sub/c.py\0",
         )
         # None -> falls back to env var (_RECURSE_SUBMODULES=True)
         result = get_all_tracked_files(tmp_path, recurse_submodules=None)
@@ -690,7 +719,7 @@ class TestGitOperations:
     ):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\n",
+            stdout="a.py\0",
         )
         # Explicit False overrides env var
         result = get_all_tracked_files(tmp_path, recurse_submodules=False)
@@ -1400,8 +1429,12 @@ class TestWatchReconciliation:
             with (
                 patch("watchdog.observers.Observer") as observer,
                 patch("time.sleep", side_effect=KeyboardInterrupt),
+                # Patch the entry point post-processing calls, not the
+                # rebuild underneath it: whether a sync rebuilds or applies
+                # a delta depends on how much of the graph moved, and this
+                # test is about the warning, not about which path ran.
                 patch(
-                    "code_review_graph.search.rebuild_fts_index",
+                    "code_review_graph.search.update_fts_index",
                     side_effect=sqlite3.OperationalError("forced FTS failure"),
                 ),
                 pytest.raises(
@@ -1811,5 +1844,160 @@ class TestRenamePurgeParity:
             # Old path fully purged, new path present — full-rebuild parity.
             assert store.get_nodes_by_file(str(tmp_path / "a.py")) == []
             assert store.get_nodes_by_file(str(tmp_path / "b.py"))
+        finally:
+            store.close()
+
+
+class TestRevertedContentParity:
+    """Issue #817: an edit/revert round trip must not leave ghost nodes."""
+
+    def test_content_scan_runs_only_for_reconciling_updates(self, tmp_path, monkeypatch):
+        source = tmp_path / "source.py"
+        source.write_text("def foo():\n    return 1\n")
+        scan_calls = []
+
+        def fake_content_scan(repo_root, store):
+            scan_calls.append(repo_root)
+            return [], {}, set()
+
+        monkeypatch.setattr(
+            incremental_module,
+            "_find_content_mismatches",
+            fake_content_scan,
+        )
+
+        store = GraphStore(tmp_path / "graph.db")
+        try:
+            disabled_result = incremental_update(
+                tmp_path,
+                store,
+                changed_files=["source.py"],
+                reconcile_stale=False,
+            )
+
+            assert disabled_result["files_updated"] == 1
+            assert scan_calls == []
+
+            reconciled_result = incremental_update(
+                tmp_path,
+                store,
+                changed_files=[],
+                reconcile_stale=True,
+            )
+
+            assert reconciled_result["files_updated"] == 0
+            assert scan_calls == [tmp_path]
+        finally:
+            store.close()
+
+    def test_reverted_file_with_empty_diff_is_reparsed(self, tmp_path):
+        source = tmp_path / "source.py"
+        original = "def foo():\n    return 1\n"
+        intermediate = original + "\n\ndef bar():\n    return 2\n"
+        source.write_text(original)
+
+        store = GraphStore(tmp_path / "graph.db")
+        try:
+            incremental_update(tmp_path, store, changed_files=["source.py"])
+            function_names = {
+                node.name for node in store.get_nodes_by_file(str(source))
+                if node.kind == "Function"
+            }
+            assert function_names == {"foo"}
+
+            source.write_text(intermediate)
+            incremental_update(tmp_path, store, changed_files=["source.py"])
+            function_names = {
+                node.name for node in store.get_nodes_by_file(str(source))
+                if node.kind == "Function"
+            }
+            assert function_names == {"foo", "bar"}
+
+            source.write_text(original)
+            result = incremental_update(tmp_path, store, changed_files=[])
+
+            assert result["changed_files"] == ["source.py"]
+            assert result["files_updated"] == 1
+            function_names = {
+                node.name for node in store.get_nodes_by_file(str(source))
+                if node.kind == "Function"
+            }
+            assert function_names == {"foo"}
+        finally:
+            store.close()
+
+    def test_reverted_file_is_reconciled_alongside_another_change(self, tmp_path):
+        source = tmp_path / "source.py"
+        other = tmp_path / "other.py"
+        original = "def foo():\n    return 1\n"
+        intermediate = original + "\n\ndef bar():\n    return 2\n"
+        source.write_text(original)
+        other.write_text("def other():\n    return 3\n")
+
+        store = GraphStore(tmp_path / "graph.db")
+        try:
+            incremental_update(
+                tmp_path,
+                store,
+                changed_files=["source.py", "other.py"],
+            )
+
+            source.write_text(intermediate)
+            incremental_update(tmp_path, store, changed_files=["source.py"])
+
+            source.write_text(original)
+            other.write_text("def other():\n    return 4\n")
+            result = incremental_update(tmp_path, store, changed_files=["other.py"])
+
+            assert set(result["changed_files"]) == {"other.py", "source.py"}
+            assert result["files_updated"] == 2
+
+            source_functions = {
+                node.name for node in store.get_nodes_by_file(str(source))
+                if node.kind == "Function"
+            }
+            assert source_functions == {"foo"}
+            other_functions = {
+                node.name for node in store.get_nodes_by_file(str(other))
+                if node.kind == "Function"
+            }
+            assert other_functions == {"other"}
+        finally:
+            store.close()
+
+
+class TestGraphExtraCorruption:
+    def test_get_all_files_survives_malformed_extra_and_false_virtual(self, tmp_path):
+        """#864: a killed writer can leave extra='' and crash every
+        get_all_files caller with SQLite 'malformed JSON'; extra with
+        virtual=false must stay visible so reconciliation can purge it."""
+        good = tmp_path / "good.py"
+        good.write_text("def ok():\n    pass\n")
+        store = GraphStore(tmp_path / "test.db")
+        try:
+            store._conn.execute(
+                "INSERT INTO nodes (kind, name, qualified_name, file_path, "
+                "extra, updated_at) "
+                "VALUES ('Function', 'dead', 'dead', ?, '', 1.0)",
+                (str(tmp_path / "killed.py"),),
+            )
+            store._conn.execute(
+                "INSERT INTO nodes (kind, name, qualified_name, file_path, "
+                "extra, updated_at) "
+                "VALUES ('Class', 'Concrete', 'Concrete', ?, ?, 1.0)",
+                (str(tmp_path / "flagged.py"), '{"virtual": false}'),
+            )
+            store._conn.execute(
+                "INSERT INTO nodes (kind, name, qualified_name, file_path, "
+                "extra, updated_at) "
+                "VALUES ('Event', 'SpringEvent', 'SpringEvent', ?, ?, 1.0)",
+                (str(tmp_path / "virtual.py"), '{"virtual": true}'),
+            )
+            store.commit()
+
+            files = set(store.get_all_files())
+            assert str(tmp_path / "killed.py") in files, "malformed extra must not crash"
+            assert str(tmp_path / "flagged.py") in files, "virtual=false must remain purgeable"
+            assert str(tmp_path / "virtual.py") not in files, "virtual=true stays resolver-managed"
         finally:
             store.close()
