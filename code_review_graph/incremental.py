@@ -23,7 +23,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional
 
 from .build_state import advance_to_postprocess_pending
-from .constants import env_float, env_int
+from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
+from .constants import discovery_timeout, env_float, env_int
 from .errors import ChangeDiscoveryError, GraphRootMismatchError, GraphStoreError
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
@@ -748,8 +749,6 @@ def _is_binary(path: Path) -> bool:
         return True
 
 
-_GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30)  # seconds, configurable
-
 # When True, `git ls-files --recurse-submodules` is used so that files
 # inside git submodules are included in the graph.  Opt-in via env var;
 # can also be overridden per-call through function parameters.
@@ -922,7 +921,13 @@ def resolve_incremental_base(repo_root: Path, store: "GraphStore") -> str | None
     return None
 
 
-def resolve_review_base(repo_root: Path, base: str) -> str:
+def resolve_review_base(
+    repo_root: Path,
+    base: str,
+    *,
+    timeout: float | None = None,
+    require_vcs: bool = False,
+) -> str:
     """Resolve a branch-like Git review base to its common ancestor with HEAD.
 
     ``git diff <branch>`` compares the two tips and therefore includes commits
@@ -934,7 +939,27 @@ def resolve_review_base(repo_root: Path, base: str) -> str:
     If ref detection or merge-base resolution fails (for example in a shallow
     clone), return *base* unchanged so callers retain the existing diff
     behaviour rather than silently reporting no changes.
+
+    Args:
+        repo_root: Repository root directory.
+        base: Git ref to resolve.
+        timeout: Seconds allowed for each Git subprocess. ``None`` (default)
+            uses the general ``CRG_GIT_TIMEOUT`` budget; the change-discovery
+            chain passes the shorter :func:`discovery_timeout` instead.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when git
+            cannot be run or overruns *timeout*, instead of returning *base*
+            unresolved.
+
+            Falling back to the unresolved ref is right for a shallow clone,
+            where there genuinely is no merge base, and wrong for a timeout:
+            the caller then diffs two tips instead of the common ancestor and
+            silently scopes the review to the base branch's commits too. The
+            shorter the budget, the likelier that is, so the discovery chain
+            asks to be told.
     """
+    if timeout is None:
+        timeout = _GIT_TIMEOUT
     if (
         detect_vcs(repo_root) != "git"
         or not base
@@ -951,7 +976,7 @@ def resolve_review_base(repo_root: Path, base: str) -> str:
             encoding="utf-8",
             errors="replace",
             cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
         symbolic_ref = symbolic.stdout.strip()
@@ -967,29 +992,43 @@ def resolve_review_base(repo_root: Path, base: str) -> str:
             encoding="utf-8",
             errors="replace",
             cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
         resolved = result.stdout.strip()
         if result.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved):
             return resolved
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if require_vcs:
+            raise _vcs_unavailable("git", exc, timeout=timeout) from exc
 
     logger.debug("Could not resolve review merge base for %s; using it directly", base)
     return base
 
 
-def _vcs_unavailable(tool: str, exc: BaseException) -> ChangeDiscoveryError:
+def _vcs_unavailable(
+    tool: str, exc: BaseException, *, timeout: float | None = None,
+) -> ChangeDiscoveryError:
     """Describe a VCS command that could not be run at all.
 
     Missing binary and timeout are the two failures that say nothing about
     the working tree, so a caller must never read them as "nothing changed".
+
+    *timeout* is the budget that actually expired. It matters which one is
+    named: change discovery runs on :func:`~.constants.discovery_timeout`,
+    and telling that caller to raise ``CRG_GIT_TIMEOUT`` would send them to a
+    knob that does not govern the call they just made.
     """
     if isinstance(exc, subprocess.TimeoutExpired):
+        budget = _GIT_TIMEOUT if timeout is None else timeout
+        knob = (
+            "CRG_GIT_TIMEOUT"
+            if timeout is None or budget >= _GIT_TIMEOUT
+            else "CRG_DISCOVERY_TIMEOUT"
+        )
         return ChangeDiscoveryError(
             f"could not determine the changes: {tool} timed out after "
-            f"{_GIT_TIMEOUT}s. Raise CRG_GIT_TIMEOUT, or re-run when the "
+            f"{budget:g}s. Raise {knob}, or re-run when the "
             "repository is not busy."
         )
     return ChangeDiscoveryError(
@@ -1003,6 +1042,7 @@ def get_changed_files(
     base: str = "HEAD~1",
     *,
     strict: bool = False,
+    timeout: float | None = None,
     require_vcs: bool = False,
 ) -> list[str]:
     """Get list of changed files via git diff or svn status.
@@ -1013,18 +1053,34 @@ def get_changed_files(
     revision instead.  When *strict* is true, Git discovery failures raise
     instead of being reported as an empty change list.
 
-    *require_vcs* is the narrower half of *strict*, for callers whose whole
-    answer is "these files changed": it raises
-    :class:`~code_review_graph.errors.ChangeDiscoveryError` when the VCS
-    binary is missing or times out, but keeps the documented fallback for a
-    base ref that simply does not resolve (a repository with no commits
-    still has to work).  Returning ``[]`` for a VCS that could not be run is
-    what let ``detect-changes`` report a clean tree it never looked at.
+    Args:
+        repo_root: Repository root directory.
+        base: Git ref (or SVN revision range) to diff against.
+        strict: Raise instead of returning ``[]`` when Git discovery fails.
+        timeout: Seconds allowed for each subprocess. ``None`` (default) uses
+            the general ``CRG_GIT_TIMEOUT`` budget, which is what build,
+            incremental update and watch want; the read-only change-discovery
+            chain passes the shorter :func:`discovery_timeout` instead.
+        require_vcs: The narrower half of *strict*, for callers whose whole
+            answer is "these files changed": it raises
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when the
+            VCS binary is missing or times out, but keeps the documented
+            fallback for a base ref that simply does not resolve (a repository
+            with no commits still has to work). Returning ``[]`` for a VCS that
+            could not be run is what let ``detect-changes`` report a clean tree
+            it never looked at.
+
+            It is also what makes the short *timeout* above safe to use: a
+            budget that is exhausted has to be reported, not rounded down to
+            "no changes".
     """
+    if timeout is None:
+        timeout = _GIT_TIMEOUT
     if detect_vcs(repo_root) == "svn":
         return _get_svn_changed_files(
             repo_root,
             base if _SAFE_SVN_REV.match(base) else None,
+            timeout=timeout,
             require_vcs=require_vcs or strict,
         )
     # Git path
@@ -1040,7 +1096,7 @@ def get_changed_files(
             ["git", "diff", "--name-status", "-z", base, "--"],
             capture_output=True,
             cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
@@ -1053,7 +1109,7 @@ def get_changed_files(
                 ["git", "diff", "--name-status", "-z", "--cached"],
                 capture_output=True,
                 cwd=str(repo_root),
-                timeout=_GIT_TIMEOUT,
+                timeout=timeout,
                 stdin=subprocess.DEVNULL,
             )
         if result.returncode != 0:
@@ -1064,7 +1120,7 @@ def get_changed_files(
         if strict:
             raise ChangeDiscoveryError("git change discovery failed") from exc
         if require_vcs:
-            raise _vcs_unavailable("git", exc) from exc
+            raise _vcs_unavailable("git", exc, timeout=timeout) from exc
         return []
 
 
@@ -1115,6 +1171,7 @@ def _get_svn_changed_files(
     repo_root: Path,
     rev_range: str | None = None,
     *,
+    timeout: float | None = None,
     require_vcs: bool = False,
 ) -> list[str]:
     """Return changed files in an SVN working copy.
@@ -1123,16 +1180,20 @@ def _get_svn_changed_files(
     is used to list files changed between those revisions.  Otherwise
     ``svn status`` reports working-copy modifications.
 
+    *timeout* is the per-subprocess budget; ``None`` uses ``CRG_GIT_TIMEOUT``.
+
     *require_vcs* has the same meaning as in :func:`get_changed_files`: an
     ``svn`` that cannot be run is raised rather than reported as "nothing
     changed".
     """
+    if timeout is None:
+        timeout = _GIT_TIMEOUT
     try:
         if rev_range:
             result = subprocess.run(
                 ["svn", "diff", "--summarize", "--non-interactive", "-r", rev_range],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+                cwd=str(repo_root), timeout=timeout,
                 stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
@@ -1149,7 +1210,7 @@ def _get_svn_changed_files(
             result = subprocess.run(
                 ["svn", "status", "--non-interactive"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+                cwd=str(repo_root), timeout=timeout,
                 stdin=subprocess.DEVNULL,
             )
             files = []
@@ -1165,7 +1226,7 @@ def _get_svn_changed_files(
             return files
     except (OSError, subprocess.TimeoutExpired) as exc:
         if require_vcs:
-            raise _vcs_unavailable("svn", exc) from exc
+            raise _vcs_unavailable("svn", exc, timeout=timeout) from exc
         return []
     except UnicodeDecodeError:
         return []
@@ -1174,14 +1235,35 @@ def _get_svn_changed_files(
 def get_staged_and_unstaged(
     repo_root: Path,
     *,
+    timeout: float | None = None,
     require_vcs: bool = False,
 ) -> list[str]:
     """Get all modified files (staged + unstaged + untracked).
 
-    *require_vcs* has the same meaning as in :func:`get_changed_files`.
+    ``--untracked-files=all`` is deliberate and load-bearing, not a default
+    nobody chose. It is what makes a brand-new, never-committed directory
+    report the files inside it. Git's cheaper ``normal`` mode collapses such a
+    directory to a single ``dir/`` record, which is not a path any caller can
+    open, so scoping the walk down would delete the first commit of every new
+    feature package from every review. See the note in
+    :func:`discover_review_changes`.
+
+    Args:
+        repo_root: Repository root directory.
+        timeout: Seconds allowed for the subprocess. ``None`` (default) uses
+            the general ``CRG_GIT_TIMEOUT`` budget; the change-discovery chain
+            passes the shorter :func:`discovery_timeout` instead.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when git
+            cannot be run or overruns *timeout*, instead of returning ``[]``.
+            A caller whose answer is an all-clear must pass this.
     """
+    if timeout is None:
+        timeout = _GIT_TIMEOUT
     if detect_vcs(repo_root) == "svn":
-        return _get_svn_changed_files(repo_root, require_vcs=require_vcs)
+        return _get_svn_changed_files(
+            repo_root, timeout=timeout, require_vcs=require_vcs,
+        )
     try:
         result = subprocess.run(
             [
@@ -1193,7 +1275,7 @@ def get_staged_and_unstaged(
             ],
             capture_output=True,
             cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
@@ -1215,8 +1297,70 @@ def get_staged_and_unstaged(
         return files
     except (OSError, subprocess.TimeoutExpired) as exc:
         if require_vcs:
-            raise _vcs_unavailable("git", exc) from exc
+            raise _vcs_unavailable("git", exc, timeout=timeout) from exc
         return []
+
+
+def discover_review_changes(
+    repo_root: Path,
+    base: str = "HEAD~1",
+) -> tuple[list[str], str]:
+    """Discover the files under review, on the short discovery budget.
+
+    This is the chain every review-shaped tool and command runs when the
+    caller did not name ``changed_files`` itself: resolve the base, diff
+    against it, and fall back to the working tree when that diff is empty.
+
+    Two things make it different from calling the three functions directly,
+    and both exist because this chain runs inside an MCP tool call that a
+    client will abandon at its own request ceiling (#262):
+
+    * every subprocess gets :func:`discovery_timeout` rather than the
+      30-second ``CRG_GIT_TIMEOUT`` that build, update and watch need, so the
+      worst case for the whole chain is seconds rather than two minutes;
+    * every subprocess runs with ``require_vcs=True``, so exhausting that
+      budget raises :class:`~code_review_graph.errors.ChangeDiscoveryError`.
+
+    The second is what licenses the first. Shortening a budget whose timeout
+    path returns ``[]`` would not have made this chain safer -- it would have
+    made #913's false all-clear several times easier to hit, and extended it
+    to the base resolution, where a timed-out merge base silently degrades a
+    three-dot diff into a two-dot one and scopes the review to the wrong
+    commits. Timing out is a failure, and it is now reported as one: callers
+    turn the error into ``status: error`` naming
+    ``CRG_DISCOVERY_TIMEOUT``, which a user can act on, instead of an
+    all-clear they cannot tell from a clean tree.
+
+    Note what this chain deliberately does *not* do: scope down the untracked
+    walk. ``git status --untracked-files=normal`` is much cheaper on a large
+    tree, and it was tried, but it collapses a wholly-untracked directory to
+    one ``dir/`` record -- so the first commit of a new package disappears
+    from every review tool with ``status: ok`` and no warning. Being slow is a
+    bug; confidently reviewing nothing is a worse one. The budget above bounds
+    the walk instead, and reports it when it does.
+
+    Returns:
+        ``(changed_files, resolved_base)``. The resolved base is returned
+        because callers need the same ref afterwards, for diff hunks and risk
+        scoring, and resolving it twice would spend the budget twice.
+
+    Raises:
+        ChangeDiscoveryError: git could not be run, or overran the discovery
+            budget. Never raised for a repository that simply has no changes.
+    """
+    budget = discovery_timeout()
+    resolved_base = resolve_review_base(
+        repo_root, base, timeout=budget, require_vcs=True,
+    )
+    changed = get_changed_files(
+        repo_root, resolved_base, timeout=budget, require_vcs=True,
+    )
+    if not changed:
+        changed = get_staged_and_unstaged(
+            repo_root, timeout=budget, require_vcs=True,
+        )
+    return changed, resolved_base
+
 
 def get_all_tracked_files(
     repo_root: Path,

@@ -30,6 +30,11 @@ dependencies = [
     # CVE-2025-62800/62801/66416 fixes; <4 prevents the next major release
     # from breaking the server the way fastmcp 3.0 did. See: #488
     "fastmcp>=3.2.4,<4",
+    # main.py imports anyio directly: the MCP tool offload has to use the
+    # same thread limiter FastMCP dispatches sync tool bodies through, not
+    # asyncio's smaller default executor. A direct import gets a direct
+    # dependency rather than relying on fastmcp to keep pulling it in.
+    "anyio>=4.0,<5",
     "tree-sitter>=0.23.0,<1",
     "tree-sitter-language-pack>=0.3.0,<1",
     "pyyaml>=6.0,<7",

@@ -14,17 +14,18 @@ from ..changes import (  # noqa: F401
     parse_git_diff_ranges,
 )
 from ..context_savings import attach_context_savings, estimate_file_tokens
+from ..errors import ChangeDiscoveryError
 from ..flows import get_affected_flows as _get_affected_flows
 from ..graph import GraphNode, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import (
-    get_changed_files,
-    get_staged_and_unstaged,
+    discover_review_changes,
     resolve_review_base,
 )
 from ..parser import is_test_file, normalize_file_path
 from ._common import (
     _bounded,
+    _error_response,
     _get_store,
     _resolve_graph_file_paths,
     _shown_of,
@@ -472,16 +473,15 @@ def get_review_context(
 
     store, root = _get_store(repo_root)
     try:
-        # Resolved once, for both the file list and the hunk lookup below:
-        # an explicit ``changed_files`` list still needs a usable base,
-        # because the snippets are cut to the regions that base changed.
-        base = resolve_review_base(root, base)
-
-        # Get impact radius first
+        # The base is resolved on both branches, for the file list and for the
+        # hunk lookup below: an explicit ``changed_files`` list still needs a
+        # usable base, because the snippets are cut to the regions that base
+        # changed. Discovery resolves it as part of the chain, on the short
+        # discovery budget, so it is never resolved twice.
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files, base = discover_review_changes(root, base)
+        else:
+            base = resolve_review_base(root, base)
 
         if not changed_files:
             return {
@@ -714,6 +714,12 @@ def get_review_context(
         }
         attach_context_savings(result, original_tokens=original_tokens)
         return result
+    except ChangeDiscoveryError as exc:
+        # Distinct from the "no changed files" answer above, and deliberately
+        # so: that one is an all-clear a client will act on. Git that could
+        # not be run, or that overran the discovery budget, says nothing
+        # about the working tree (#262).
+        return _error_response(str(exc))
     finally:
         store.close()
 
@@ -830,10 +836,7 @@ def get_affected_flows_func(
     store, root = _get_store(repo_root)
     try:
         if changed_files is None:
-            base = resolve_review_base(root, base)
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files, base = discover_review_changes(root, base)
 
         if not changed_files:
             return {
@@ -937,16 +940,17 @@ def detect_changes_func(
 
     store, root = _get_store(repo_root)
     try:
-        base = resolve_review_base(root, base)
         # Detect changed files if not provided.
         if changed_files is None:
-            # require_vcs: the "no changed files" answer below is an
-            # all-clear. A git that cannot be run must not produce it — the
-            # ChangeDiscoveryError becomes {"status": "error"} instead, so a
-            # client can tell "nothing to review" from "could not look".
-            changed_files = get_changed_files(root, base, require_vcs=True)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root, require_vcs=True)
+            # discover_review_changes carries require_vcs through the whole
+            # chain: the "no changed files" answer below is an all-clear, and
+            # a git that could not be run (or overran the discovery budget)
+            # must not produce it. The ChangeDiscoveryError becomes
+            # {"status": "error"} instead, so a client can tell "nothing to
+            # review" from "could not look".
+            changed_files, base = discover_review_changes(root, base)
+        else:
+            base = resolve_review_base(root, base)
 
         if not changed_files:
             return {

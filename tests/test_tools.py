@@ -2431,16 +2431,23 @@ class TestGetMinimalContext:
         assert "summary" in result
         assert "next_tool_suggestions" in result
 
-    def test_review_base_is_shared_by_probe_discovery_and_analysis(self, monkeypatch):
+    def test_change_discovery_runs_once_on_the_discovery_budget(self, monkeypatch):
+        """The tool CLAUDE.md tells agents to call first cannot be the one
+        exception to #262's budget.
+
+        It used to run five git subprocesses of its own -- resolve_review_base
+        at 30s, two hardcoded 10s probes, then get_changed_files at another
+        30s -- for a ~130s worst case on the entry point. One
+        discover_review_changes call replaces all of them, and the base it
+        resolves is the one the analysis is scored against.
+        """
         import code_review_graph.tools.context as context_module
 
-        resolve = MagicMock(return_value="merge-base-sha")
-        has_changes = MagicMock(return_value=True)
-        get_changed = MagicMock(return_value=["app.py"])
+        discover = MagicMock(return_value=(["app.py"], "merge-base-sha"))
+        resolve = MagicMock(return_value="unused")
         analyze = MagicMock(return_value={"risk_score": 0.2, "changed_functions": []})
+        monkeypatch.setattr(context_module, "discover_review_changes", discover)
         monkeypatch.setattr(context_module, "resolve_review_base", resolve)
-        monkeypatch.setattr(context_module, "_has_git_changes", has_changes)
-        monkeypatch.setattr("code_review_graph.incremental.get_changed_files", get_changed)
         monkeypatch.setattr("code_review_graph.changes.analyze_changes", analyze)
 
         result = context_module.get_minimal_context(
@@ -2450,10 +2457,65 @@ class TestGetMinimalContext:
         )
 
         assert result["status"] == "ok"
-        resolve.assert_called_once_with(self.root.resolve(), "origin/main")
-        has_changes.assert_called_once_with(self.root.resolve(), "merge-base-sha")
-        get_changed.assert_called_once_with(self.root.resolve(), "merge-base-sha")
+        discover.assert_called_once_with(self.root.resolve(), "origin/main")
+        # No separate probe, and no second base resolution: both were git
+        # round trips this tool no longer makes.
+        resolve.assert_not_called()
         assert analyze.call_args.kwargs["base"] == "merge-base-sha"
+
+    def test_a_discovery_failure_is_reported_not_read_as_no_changes(
+        self, monkeypatch,
+    ):
+        """Degraded, and it says so -- the same contract as the churn note.
+
+        An agent acts on this response. "I could not determine the changes"
+        must not render identically to "there are none".
+        """
+        import code_review_graph.tools.context as context_module
+        from code_review_graph.errors import ChangeDiscoveryError
+
+        monkeypatch.setattr(
+            context_module, "discover_review_changes",
+            MagicMock(side_effect=ChangeDiscoveryError(
+                "could not determine the changes: git timed out after 5s."
+            )),
+        )
+
+        result = context_module.get_minimal_context(
+            task="review changes",
+            repo_root=str(self.root),
+            base="origin/main",
+        )
+
+        # The other sections still answer; only the risk section degrades.
+        assert result["status"] == "ok"
+        assert "Degraded" in result["summary"]
+        assert "git timed out" in result["summary"]
+
+    def test_explicit_changed_files_skip_discovery_entirely(self, monkeypatch):
+        """A caller that already knows the files spends no git budget on them."""
+        import code_review_graph.tools.context as context_module
+
+        discover = MagicMock()
+        monkeypatch.setattr(context_module, "discover_review_changes", discover)
+        monkeypatch.setattr(
+            context_module, "resolve_review_base",
+            MagicMock(return_value="merge-base-sha"),
+        )
+        monkeypatch.setattr(
+            "code_review_graph.changes.analyze_changes",
+            MagicMock(return_value={"risk_score": 0.2, "changed_functions": []}),
+        )
+
+        result = context_module.get_minimal_context(
+            task="review changes",
+            changed_files=["app.py"],
+            repo_root=str(self.root),
+            base="origin/main",
+        )
+
+        assert result["status"] == "ok"
+        discover.assert_not_called()
 
     def test_missing_graph_returns_not_ready_without_creating_database(self, tmp_path):
         from code_review_graph.tools.context import get_minimal_context
@@ -2473,13 +2535,20 @@ class TestGetMinimalContext:
         assert not db_path.parent.exists()
 
     def test_mcp_wrapper_reports_missing_graph_without_creating_state(self, tmp_path):
+        import asyncio
+
         from code_review_graph.main import get_minimal_context_tool
 
         repo = tmp_path / "cold-worktree"
         repo.mkdir()
         (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
 
-        result = get_minimal_context_tool(repo_root=str(repo))
+        # The wrapper is a coroutine: it hands the blocking work to a worker
+        # thread so the stdio event loop stays answerable (#262).
+        underlying = (
+            getattr(get_minimal_context_tool, "fn", None) or get_minimal_context_tool
+        )
+        result = asyncio.run(underlying(repo_root=str(repo)))
 
         assert result["status"] == "not_ready"
         assert result["reason"] == "missing_graph"
@@ -2784,7 +2853,9 @@ class TestGraphProvenance:
         assert common_module.with_provenance(existing, str(repo)) is existing
         assert existing["_graph"] == {"updated_at": "existing"}
 
-    def test_registered_sync_tool_preserves_existing_fields(self, tmp_path):
+    def test_registered_tool_preserves_existing_fields(self, tmp_path):
+        import asyncio
+
         from code_review_graph.main import list_graph_stats_tool
 
         repo = self._make_repo(tmp_path, {
@@ -2793,7 +2864,7 @@ class TestGraphProvenance:
         })
         expected = list_graph_stats(repo_root=str(repo))
         underlying = getattr(list_graph_stats_tool, "fn", None) or list_graph_stats_tool
-        result = underlying(repo_root=str(repo))
+        result = asyncio.run(underlying(repo_root=str(repo)))
 
         envelope = result.pop("_graph")
         assert result == expected

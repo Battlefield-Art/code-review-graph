@@ -518,7 +518,8 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 
 | चर | विवरण | डिफ़ॉल्ट |
 |----------|-------------|---------|
-| `CRG_GIT_TIMEOUT` | Git संक्रियाओं की समय सीमा (सेकंड में) | `30` |
+| `CRG_GIT_TIMEOUT` | Git संक्रियाओं की समय सीमा (सेकंड में; build / update / watch) | `30` |
+| `CRG_DISCOVERY_TIMEOUT` | जब फ़ाइल सूची स्पष्ट रूप से नहीं दी गई हो, तब बदलाव पता करने वाली प्रत्येक Git कमांड की समय सीमा (सेकंड में)। सीमा पार होने पर त्रुटि मिलती है, "कोई बदलाव नहीं" नहीं | `5` (`CRG_GIT_TIMEOUT` स्पष्ट रूप से सेट हो तो वही) |
 | `CRG_DATA_DIR` | ग्राफ़ डेटाबेस और बनी हुई फ़ाइलों की डायरेक्टरी | - |
 | `CRG_HOOK_WORKTREES` | `1` करने पर pre-commit हुक जुड़े हुए git worktree में भी चलता है | - |
 | `CRG_EMBEDDING_MODEL` | स्थानीय वेक्टर एम्बेडिंग का डिफ़ॉल्ट मॉडल | `all-MiniLM-L6-v2` |
@@ -529,7 +530,7 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 | `CRG_MAX_BFS_DEPTH` | ग्राफ़ ट्रैवर्सल की अधिकतम गहराई | `15` |
 | `CRG_MAX_CHANGED_FUNCS` | एक बदलाव रिपोर्ट में विश्लेषित अधिकतम बदले हुए फ़ंक्शन | `500` |
 | `CRG_MAX_TRANSITIVE_FRONTIER` | सकर्मक कॉलर/कॉली विस्तार में अधिकतम फ़्रंटियर आकार | `50` |
-| `CRG_TOOL_TIMEOUT` | सीमित MCP टूल की समय सीमा (सेकंड; `0` से बंद) | `0` |
+| `CRG_TOOL_TIMEOUT` | केवल-पठन MCP टूल की समय सीमा (सेकंड; `0` से बंद)। लिखने वाले टूल (build / postprocess / embed / wiki / apply-refactor) पर लागू नहीं | `0` |
 | `CRG_CHURN_WINDOW_DAYS` | `detect-changes --churn` की कमिट गिनती की अवधि | `90` |
 | `CRG_LEIDEN_SEED` | Leiden कम्युनिटी पहचान का सीड | `42` |
 | `CRG_RECURSE_SUBMODULES` | `1`, `true` या `yes` होने पर git सबमॉड्यूल शामिल करें | - |

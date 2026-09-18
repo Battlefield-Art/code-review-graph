@@ -34,7 +34,7 @@ Release highlights by version. The full changelog is in [CHANGELOG.md](../CHANGE
 ## v2.3.4
 - **Estimated context savings**: review, impact, detect-changes and compact architecture responses include `context_savings` metadata (`estimated`, `saved_tokens`, `saved_percent`) where a baseline can be estimated.
 - **Compact architecture overview by default**: `get_architecture_overview_tool` defaults to `detail_level="minimal"`. Use `detail_level="standard"` for member lists and per-edge detail.
-- **Bounded change analysis**: `CRG_MAX_CHANGED_FUNCS`, `CRG_MAX_TRANSITIVE_FRONTIER` and `CRG_TOOL_TIMEOUT` keep large MCP review calls responsive.
+- **Bounded change analysis**: `CRG_MAX_CHANGED_FUNCS`, `CRG_MAX_TRANSITIVE_FRONTIER` and `CRG_TOOL_TIMEOUT` keep large MCP review calls responsive. `CRG_TOOL_TIMEOUT` applies to read-only tools only; the tools that write (build, postprocess, embed, wiki, apply-refactor) are never cut short.
 - **Windows MCP reliability**: local embedding models are pre-warmed on Windows before FastMCP starts worker dispatch, avoiding semantic-search deadlocks.
 - **Parser correctness**: Rust `#[test]` and common async test attributes produce `Test` nodes.
 - **Graph lookup correctness**: review, impact and file-summary tools resolve user-facing paths to stored graph paths; `callers_of` includes cross-file callers even when same-file callers exist.
@@ -74,7 +74,8 @@ Release highlights by version. The full changelog is in [CHANGELOG.md](../CHANGE
 - **Embeddings retry**: exponential backoff for Google Gemini API calls.
 - **Visualisation XSS hardening**: `</` escaped to `<\/` in JSON serialisation.
 - **CLI error handling**: broad `except` split into specific handlers.
-- **Git timeout**: configurable through `CRG_GIT_TIMEOUT`.
+- **Git timeout**: configurable through `CRG_GIT_TIMEOUT` (build, update, watch).
+- **Change-discovery timeout**: `CRG_DISCOVERY_TIMEOUT` bounds each Git command run to work out what changed when no file list was supplied; 5 seconds by default, or `CRG_GIT_TIMEOUT` when that is set explicitly. Exhausting it is reported as an error, never as "no changes".
 - **Governance files**: CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md.
 
 ## v1.8.2

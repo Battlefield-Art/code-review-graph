@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
 from .constants import env_float, env_int
 from .errors import ChangeDiscoveryError
@@ -33,8 +34,6 @@ _TEST_GAP_EXEMPT_NAMES = frozenset({
     "setup_method", "teardown_method", "setUpClass", "tearDownClass",
     "__construct", "__init__", "__destruct",
 })
-
-_GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30)  # seconds, configurable
 
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
