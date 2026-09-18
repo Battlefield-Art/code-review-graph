@@ -35,13 +35,17 @@ _TEST_GAP_EXEMPT_NAMES = frozenset({
     "__construct", "__init__", "__destruct",
 })
 
-# Discount on the 0.30 "no tests" risk term for a symbol that only a tested
-# caller reaches. Smaller than the 0.05 one direct test earns, on purpose:
-# a test whose call chain passes through a symbol proves it is reachable, not
-# that anything checks what it returns. Keeping the credit below one direct
-# test keeps the ordering honest -- own tests always beat borrowed ones.
-_INDIRECT_COVERAGE_CREDIT = 0.03
-
+# Being reached by a tested caller buys no risk discount at all. It was worth
+# 0.03 briefly and that was wrong twice over. Evidentially: a static CALLS path
+# shows the symbol is reachable, not that any test runs it -- about 6% of the
+# symbols the walk reaches are never executed by this repository's own suite.
+# Mechanically: every other term here moves in multiples of 0.05 and the scores
+# quantize hard (one real delta produced 15 distinct scores over 49 symbols,
+# with 25 tied at 0.05), so a 0.03 nudge could never leave a symbol tied -- it
+# dropped it below its whole tie class, and `review_priorities` is
+# `sorted(...)[:10]`. On the delta of #1047 that evicted the one genuinely
+# untested symbol from the table the Action renders. The classification is
+# reported in its own field instead, where it informs without displacing.
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
 
@@ -578,7 +582,6 @@ def compute_risk_score(
     store: GraphStore,
     node: GraphNode,
     churn_counts: dict[str, int] | None = None,
-    reached_by_tested_caller: bool = False,
 ) -> float:
     """Compute a risk score (0.0 - 1.0) for a single node.
 
@@ -591,16 +594,10 @@ def compute_risk_score(
       - Change frequency (opt-in): commits touching the file / 10, capped
         at 0.15
 
-    Args:
-        reached_by_tested_caller: The node has no test of its own but a tested
-            caller reaches it (see
-            :meth:`~code_review_graph.graph.GraphStore.get_caller_test_routes`).
-            Worth a small, fixed discount and deliberately nothing more: a
-            test that runs through this symbol is more than no test at all,
-            but it asserts nothing about it, so the credit stays strictly
-            smaller than the 0.05 a single direct test earns. It applies only
-            when the node has no direct coverage, so it can never stack on
-            top of real tests.
+    Only direct and transitive TESTED_BY edges move the coverage term. A
+    symbol that merely sits under a tested caller scores as untested here; see
+    :meth:`~code_review_graph.graph.GraphStore.get_caller_test_routes` for why
+    that reachability is reported beside the score rather than folded into it.
     """
     score = 0.0
 
@@ -630,10 +627,7 @@ def compute_risk_score(
     # --- Test coverage (direct + transitive) ---
     transitive_tests = store.get_transitive_tests(node.qualified_name)
     test_count = len(transitive_tests)
-    coverage_risk = 0.30 - (min(test_count / 5.0, 1.0) * 0.25)
-    if test_count == 0 and reached_by_tested_caller:
-        coverage_risk -= _INDIRECT_COVERAGE_CREDIT
-    score += coverage_risk
+    score += 0.30 - (min(test_count / 5.0, 1.0) * 0.25)
 
     # --- Security sensitivity ---
     name_lower = node.name.lower()
@@ -804,25 +798,26 @@ def analyze_changes(
     directly_tested = store.get_directly_tested(
         node.qualified_name for node in gap_candidates
     )
-    # A private helper that no test names by hand is still executed by every
-    # test of the public function calling it, and calling it "untested" is a
+    # A private helper that no test names by hand is still run by the tests of
+    # the public function calling it, and calling it flatly "untested" is a
     # false alarm the author cannot act on (#1047). Walk up the CALLS graph to
-    # find such a caller -- but the answer stays in its own weaker class
-    # below, never a suppression: a reachable symbol is not an asserted one.
+    # find such a caller. The answer is a pointer, never a suppression and
+    # never a discount: the symbol keeps its full untested risk score and its
+    # place in the gap list, and only gains a note saying where a test already
+    # runs nearby. A static path is not execution -- see
+    # ``get_caller_test_routes`` for the coverage measurement behind that.
     caller_routes = store.get_caller_test_routes(
-        node.qualified_name for node in gap_candidates
-        if node.qualified_name not in directly_tested
+        (
+            node.qualified_name for node in gap_candidates
+            if node.qualified_name not in directly_tested
+        ),
+        repo_root=gap_root,
     )
 
     # Compute per-node risk scores.
     node_risks: list[dict[str, Any]] = []
     for node in changed_funcs:
-        risk = compute_risk_score(
-            store,
-            node,
-            churn_counts,
-            reached_by_tested_caller=node.qualified_name in caller_routes,
-        )
+        risk = compute_risk_score(store, node, churn_counts)
         node_risks.append({
             **node_to_dict(node),
             "risk_score": risk,
@@ -834,8 +829,20 @@ def analyze_changes(
     # Affected flows.
     affected = get_affected_flows(store, changed_files)
 
-    # Split the gaps into the two claims a reader has to tell apart: no test
-    # comes near this symbol, versus a test only reaches it through a caller.
+    # Label each gap with the two claims a reader has to tell apart: no tested
+    # caller was found anywhere near this symbol, versus one reaches it but
+    # only through a caller. Both stay in one list in node order, and
+    # ``indirect_gaps`` is only a view for the summary.
+    #
+    # The order is deliberately class-blind. Sorting the reached ones last
+    # looks prudent -- keep the "real" gaps when the list is truncated -- but
+    # every consumer bounds this list, so it made the weaker class the
+    # guaranteed first casualty: at ``detect_changes_tool``'s default of 25
+    # rows, a delta with 73 unreached gaps shipped zero reached ones while
+    # still reporting a count of 9, and a consumer deriving its own "tested"
+    # column from the truncated list then labelled those symbols as having
+    # their own tests. A class must not be announced in the counts and
+    # withheld from the payload.
     test_gaps: list[dict[str, Any]] = []
     indirect_gaps: list[dict[str, Any]] = []
     for node in gap_candidates:
@@ -851,27 +858,34 @@ def analyze_changes(
         route = caller_routes.get(node.qualified_name)
         if route is None:
             entry["coverage"] = "none"
-            test_gaps.append(entry)
         else:
             entry["coverage"] = "indirect"
             entry["covered_via"] = _sanitize_name(str(route["via"]))
             entry["covered_depth"] = route["depth"]
-            entry["covered_by"] = [_sanitize_name(str(t)) for t in route["tests"]]
+            # One test names the route; three cost triple the payload for a
+            # reader who opens the first one anyway.
+            entry["covered_by"] = [
+                _sanitize_name(str(t)) for t in route["tests"][:1]
+            ]
             indirect_gaps.append(entry)
-    uncovered_count = len(test_gaps)
+        test_gaps.append(entry)
     indirect_count = len(indirect_gaps)
-    # Unreached first: every consumer bounds this list, and the rows that must
-    # survive truncation are the ones with no test anywhere near them.
-    test_gaps.extend(indirect_gaps)
+    uncovered_count = len(test_gaps) - indirect_count
 
     # Review priorities: top 10 by risk score.
     review_priorities = sorted(node_risks, key=lambda x: x["risk_score"], reverse=True)[:10]
 
     # Build summary.
+    # "no direct test", not "no test in reach": the graph sees TESTED_BY edges
+    # and CALLS paths, not the suite. On the very delta of #1047 two symbols in
+    # the unreached group (auto_promote.py::cmd_verify and
+    # ::ForeignPullRequestError) are exercised by tests that load the script
+    # through importlib, so no edge records it. The weaker claim is true; the
+    # stronger one is not ours to make.
     gap_line = f"  - {len(test_gaps)} test gap(s)"
     if indirect_count:
         gap_line += (
-            f" ({uncovered_count} with no test in reach, "
+            f" ({uncovered_count} with no tested caller found, "
             f"{indirect_count} reached only through a caller)"
         )
     summary_parts = [
@@ -903,13 +917,16 @@ def analyze_changes(
         return names
 
     if uncovered_count:
+        # Filtered by class, not sliced: the list is in node order, so the
+        # two classes are interleaved.
+        unreached_gaps = [g for g in test_gaps if g["coverage"] != "indirect"]
         summary_parts.append(
-            f"  - Untested: {', '.join(_gap_names(test_gaps[:uncovered_count]))}"
+            f"  - Untested: {', '.join(_gap_names(unreached_gaps))}"
         )
     if indirect_count:
         # Named separately, because acting on the two lists differs: these
-        # symbols run under an existing test and need an assertion of their
-        # own, not a test written from nothing.
+        # symbols already run under a test and need an assertion of their own,
+        # not a test written from nothing.
         summary_parts.append(
             "  - Reached only through a caller: "
             f"{', '.join(_gap_names(indirect_gaps))}"
@@ -942,8 +959,11 @@ def analyze_changes(
         "affected_flows": affected["affected_flows"],
         "test_gaps": test_gaps,
         # Counts, not just the list: every consumer bounds ``test_gaps``, and
-        # the split between "no test in reach" and "reached through a caller"
-        # must survive that truncation.
+        # both the total and the split between "no tested caller found" and
+        # "reached through a caller" must survive that truncation. A renderer
+        # that takes its headline from ``len(test_gaps)`` but its split from
+        # these prints a total that does not equal its own parts.
+        "test_gaps_total": len(test_gaps),
         "test_gaps_uncovered": uncovered_count,
         "test_gaps_indirect": indirect_count,
         "review_priorities": review_priorities,

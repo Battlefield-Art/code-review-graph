@@ -24,6 +24,7 @@ import networkx as nx
 from .constants import (
     BFS_ENGINE,
     CALLER_TEST_ROUTE_DEPTH,
+    CALLER_TEST_ROUTE_MAX_CALLERS,
     IMPACT_DEFAULT_EDGE_DIRECTION,
     IMPACT_DEFAULT_EDGE_WEIGHT,
     IMPACT_DEPTH_DECAY,
@@ -49,7 +50,7 @@ from .migrations import (
     run_migrations,
     target_resolution_expr,
 )
-from .parser import EdgeInfo, NodeInfo, normalize_file_path
+from .parser import EdgeInfo, NodeInfo, is_test_file, normalize_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -1487,34 +1488,52 @@ class GraphStore:
         self,
         qualified_names: Iterable[str],
         max_depth: int = CALLER_TEST_ROUTE_DEPTH,
-        max_frontier: int | None = None,
+        max_callers_per_node: int | None = None,
+        repo_root: str | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Find, for each input symbol, a tested *caller* that reaches it.
 
         This is the opposite direction from :meth:`get_transitive_tests`, which
         walks *outgoing* CALLS to ask "do the things this symbol calls have
         tests?". Here the walk is *upwards* over incoming CALLS edges: a
-        private helper that no test names directly is still executed by every
-        test of the public function that calls it, and reporting it as
-        "untested" is wrong (#1047).
+        private helper that no test names directly is still run by the tests of
+        the public function that calls it, and reporting it as flatly
+        "untested" is a false alarm the author cannot act on (#1047).
 
-        The two claims are not interchangeable, so the caller must keep them
-        apart. Reachability is not execution: a helper can sit under two
-        well-tested callers on a branch none of their tests take. The routes
-        returned here say "a test reaches this", never "a test asserts this",
-        which is why ``analyze_changes`` keeps an indirectly covered symbol in
-        the gap report instead of dropping it.
+        **What a route proves, and what it does not.** A route is a static
+        CALLS path from a tested caller down to the symbol. It does not show
+        that any test executes the symbol: a helper can sit under two
+        well-tested callers on a branch none of their tests take. Measured
+        against line coverage over this repository's own suite, about 6% of
+        the symbols this walk reaches are never executed by any test, and no
+        shape of the call graph separates them -- the discriminating fact is
+        which branch a test takes, which the graph does not record. Tightening
+        the hop limit, the caller fan-out or the file boundary was tried and
+        each halves the number of symbols reached while leaving that ~6%
+        roughly where it was. So the result is reported as reachability and
+        never scored as coverage: ``analyze_changes`` keeps an indirectly
+        reached symbol in the gap report at full untested risk, and only adds
+        the route as a pointer to where a test already runs nearby.
 
         Args:
             qualified_names: Symbols with no direct TESTED_BY edge of their own.
             max_depth: Maximum CALLS hops to walk upwards. The default of
                 ``CALLER_TEST_ROUTE_DEPTH`` (2) is measured, not guessed: on
-                this repository depths 3-5 rescue no additional symbol while
-                each concedes another ~8% of the codebase to "covered".
-            max_frontier: Cap on the callers examined per hop, across all
-                inputs. Defaults to ``CRG_MAX_CALLER_ROUTE_FRONTIER`` (2000).
-                A hub with thousands of callers must not turn one report into
-                a graph-wide scan.
+                this repository depths 3-5 reach no additional symbol while
+                each concedes another ~8% of the codebase to "reached".
+            max_callers_per_node: Skip expanding any one node with more
+                incoming CALLS than this (default
+                ``CALLER_TEST_ROUTE_MAX_CALLERS``). Deliberately a per-node
+                limit rather than a budget shared across the inputs: a shared
+                budget makes one hub in a change set delete the routes of
+                every other symbol in it, which is the false alarm this walk
+                exists to remove. It is applied before the callers are read,
+                so it bounds the work rather than the leftovers.
+            repo_root: Repository root, used to recognise callers that live in
+                test files. Such a caller's TESTED_BY edges point at other
+                symbols in its own test file, so crediting a production symbol
+                through one would let a test fixture vouch for the code it
+                sets up. Defaults to the graph's recorded root.
 
         Returns:
             ``{qualified_name: {"via", "depth", "tests"}}`` holding only the
@@ -1523,8 +1542,10 @@ class GraphStore:
             caller's test symbols. Inputs absent from the mapping have no
             tested caller within *max_depth*.
         """
-        if max_frontier is None:
-            max_frontier = env_int("CRG_MAX_CALLER_ROUTE_FRONTIER", 2000)
+        if max_callers_per_node is None:
+            max_callers_per_node = CALLER_TEST_ROUTE_MAX_CALLERS
+        if repo_root is None:
+            repo_root = self.get_repo_root()
         seeds = [qn for qn in dict.fromkeys(qualified_names) if qn]
         routes: dict[str, dict[str, Any]] = {}
         if not seeds or max_depth < 1:
@@ -1542,6 +1563,23 @@ class GraphStore:
         for depth in range(1, max_depth + 1):
             callers: dict[str, set[str]] = {}
             keys = sorted(frontier)
+            # Drop hubs before reading their edges, not after. Counting is one
+            # aggregate per batch; materialising 50,000 caller rows to throw
+            # most of them away is what used to make this slow, and throwing
+            # them away by name let one hub evict unrelated symbols' routes.
+            hubs: set[str] = set()
+            for start in range(0, len(keys), 450):
+                batch = keys[start:start + 450]
+                placeholders = ",".join("?" for _ in batch)
+                for row in self._conn.execute(  # nosec B608
+                    "SELECT target_qualified, COUNT(*) AS n FROM edges "
+                    f"WHERE kind = 'CALLS' AND target_qualified IN ({placeholders}) "
+                    "GROUP BY target_qualified",
+                    batch,
+                ).fetchall():
+                    if row["n"] > max_callers_per_node:
+                        hubs.add(row["target_qualified"])
+            keys = [key for key in keys if key not in hubs]
             for start in range(0, len(keys), 450):
                 batch = keys[start:start + 450]
                 placeholders = ",".join("?" for _ in batch)
@@ -1569,9 +1607,25 @@ class GraphStore:
                         callers.setdefault(caller, set()).update(fresh)
             if not callers:
                 break
-            if len(callers) > max_frontier:
-                # Sorted, so a truncated walk is at least reproducible.
-                callers = {name: callers[name] for name in sorted(callers)[:max_frontier]}
+
+            # A caller that lives in a test file is test code. Its own
+            # TESTED_BY edges point at tests in that same file, so crediting a
+            # production symbol through one lets a fixture vouch for the code
+            # it sets up -- 20% of this graph's TESTED_BY edges start at a
+            # test-file symbol, so the laundering is not hypothetical.
+            caller_names = sorted(callers)
+            for start in range(0, len(caller_names), 450):
+                batch = caller_names[start:start + 450]
+                placeholders = ",".join("?" for _ in batch)
+                for row in self._conn.execute(  # nosec B608
+                    "SELECT qualified_name, file_path, is_test FROM nodes "
+                    f"WHERE qualified_name IN ({placeholders})",
+                    batch,
+                ).fetchall():
+                    if row["is_test"] or is_test_file(row["file_path"], repo_root):
+                        callers.pop(row["qualified_name"], None)
+            if not callers:
+                break
 
             tests: dict[str, list[str]] = {}
             caller_names = sorted(callers)

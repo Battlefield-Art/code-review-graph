@@ -210,6 +210,16 @@ MAX_SEARCH_RESULTS = env_int("CRG_MAX_SEARCH_RESULTS", 20)
 # as "covered". Two hops is where the rule still discriminates. See #1047.
 CALLER_TEST_ROUTE_DEPTH = env_int("CRG_CALLER_TEST_ROUTE_DEPTH", 2)
 
+# A frontier node with more incoming CALLS than this is a hub, and is not
+# expanded when walking up for a tested caller. Two reasons, both measured on
+# this repository: "one of my 1,800 callers has a test" is no evidence about
+# this symbol, and expanding a hub is what makes the walk expensive. The
+# limit is per node, never a budget shared across the change set -- a shared
+# budget lets one hub in a pull request erase the routes of every other
+# symbol in it. 500 sits above this graph's 99.5th percentile of in-degree
+# (374) and excludes 10 of 3,415 call targets. See #1047.
+CALLER_TEST_ROUTE_MAX_CALLERS = env_int("CRG_CALLER_TEST_ROUTE_MAX_CALLERS", 500)
+
 # Impact traversal engine: "sql" (bounded SQLite relaxation) or "networkx".
 BFS_ENGINE = os.environ.get("CRG_BFS_ENGINE", "sql")
 

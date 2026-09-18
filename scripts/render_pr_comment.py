@@ -164,6 +164,7 @@ def _functions_table(
     gap_names: set[str],
     max_functions: int,
     indirect_names: set[str] | None = None,
+    gaps_truncated: bool = False,
 ) -> list[str]:
     indirect_names = indirect_names or set()
     lines = [
@@ -183,6 +184,11 @@ def _functions_table(
             tested = "indirect"
         elif name in gap_names:
             tested = "no"
+        elif gaps_truncated:
+            # Absence from a truncated gap list proves nothing. Claiming "yes"
+            # here is the strongest possible overclaim: a symbol the report
+            # itself classified as a gap renders as one with its own tests.
+            tested = "?"
         else:
             tested = "yes"
         lines.append(
@@ -229,17 +235,30 @@ def _dedup_gaps(gaps: list[dict[str, Any]], max_gaps: int) -> list[dict[str, Any
     return shown
 
 
-def _gaps_section(gaps: list[dict[str, Any]], max_gaps: int = 5) -> list[str]:
+def _gaps_section(
+    gaps: list[dict[str, Any]],
+    max_gaps: int = 5,
+    uncovered_total: int | None = None,
+    indirect_total: int | None = None,
+) -> list[str]:
     """Render the gap list, keeping the two coverage claims apart.
 
-    A symbol no test comes near and one a test only reaches through its caller
-    are different asks -- write a test versus add an assertion -- so they get
-    separate headings rather than one undifferentiated "untested" list. Entries
-    from an older report with no ``coverage`` key fall into the unreached
-    group, which is what they meant before the field existed.
+    A symbol with no tested caller anywhere near it and one a test only reaches
+    through its caller are different asks -- write a test versus add an
+    assertion -- so they get separate headings rather than one undifferentiated
+    "untested" list. Entries from an older report with no ``coverage`` key fall
+    into the unreached group, which is what they meant before the field existed.
+
+    The totals come from the report when it supplies them, because ``gaps`` is
+    bounded by every consumer and counting the rendered rows understates a
+    truncated report.
     """
     unreached = [g for g in gaps if g.get("coverage") != "indirect"]
     indirect = [g for g in gaps if g.get("coverage") == "indirect"]
+    if not isinstance(uncovered_total, int):
+        uncovered_total = len(unreached)
+    if not isinstance(indirect_total, int):
+        indirect_total = len(indirect)
 
     lines: list[str] = []
     if unreached or not indirect:
@@ -248,18 +267,26 @@ def _gaps_section(gaps: list[dict[str, Any]], max_gaps: int = 5) -> list[str]:
         for gap in shown:
             name = gap.get("qualified_name") or gap.get("name") or "?"
             lines.append(f"- {md_escape(relativize_path(name))} ({_location(gap)})")
-        remaining = len(unreached) - len(shown)
+        # "no direct test", not "no test in reach". The graph knows its own
+        # TESTED_BY edges and CALLS paths; it does not know the test suite. A
+        # test that reaches production code through importlib, a fixture or a
+        # subprocess leaves no edge, and two such symbols sit in this very
+        # list on the delta that motivated the split.
+        remaining = uncovered_total - len(shown)
         if remaining > 0:
-            lines.append(f"- ...and {remaining} more with no test in reach")
+            lines.append(f"- ...and {remaining} more with no direct test")
 
     if indirect:
         if lines:
             lines.append("")
         lines.extend([
-            "### Covered only through a caller",
+            "### Reached only through a caller",
             "",
-            "No test names these directly; one reaches them through the caller "
-            "shown. That is execution, not an assertion.",
+            "No test names these directly, but a tested caller reaches them "
+            "along the call path shown. That is a path in the call graph, not "
+            "a record of execution -- the caller's tests may never take this "
+            "branch. Treat it as where to look, not as coverage: these count "
+            "as gaps and are scored as untested.",
             "",
         ])
         shown = _dedup_gaps(indirect, max_gaps)
@@ -272,9 +299,18 @@ def _gaps_section(gaps: list[dict[str, Any]], max_gaps: int = 5) -> list[str]:
                 f"- {md_escape(relativize_path(name))} ({_location(gap)}) — via "
                 f"{md_escape(relativize_path(via))}, {hops}"
             )
-        remaining = len(indirect) - len(shown)
+        remaining = indirect_total - len(shown)
         if remaining > 0:
             lines.append(f"- ...and {remaining} more reached only through a caller")
+    elif indirect_total:
+        # The headline promised this class; say where it went rather than
+        # letting the section vanish and the two disagree.
+        if lines:
+            lines.append("")
+        lines.append(
+            f"_{indirect_total} more gap(s) are reached only through a caller; "
+            "the list above was truncated before them._"
+        )
     return lines
 
 
@@ -307,12 +343,20 @@ def render_markdown(
     uncovered_total = report.get("test_gaps_uncovered")
     if not isinstance(uncovered_total, int):
         uncovered_total = len(gaps) - indirect_total
+    # The headline total has to come from the same place as the split, or a
+    # truncated report prints "25 test gap(s) (73 ..., 9 ...)" -- a number
+    # beside its own parts, which do not add up to it. ``test_gaps`` is
+    # bounded by every consumer; these counts are not.
+    gaps_total = report.get("test_gaps_total")
+    if not isinstance(gaps_total, int):
+        gaps_total = uncovered_total + indirect_total
+    truncated = gaps_total > len(gaps)
 
     lines: list[str] = [MARKER, "", "## code-review-graph review", ""]
-    gap_text = f"{len(gaps)} test gap(s)"
+    gap_text = f"{gaps_total} test gap(s)"
     if indirect_total:
         gap_text += (
-            f" ({uncovered_total} with no test in reach, "
+            f" ({uncovered_total} with no tested caller found, "
             f"{indirect_total} reached only through a caller)"
         )
     lines.append(
@@ -324,14 +368,22 @@ def render_markdown(
     if priorities:
         lines.append("")
         lines.extend(
-            _functions_table(priorities, gap_names, max_functions, indirect_names)
+            _functions_table(
+                priorities, gap_names, max_functions, indirect_names, truncated
+            )
         )
     if flows:
         lines.append("")
         lines.extend(_flows_section(flows, max_flows))
     if gaps:
         lines.append("")
-        lines.extend(_gaps_section(gaps))
+        lines.extend(
+            _gaps_section(
+                gaps,
+                uncovered_total=uncovered_total,
+                indirect_total=indirect_total,
+            )
+        )
 
     savings = report.get("context_savings") or {}
     saved_tokens = savings.get("saved_tokens")

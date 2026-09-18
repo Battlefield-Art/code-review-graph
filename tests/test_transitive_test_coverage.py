@@ -17,7 +17,7 @@ body no test executes.
 import tempfile
 from pathlib import Path
 
-from code_review_graph.changes import analyze_changes, compute_risk_score
+from code_review_graph.changes import analyze_changes
 from code_review_graph.graph import GraphStore
 from code_review_graph.parser import EdgeInfo, NodeInfo
 
@@ -184,15 +184,30 @@ class TestGapClassification(_Fixture):
         assert len(result["test_gaps"]) == 1
         assert result["test_gaps_indirect"] == 1
 
-    def test_unreached_gaps_sort_before_indirect_ones(self):
-        """Every consumer truncates the list; the real gaps must survive it."""
-        self._chain(1)
+    def test_gap_order_does_not_depend_on_the_coverage_class(self):
+        """Truncation must not be able to delete one whole class.
+
+        Sorting the reached ones last looks prudent until you notice every
+        consumer bounds this list: at ``detect_changes_tool``'s default of 25
+        rows a delta with 73 unreached gaps shipped zero reached ones while
+        still reporting a count of them. A class announced in the counts and
+        withheld from the payload is worse than no class at all.
+        """
+        # "orphan" sorts after the chain's helper but is declared first, so a
+        # class-blind order is node order, not grouped-by-coverage order.
         self._add_func("orphan", line_start=300, line_end=310)
+        self._chain(1)
 
         gaps = self._analyze()["test_gaps"]
-        assert [g["coverage"] for g in gaps] == ["none", "indirect"]
+        classes = [g["coverage"] for g in gaps]
+        assert "indirect" in classes and "none" in classes
+        # Node order, so the two classes interleave rather than grouping.
+        assert classes == sorted(
+            classes, key=lambda c: [g["coverage"] for g in gaps].index(c)
+        )
+        assert gaps[0]["name"] == "orphan"
 
-    def test_a_test_caller_does_not_launder_coverage_onto_its_callees(self):
+    def test_an_untested_caller_does_not_launder_coverage_onto_its_callees(self):
         """A caller with no tests of its own passes nothing down."""
         untested_caller = self._add_func("caller", line_start=1, line_end=10)
         helper = self._add_func("helper", line_start=20, line_end=30)
@@ -203,6 +218,28 @@ class TestGapClassification(_Fixture):
             "caller": "none",
             "helper": "none",
         }
+
+    def test_a_caller_inside_a_test_file_launders_nothing(self):
+        """The larger laundering class: the "caller" is itself test code.
+
+        A fixture in ``tests/`` that calls production code carries TESTED_BY
+        edges pointing at tests in its own file -- 20% of this project's
+        TESTED_BY edges start at a test-file symbol. Crediting through one
+        lets a test fixture vouch for the code it sets up, and the route the
+        report prints names a test file as the caller.
+        """
+        helper = self._add_func("helper", line_start=1, line_end=10)
+        # is_test=0 on purpose: this is the real shape in the graph for a
+        # module-level helper inside a test file.
+        seeder = self._add_func(
+            "_seed_callers", path="tests/test_x.py", line_start=1, line_end=10,
+        )
+        self._add_call(seeder, helper)
+        self._add_tested_by(seeder, "tests/test_x.py::test_thing")
+
+        gaps = {g["name"]: g for g in self._analyze()["test_gaps"]}
+        assert gaps["helper"]["coverage"] == "none"
+        assert "covered_via" not in gaps["helper"]
 
 
 class TestSummaryText(_Fixture):
@@ -215,8 +252,12 @@ class TestSummaryText(_Fixture):
         self._add_func("orphan", line_start=40, line_end=50)
 
         summary = self._analyze()["summary"]
+        # "no tested caller found", not "no test in reach": the graph reads
+        # its own edges, not the test suite. A test reaching production code
+        # through importlib or a subprocess leaves no edge behind, and two
+        # such symbols sit in this list on the delta of #1047.
         assert (
-            "  - 2 test gap(s) (1 with no test in reach, "
+            "  - 2 test gap(s) (1 with no tested caller found, "
             "1 reached only through a caller)"
         ) in summary
         untested_line = next(
@@ -280,18 +321,54 @@ class TestWalkSafety(_Fixture):
         assert self.store.get_caller_test_routes([helper], max_depth=0) == {}
         assert self.store.get_caller_test_routes([helper], max_depth=1) != {}
 
-    def test_frontier_cap_bounds_the_walk(self):
-        """A hub with many callers must not turn one report into a scan."""
+    def test_a_hub_is_not_expanded(self):
+        """A symbol with more callers than the limit is skipped, not scanned.
+
+        "One of my 1,800 callers has a test" is no evidence about this symbol,
+        and expanding a hub is what makes the walk expensive.
+        """
         helper = self._add_func("helper", line_start=1, line_end=5)
         for i in range(10):
             caller = self._add_func(f"c{i:02d}", line_start=10 + i * 10, line_end=15 + i * 10)
             self._add_call(caller, helper)
-        # Only the last caller (sorted) has tests, so a cap of 1 keeps the
-        # first one and finds nothing.
         self._add_tested_by("app.py::c09", "test_app.py::test_c09")
 
-        assert self.store.get_caller_test_routes([helper], max_frontier=1) == {}
-        assert self.store.get_caller_test_routes([helper], max_frontier=10) != {}
+        assert self.store.get_caller_test_routes(
+            [helper], max_callers_per_node=9
+        ) == {}
+        assert self.store.get_caller_test_routes(
+            [helper], max_callers_per_node=10
+        ) != {}
+
+    def test_a_hub_in_the_change_set_does_not_erase_other_symbols_routes(self):
+        """The limit is per node, never a budget shared across the inputs.
+
+        A shared budget was truncated by sorting caller names and keeping the
+        first N, so one hub in a pull request deleted the routes of every
+        other changed symbol -- on a real graph, 206 of them -- and which
+        symbols survived depended on where in the tree their callers lived.
+        That is exactly the false alarm this walk exists to remove.
+        """
+        hub = self._add_func("hub", line_start=1, line_end=5)
+        for i in range(40):
+            caller = self._add_func(
+                f"h{i:03d}", line_start=100 + i * 10, line_end=105 + i * 10,
+            )
+            self._add_call(caller, hub)
+
+        ordinary = self._add_func("ordinary", line_start=2000, line_end=2005)
+        tested_caller = self._add_func("public", line_start=2100, line_end=2105)
+        self._add_call(tested_caller, ordinary)
+        self._add_tested_by(tested_caller, "test_app.py::test_public")
+
+        alone = self.store.get_caller_test_routes(
+            [ordinary], max_callers_per_node=10,
+        )
+        with_hub = self.store.get_caller_test_routes(
+            [hub, ordinary], max_callers_per_node=10,
+        )
+        assert ordinary in alone
+        assert with_hub == alone
 
     def test_batching_survives_more_seeds_than_one_sql_batch(self):
         """450 is the per-query bind limit; the walk must chunk past it."""
@@ -309,31 +386,128 @@ class TestWalkSafety(_Fixture):
 
 
 class TestRiskScoring(_Fixture):
-    def test_indirect_credit_sits_between_untested_and_one_direct_test(self):
-        """Own tests must always beat borrowed ones, or the order lies."""
-        untested = self._add_func("untested", line_start=1, line_end=10)
-        tested = self._add_func("tested", line_start=20, line_end=30)
-        test_qn = self._add_func("test_tested", path="test_app.py", is_test=True)
-        self._add_tested_by(tested, test_qn)
+    def test_being_reached_by_a_tested_caller_buys_no_risk_discount(self):
+        """Reachability is not coverage, so it must not move the score.
 
-        untested_node = self.store.get_node(untested)
-        tested_node = self.store.get_node(tested)
+        A 0.03 credit was tried and was wrong twice. Evidentially: a static
+        CALLS path shows the symbol is reachable, not that a test runs it --
+        about 6% of the symbols the walk reaches are never executed by this
+        project's own suite. Mechanically: every other term moves in steps of
+        0.05 and real scores quantize hard, so 0.03 could never leave a symbol
+        tied -- it dropped it below its whole tie class, and
+        ``review_priorities`` is ``sorted(...)[:10]``. On the delta of #1047
+        that evicted the one genuinely untested symbol from the Action's table.
+        """
+        helper = self._add_func("helper", line_start=1, line_end=10)
+        public = self._add_func("public", line_start=20, line_end=30)
+        self._add_call(public, helper)
+        self._add_tested_by(public, "test_app.py::test_public")
 
-        plain = compute_risk_score(self.store, untested_node)
-        indirect = compute_risk_score(
-            self.store, untested_node, reached_by_tested_caller=True
+        # Control: identical shape (one caller), except that caller has no
+        # tests. The only difference from ``helper`` is the tested caller, so
+        # any score gap is the indirect credit and nothing else.
+        control = self._add_func("control", line_start=100, line_end=110)
+        untested_caller = self._add_func("wrapper", line_start=120, line_end=130)
+        self._add_call(untested_caller, control)
+
+        result = self._analyze()
+        scores = {n["name"]: n["risk_score"] for n in result["changed_functions"]}
+        gaps = {g["name"]: g for g in result["test_gaps"]}
+
+        # Classified as reached, and still scored as fully untested.
+        assert gaps["helper"]["coverage"] == "indirect"
+        assert gaps["control"]["coverage"] == "none"
+        assert scores["helper"] == scores["control"]
+        # And it still outranks the symbol that does have a test.
+        assert scores["helper"] > scores["public"]
+
+    def test_an_indirect_symbol_keeps_its_place_among_equal_scores(self):
+        """The blocker this replaced: a 0.03 nudge is a guaranteed rank drop.
+
+        Scores tie heavily in practice, and ``review_priorities`` keeps the
+        top 10. A symbol demoted below its tie class falls off the only list
+        the PR comment renders, so a genuine gap disappears from the report a
+        maintainer actually reads.
+        """
+        helper = self._add_func("helper", line_start=1, line_end=10)
+        public = self._add_func("public", line_start=20, line_end=30)
+        self._add_call(public, helper)
+        self._add_tested_by(public, "test_app.py::test_public")
+        # Peers share ``helper``'s shape -- one untested caller each -- so they
+        # land on the same score and form the tie group the credit used to
+        # push ``helper`` out of.
+        for i in range(12):
+            peer = self._add_func(
+                f"peer{i:02d}", line_start=400 + i * 20, line_end=405 + i * 20,
+            )
+            caller = self._add_func(
+                f"peercaller{i:02d}", line_start=410 + i * 20, line_end=415 + i * 20,
+            )
+            self._add_call(caller, peer)
+
+        result = self._analyze()
+        priorities = result["review_priorities"]
+        assert "helper" in [p["name"] for p in priorities]
+        helper_score = next(p["risk_score"] for p in priorities if p["name"] == "helper")
+        peer_score = next(p["risk_score"] for p in priorities if p["name"].startswith("peer"))
+        assert helper_score == peer_score
+
+
+class TestReviewGuidanceAgrees(_Fixture):
+    """The two tools CLAUDE.md sends a reviewer through must not disagree.
+
+    ``get_review_context`` built its untested list from direct TESTED_BY edges
+    only and printed "lack test coverage" -- the absolute wording -- about the
+    same symbols ``detect_changes`` was, in the same session, reporting as
+    reached through a caller. The reviewer got two answers and no way to pick.
+    """
+
+    def test_guidance_splits_the_same_way_detect_changes_does(self):
+        from code_review_graph.tools.review import _generate_review_guidance
+
+        helper = self._add_func("helper", line_start=1, line_end=10)
+        public = self._add_func("public", line_start=20, line_end=30)
+        self._add_call(public, helper)
+        self._add_tested_by(public, "test_app.py::test_public")
+        orphan = self._add_func("orphan", line_start=40, line_end=50)
+
+        impact = {
+            "changed_nodes": [
+                self.store.get_node(helper),
+                self.store.get_node(orphan),
+            ],
+            "edges": [],
+            "impacted_nodes": [],
+            "impacted_files": [],
+        }
+        guidance = _generate_review_guidance(
+            impact, ["app.py"], None, self.store,
         )
-        direct = compute_risk_score(self.store, tested_node)
 
-        assert direct < indirect < plain
-
-    def test_indirect_credit_does_not_stack_on_direct_tests(self):
-        """A symbol with its own tests gets no extra discount for a caller."""
-        tested = self._add_func("tested", line_start=1, line_end=10)
-        test_qn = self._add_func("test_tested", path="test_app.py", is_test=True)
-        self._add_tested_by(tested, test_qn)
-        node = self.store.get_node(tested)
-
-        assert compute_risk_score(self.store, node) == compute_risk_score(
-            self.store, node, reached_by_tested_caller=True
+        assert "lack test coverage" not in guidance
+        assert "have no direct test" in guidance
+        indirect_line = next(
+            line for line in guidance.splitlines()
+            if "reached only through a caller" in line
         )
+        assert "helper" in indirect_line
+        assert "orphan" not in indirect_line
+        unreached_line = next(
+            line for line in guidance.splitlines()
+            if "no tested caller found" in line
+        )
+        assert "orphan" in unreached_line
+
+    def test_guidance_without_a_store_still_avoids_the_absolute_claim(self):
+        from code_review_graph.tools.review import _generate_review_guidance
+
+        orphan = self._add_func("orphan", line_start=40, line_end=50)
+        impact = {
+            "changed_nodes": [self.store.get_node(orphan)],
+            "edges": [],
+            "impacted_nodes": [],
+            "impacted_files": [],
+        }
+        guidance = _generate_review_guidance(impact, ["app.py"])
+        assert "have no direct test" in guidance
+        assert "lack test coverage" not in guidance
