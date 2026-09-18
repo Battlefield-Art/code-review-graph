@@ -66,6 +66,7 @@ _COVERED_TABLES = {
     "flow_snapshots",
     "risk_index",
     "nodes_fts",
+    "nodes_fts_state",
     "embeddings",
 }
 
@@ -438,6 +439,46 @@ def dump_database(db_path: Path, repo_root: Path) -> dict[str, list[str]]:
                     digest.update(repr(value).encode("utf-8", "replace"))
         fts_count = conn.execute("SELECT count(*) FROM nodes_fts").fetchone()[0]
         sections["fts_index_bytes"] = [f"rows={fts_count} sha256={digest.hexdigest()}"]
+
+        # ``nodes_fts`` is an external-content table, so deleting an entry needs
+        # the column values that were indexed, and those are gone once the node
+        # row is. ``nodes_fts_state`` is the mirror kept for that, which makes a
+        # disagreement here a disagreement about what the next incremental
+        # update will be able to remove -- not cosmetic. Its own ``node_id`` is
+        # the surrogate key from ``nodes``, resolved to the node's identity the
+        # way ``flow_memberships`` resolves its own; raw numbering is already
+        # pinned by the ``node_id_order`` section.
+        #
+        # Columns come from ``NODES_FTS_COLUMNS`` rather than a literal list, so
+        # widening the mirror widens this section with it. Intersected with what
+        # the database actually has, because a mirror written by an older
+        # release carries fewer columns.
+        from code_review_graph.migrations import (
+            NODES_FTS_COLUMNS,
+            NODES_FTS_STATE_TABLE,
+        )
+
+        present = {
+            row[1]
+            for row in conn.execute(
+                f"PRAGMA table_info({NODES_FTS_STATE_TABLE})"  # nosec B608
+            )
+        }
+        mirrored = [name for name in NODES_FTS_COLUMNS if name in present]
+        mirror_rows: list[str] = []
+        if mirrored:
+            for r in _rows(
+                conn,
+                f"SELECT node_id, {', '.join(mirrored)} "  # nosec B608
+                f"FROM {NODES_FTS_STATE_TABLE}",
+            ):
+                identity = nodes.get(
+                    r["node_id"], f"<missing-node:{r['node_id']}>"
+                )
+                mirror_rows.append(
+                    _canon([identity] + [r[name] for name in mirrored], roots)
+                )
+        sections["nodes_fts_state"] = sorted(mirror_rows)
 
         # What the embedding pipeline selects and what text it reduces each
         # node to -- computed from the graph, independent of any provider.

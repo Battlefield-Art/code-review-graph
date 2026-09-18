@@ -115,6 +115,10 @@ MIN_ROWS: dict[str, int] = {
     "risk_index": 500,
     "fts_query_results": 60,
     "fts_index_bytes": 1,
+    # One row per indexed node, so it tracks the nodes floor rather than a
+    # number of its own: a mirror that fell far below it would mean the index
+    # had lost the values it needs to delete entries with.
+    "nodes_fts_state": 1000,
     "embedding_texts": 1000,
     "embeddings": 1000,
 }
