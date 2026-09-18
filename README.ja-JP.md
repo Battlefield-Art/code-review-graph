@@ -518,7 +518,8 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 
 | 変数 | 内容 | 既定値 |
 |----------|-------------|---------|
-| `CRG_GIT_TIMEOUT` | Git 操作のタイムアウト（秒） | `30` |
+| `CRG_GIT_TIMEOUT` | Git 操作のタイムアウト（秒。build / update / watch） | `30` |
+| `CRG_DISCOVERY_TIMEOUT` | ファイル一覧が明示されなかったとき、変更内容を特定する各 Git コマンドのタイムアウト（秒）。超過時はエラーを返し、「変更なし」とは報告しない | `5`（`CRG_GIT_TIMEOUT` を明示設定した場合はその値） |
 | `CRG_DATA_DIR` | グラフのデータベースと生成物を置くディレクトリ | - |
 | `CRG_HOOK_WORKTREES` | `1` にすると pre-commit フックをリンク済みの git worktree でも動かす | - |
 | `CRG_EMBEDDING_MODEL` | ローカルのベクトル埋め込みの既定モデル | `all-MiniLM-L6-v2` |
@@ -529,7 +530,7 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 | `CRG_MAX_BFS_DEPTH` | グラフ探索の最大の深さ | `15` |
 | `CRG_MAX_CHANGED_FUNCS` | 1 回の変更レポートで分析する変更関数の最大数 | `500` |
 | `CRG_MAX_TRANSITIVE_FRONTIER` | 推移的な呼び出し元・呼び出し先の展開における最大フロンティア数 | `50` |
-| `CRG_TOOL_TIMEOUT` | 制限付き MCP ツールのタイムアウト（秒。`0` で無効） | `0` |
+| `CRG_TOOL_TIMEOUT` | 読み取り専用 MCP ツールのタイムアウト（秒。`0` で無効）。書き込みを行うツール（build / postprocess / embed / wiki / apply-refactor）には適用されない | `0` |
 | `CRG_CHURN_WINDOW_DAYS` | `detect-changes --churn` のコミット数を数える期間 | `90` |
 | `CRG_LEIDEN_SEED` | Leiden のコミュニティ検出のシード | `42` |
 | `CRG_RECURSE_SUBMODULES` | `1`、`true`、`yes` のとき git サブモジュールを含める | - |

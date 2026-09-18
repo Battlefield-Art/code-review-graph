@@ -1149,6 +1149,9 @@ class NumericVar:
 
 NUMERIC_ENV_VARS: tuple[NumericVar, ...] = (
     NumericVar("CRG_GIT_TIMEOUT", ("status",), "45"),
+    # Read through a local variable, so ``_numeric_env_sites`` cannot see
+    # the parse; listed by hand so the reachable-value tests still run it.
+    NumericVar("CRG_DISCOVERY_TIMEOUT", ("detect-changes", "--brief"), "3"),
     NumericVar("CRG_MAX_IMPACT_NODES", ("status",), "250"),
     NumericVar("CRG_MAX_IMPACT_DEPTH", ("status",), "3"),
     NumericVar("CRG_MAX_BFS_DEPTH", ("status",), "10"),

@@ -571,6 +571,20 @@ def _resolve_kwargs(kwargs: dict[str, Any], repo: dict[str, Any]) -> dict[str, A
     return resolved
 
 
+def _invoke(tool: Any, **kwargs: Any) -> Any:
+    """Call a registered MCP tool from a synchronous test.
+
+    Nearly every tool is a coroutine now: the blocking body runs on a worker
+    thread so the stdio event loop can still answer other requests (#262).
+    Tests care about the payload, not the transport, so drive whichever shape
+    the tool has.
+    """
+    result = tool(**kwargs)
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
+
+
 def _call(name: str, spec: dict[str, Any], kwargs: dict[str, Any],
           repo: dict[str, Any]) -> Any:
     """Invoke one registered tool with fixture-resolved arguments."""
@@ -589,7 +603,8 @@ def _call(name: str, spec: dict[str, Any], kwargs: dict[str, Any],
 @pytest.fixture(scope="module")
 def repo(graph_repo) -> dict[str, Any]:
     """Fixture graph plus a live refactor_id for apply_refactor_tool."""
-    preview = crg_main.refactor_tool(
+    preview = _invoke(
+            crg_main.refactor_tool,
         mode="rename", old_name="helper_0_0_0", new_name="renamed_helper",
         repo_root=graph_repo["root"],
     )
@@ -664,24 +679,30 @@ def test_caps_actually_bind_on_the_fixture_graph(repo):
     root = repo["root"]
     all_files = repo["files"]
     cases = {
-        "list_communities": crg_main.list_communities_tool(
+        "list_communities": _invoke(
+            crg_main.list_communities_tool,
             repo_root=root, max_results=1,
         ),
-        "list_flows": crg_main.list_flows_tool(repo_root=root, limit=1),
-        "get_affected_flows": crg_main.get_affected_flows_tool(
+        "list_flows": _invoke(crg_main.list_flows_tool, repo_root=root, limit=1),
+        "get_affected_flows": _invoke(
+            crg_main.get_affected_flows_tool,
             repo_root=root, changed_files=all_files, max_flows=1,
         ),
-        "refactor_dead_code": crg_main.refactor_tool(
+        "refactor_dead_code": _invoke(
+            crg_main.refactor_tool,
             repo_root=root, mode="dead_code", max_results=1,
         ),
-        "get_hub_nodes": crg_main.get_hub_nodes_tool(repo_root=root, top_n=1),
-        "get_bridge_nodes": crg_main.get_bridge_nodes_tool(
+        "get_hub_nodes": _invoke(crg_main.get_hub_nodes_tool, repo_root=root, top_n=1),
+        "get_bridge_nodes": _invoke(
+            crg_main.get_bridge_nodes_tool,
             repo_root=root, top_n=1,
         ),
-        "get_surprising_connections": crg_main.get_surprising_connections_tool(
+        "get_surprising_connections": _invoke(
+            crg_main.get_surprising_connections_tool,
             repo_root=root, top_n=1,
         ),
-        "get_architecture_overview": crg_main.get_architecture_overview_tool(
+        "get_architecture_overview": _invoke(
+            crg_main.get_architecture_overview_tool,
             repo_root=root, max_results=1,
         ),
     }
@@ -750,7 +771,8 @@ def test_hard_ceilings_bind(repo):
     root = repo["root"]
     all_files = repo["files"]
 
-    communities = crg_main.list_communities_tool(
+    communities = _invoke(
+            crg_main.list_communities_tool,
         repo_root=root, max_members=HUGE,
     )["communities"]
     oversized = [c for c in communities if c["size"] > 25]
@@ -759,18 +781,20 @@ def test_hard_ceilings_bind(repo):
         assert len(community["members"]) == community_tools._MAX_MEMBERS
         assert community["members_truncated"] is True
 
-    hubs = crg_main.get_hub_nodes_tool(repo_root=root, top_n=HUGE)
+    hubs = _invoke(crg_main.get_hub_nodes_tool, repo_root=root, top_n=HUGE)
     assert hubs["total"] > analysis_tools._MAX_HUB_NODES
     assert len(hubs["hub_nodes"]) == analysis_tools._MAX_HUB_NODES
 
-    surprises = crg_main.get_surprising_connections_tool(
+    surprises = _invoke(
+            crg_main.get_surprising_connections_tool,
         repo_root=root, top_n=HUGE,
     )
     assert len(surprises["surprising_connections"]) == (
         min(surprises["total"], analysis_tools._MAX_SURPRISING)
     )
 
-    flows = crg_main.get_affected_flows_tool(
+    flows = _invoke(
+            crg_main.get_affected_flows_tool,
         repo_root=root, changed_files=all_files, max_flows=HUGE,
     )
     assert flows["total"] > review._MAX_AFFECTED_FLOWS_STANDARD
@@ -785,7 +809,8 @@ def test_hard_ceilings_bind(repo):
     assert changes["changed_functions_total"] > review._MAX_CHANGED_FUNCTIONS
     assert len(changes["changed_functions"]) == review._MAX_CHANGED_FUNCTIONS
 
-    context = crg_main.get_review_context_tool(
+    context = _invoke(
+            crg_main.get_review_context_tool,
         repo_root=root, changed_files=all_files, max_results=HUGE,
         max_files=HUGE, include_source=True, max_lines_per_file=HUGE,
     )["context"]
@@ -818,7 +843,8 @@ def test_hard_ceilings_bind(repo):
         )
         assert held <= share_cap, f"{name} starved the rest of the ranking"
 
-    impact = crg_main.get_impact_radius_tool(
+    impact = _invoke(
+            crg_main.get_impact_radius_tool,
         repo_root=root, changed_files=all_files, max_depth=5,
         max_results=HUGE,
     )
@@ -833,7 +859,8 @@ def test_hard_ceilings_bind(repo):
     assert impact["changed_nodes_omitted"] > 0
     assert impact["truncated"] is True
 
-    dead = crg_main.refactor_tool(
+    dead = _invoke(
+            crg_main.refactor_tool,
         repo_root=root, mode="dead_code", max_results=HUGE,
     )
     assert len(dead["dead_code"]) == min(
@@ -845,7 +872,8 @@ class TestTruncationContract:
     """The contract PR #853 established, applied to the newly capped tools."""
 
     def test_list_communities_reports_untruncated_total(self, repo):
-        result = crg_main.list_communities_tool(
+        result = _invoke(
+            crg_main.list_communities_tool,
             repo_root=repo["root"], max_results=1,
         )
         assert result["status"] == "ok"
@@ -854,7 +882,8 @@ class TestTruncationContract:
         assert f"showing {len(result['communities'])} of" in result["summary"]
 
     def test_get_community_keeps_true_size_when_members_cut(self, repo):
-        result = crg_main.get_community_tool(
+        result = _invoke(
+            crg_main.get_community_tool,
             repo_root=repo["root"],
             community_id=_pick_row(repo, _COMMUNITY_SQL, 0),
             include_members=True, max_members=1,
@@ -877,7 +906,8 @@ class TestTruncationContract:
 
     def test_affected_flows_zero_still_hits_the_ceiling(self, repo):
         """``max_flows=0`` means 'no caller limit', not 'no limit'."""
-        result = crg_main.get_affected_flows_tool(
+        result = _invoke(
+            crg_main.get_affected_flows_tool,
             repo_root=repo["root"], changed_files=repo["files"], max_flows=0,
         )
         assert len(result["affected_flows"]) <= 25
@@ -885,7 +915,8 @@ class TestTruncationContract:
 
     def test_rename_preview_response_is_cut_but_apply_is_not(self, repo):
         """Truncating the response must not truncate the stored refactor."""
-        preview = crg_main.refactor_tool(
+        preview = _invoke(
+            crg_main.refactor_tool,
             repo_root=repo["root"], mode="rename", old_name="helper_0_0_0",
             new_name="renamed_helper", max_results=1,
         )
@@ -894,7 +925,8 @@ class TestTruncationContract:
         assert preview["total"] > 1
         # The stored preview still holds every edit, so a dry run reports the
         # full set of files rather than the one shown edit.
-        applied = crg_main.apply_refactor_tool(
+        applied = _invoke(
+            crg_main.apply_refactor_tool,
             repo_root=repo["root"], refactor_id=preview["refactor_id"],
             dry_run=True,
         )
@@ -929,11 +961,12 @@ class TestBoundValidation:
     def test_rejects_non_positive_bounds(self, tool, kwargs, repo):
         func = getattr(crg_main, tool)
         with pytest.raises(ValueError, match="greater than or equal to 1"):
-            func(repo_root=repo["root"], **kwargs)
+            _invoke(func, repo_root=repo["root"], **kwargs)
 
     def test_refactor_rejects_non_positive_max_results(self, repo):
         with pytest.raises(ValueError, match="greater than or equal to 1"):
-            crg_main.refactor_tool(
+            _invoke(
+            crg_main.refactor_tool,
                 repo_root=repo["root"], mode="dead_code", max_results=0,
             )
 
@@ -945,4 +978,4 @@ class TestBoundValidation:
 
     def test_cross_repo_search_rejects_non_positive_bounds(self):
         with pytest.raises(ValueError, match="greater than or equal to 1"):
-            crg_main.cross_repo_search_tool(query="x", max_results=0)
+            _invoke(crg_main.cross_repo_search_tool, query="x", max_results=0)

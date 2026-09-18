@@ -11,6 +11,7 @@ from ..config_keys import normalize_spring_config_key
 from ..constants import IMPORT_SCOPE_KEY
 from ..context_savings import attach_context_savings, estimate_file_tokens
 from ..embeddings import EmbeddingStore
+from ..errors import ChangeDiscoveryError
 from ..graph import (
     IMPACT_RESOLUTIONS,
     QUERY_RESOLUTIONS,
@@ -28,10 +29,8 @@ from ..graph import (
 )
 from ..hints import generate_hints, get_session
 from ..incremental import (
-    get_changed_files,
+    discover_review_changes,
     get_db_path,
-    get_staged_and_unstaged,
-    resolve_review_base,
 )
 from ..parser import normalize_file_path
 from ..search import hybrid_search
@@ -43,6 +42,7 @@ from ..uncertainty import (
 from ._common import (
     _BUILTIN_CALL_NAMES,
     _bounded,
+    _error_response,
     _get_store,
     _resolve_graph_file_paths,
 )
@@ -241,10 +241,7 @@ def get_impact_radius(
     store, root = _get_store(repo_root)
     try:
         if changed_files is None:
-            base = resolve_review_base(root, base)
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files, base = discover_review_changes(root, base)
 
         if not changed_files:
             return {
@@ -418,6 +415,12 @@ def get_impact_radius(
             response["confidence"] = confidence
         attach_context_savings(response, original_tokens=original_tokens)
         return response
+    except ChangeDiscoveryError as exc:
+        # Distinct from the "no changed files" answer above, and deliberately
+        # so: that one is an all-clear a client will act on. Git that could
+        # not be run, or that overran the discovery budget, says nothing
+        # about the working tree (#262).
+        return _error_response(str(exc))
     finally:
         store.close()
 

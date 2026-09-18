@@ -18,6 +18,26 @@
   (#952).
 - `CRG_HOOK_WORKTREES=1` keeps the generated pre-commit hook active inside
   a linked Git worktree (#953).
+- `CRG_DISCOVERY_TIMEOUT` bounds each Git command that discovers what
+  changed when a review tool or command was not handed an explicit file
+  list. It defaults to 5 seconds, never exceeds `CRG_GIT_TIMEOUT`, and is
+  read on every call rather than frozen at import. `CRG_GIT_TIMEOUT` keeps
+  its 30-second default and still governs build, update and watch (#262).
+- `staging` is promoted to `testing` automatically, once a day, when it has
+  commits `testing` lacks, every required status check is green on its tip,
+  and the promotion gate has not failed on the `testing` tip.
+  `.github/workflows/auto-promote.yml` opens the promotion pull request and
+  merges it with a merge commit, so contributor authorship survives; the
+  decision lives in `scripts/auto_promote.py` and reads the required
+  contexts from the `testing` ruleset at run time. It merges only a pull
+  request it opened itself — same repository, `staging` → `testing`,
+  labelled `auto-promotion`, and pinned with `--match-head-commit` to the
+  commit whose checks were read — all re-verified immediately before the
+  merge, so a fork branch named `staging`, a base branch changed after the
+  fact, or a promotion pull request opened by hand cannot be merged by it. A
+  hand-started run defaults to a dry run. Requires *Allow GitHub Actions to
+  create and approve pull requests* under Settings → Actions → General.
+  Promotion to `main` is never automatic and the workflow cannot target it.
 
 ### Changed
 
@@ -40,6 +60,34 @@
   another branch. Detection uses the git directory's `commondir` file and
   needs only `git rev-parse --absolute-git-dir` (Git 2.13). Reinstall
   upgrades the exact hook block written by earlier releases (#953).
+- Every MCP tool that can reach Git discovery, a graph traversal, FTS, an
+  embedding provider or the filesystem now runs its work on a worker thread
+  through one shared helper. A tool that exceeds `CRG_TOOL_TIMEOUT` answers
+  with `status: error` naming itself and the budget, instead of leaving the
+  client to time the request out itself as MCP error -32001. Only
+  `get_docs_section_tool` and `list_repos_tool` still run inline; they read
+  one small file each (#262, #46, #136).
+
+  `CRG_TOOL_TIMEOUT` keeps its meaning: it bounds read-only tools, and it
+  does **not** bound `build_or_update_graph_tool`, `run_postprocess_tool`,
+  `embed_graph_tool`, `generate_wiki_tool` or `apply_refactor_tool`. Those
+  write — to `graph.db`, to the wiki tree, to your source files — and a
+  timeout cancels the wait, not the worker, so bounding them would report
+  failure to the client while the write went on regardless.
+- Change discovery is bounded honestly. Each Git command in the chain that
+  works out what changed gets `CRG_DISCOVERY_TIMEOUT` (5 seconds) rather
+  than the 30-second `CRG_GIT_TIMEOUT`, and runs with `require_vcs`, so
+  exhausting that budget raises a `ChangeDiscoveryError` and the tool
+  answers `status: error`. Shortening a budget that failed *silently* would
+  only have made #913's false all-clear easier to hit, and would have
+  extended it to the base resolution, where a timed-out merge base
+  degrades a three-dot diff into a two-dot one. Raising `CRG_GIT_TIMEOUT`
+  still raises discovery with it, so the documented remedy for slow Git
+  keeps working (#262).
+- `get_minimal_context_tool` runs its change discovery on that same budget.
+  It previously spent up to ~130 seconds on five Git subprocesses of its
+  own — the tool agents are told to call first, and the one most likely to
+  hit a client's request ceiling (#262).
 
 ### Fixed
 

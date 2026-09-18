@@ -54,8 +54,8 @@ feature branch --PR--> staging --PR--> testing --PR--> main --tag--> PyPI
 | Branch    | Purpose                                                        | Who merges into it                      |
 | --------- | -------------------------------------------------------------- | --------------------------------------- |
 | `staging` | Default branch. Every feature and fix PR lands here first.     | Maintainers, once CI is green.          |
-| `testing` | Candidate for the next release. Gets a longer soak and manual QA. | Maintainer, via a promotion PR from `staging`. |
-| `main`    | Released code. Nothing reaches `main` without passing QA on `testing`. | Maintainer, via a promotion PR from `testing`. |
+| `testing` | Candidate for the next release. Gets a longer soak and manual QA. | The `Auto promote` workflow, once a day, when `staging` is green. |
+| `main`    | Released code. Nothing reaches `main` without passing QA on `testing`. | Maintainer only, by hand, via a promotion PR from `testing`. |
 
 Rules that apply to all three branches (enforced by repository rulesets):
 
@@ -74,14 +74,67 @@ merge commit when a PR has several authors so nobody loses attribution. Rebase-m
 also allowed on `staging`.
 
 **Promotion PRs** move everything on `staging` to `testing`, and later everything on
-`testing` to `main`. Open one from the Actions tab (`Promote` workflow, pick the step) or
-by hand with `gh pr create --base testing --head staging`. They are always merged with a
-**merge commit**, never squashed, so every contributor stays the author of their commits;
-the `testing` and `main` rulesets allow no other merge method. A promotion is the
-maintainer's sign-off: CI green is necessary but not sufficient. A promotion PR opened by
-the workflow shows an "Approve workflows to run" banner; the required checks are already
-satisfied by the CI run on the source branch's tip, so the banner can be approved or
-ignored.
+`testing` to `main`. They are always merged with a **merge commit**, never squashed, so
+every contributor stays the author of their commits; the `testing` and `main` rulesets
+allow no other merge method. Opening a promotion PR re-queues every required check on a
+commit that already had them green from the push run, so the PR sits blocked for a
+quarter of an hour or so before it can be merged. That is normal.
+
+`staging` → `testing` happens by itself. `testing` → `main` never does.
+
+### Automatic promotion to `testing`
+
+`.github/workflows/auto-promote.yml` runs once a day. If `staging` has commits `testing`
+does not, every required status check is green on the `staging` tip, and the promotion
+gate has not failed on the current `testing` tip, it opens the promotion PR and merges it
+with a merge commit. It writes a summary on every run, including the runs that decide to
+do nothing, so "nothing to promote" is never indistinguishable from "did not run".
+
+**One repository setting is required.** Settings → Actions → General → Workflow
+permissions → tick **Allow GitHub Actions to create and approve pull requests** → Save.
+Without it `gh pr create` is refused and no promotion PR can be opened — by this workflow
+or by the manual `Promote` one. Leave *Workflow permissions* itself on **Read repository
+contents and packages permissions**: both workflows ask for the writes they need in their
+own `permissions:` block. If the tick is missing, the run goes red and the job summary
+gives that click path.
+
+It merges only a PR it opened itself: same repository, `staging` → `testing`, carrying the
+`auto-promotion` label, and at the commit whose checks were read. `gh pr list --head
+staging` matches a branch of that name in any of this repository's forks, and a PR's base
+branch can be changed by its author at any time without re-running a single check, so all
+of that is verified again immediately before the merge, and the merge itself is pinned
+with `--match-head-commit`. **A promotion PR you opened by hand is never touched** — it
+has no `auto-promotion` label, so the daily run refuses it by number and says so.
+
+It stops, without failing, when there is nothing to promote, when CI is still running,
+when a required check failed or was skipped, when the promotion gate is still running on
+`testing`, when the gate failed there, or when `staging` moved mid-run. Those states are
+reported elsewhere already and tomorrow's run looks again. Three things turn the run red,
+because nothing else reports them:
+
+- **GitHub refused the merge.** The PR is left open and the refusal is quoted in the job
+  summary, with the causes listed in the order they actually occur; merge it by hand with
+  a merge commit.
+- **The workflow is stuck on its own PR** — it conflicts, it is a draft, or GitHub holds
+  it for a rule with every required check green. A stalled promotion that reported itself
+  as a green warning every morning would stay stalled for ever.
+- **A PR it was about to merge is not the one it decided on**, or the release gate could
+  not be started after the merge.
+
+Every rule lives in `scripts/auto_promote.py` and is covered by
+`tests/test_auto_promote.py`; the workflow fetches facts and obeys. The required contexts
+are read from the `testing` ruleset at run time, so a renamed CI job cannot silently drop
+out of the gate. The workflow has no input, variable or code path that can target `main`,
+the PR it merges is re-checked at the door, and the tests assert both.
+
+To see what it would decide without it doing anything, run the `Auto promote` workflow
+from the Actions tab: a hand-started run defaults to a dry run.
+
+**Promotion to `main` is never automatic.** Open it from the Actions tab (`Promote`
+workflow, pick `testing -> main`) or by hand with
+`gh pr create --base main --head testing`, read the promotion gate's verdict first, and
+merge it yourself. That is the maintainer's sign-off: CI green is necessary but not
+sufficient.
 
 **Hotfixes** for a released version follow the same path. If a fix is urgent, open the PR
 against `staging` and promote twice in a row; do not open PRs against `main`.
@@ -144,7 +197,8 @@ it). The report names every check, whether it passed, and for a failure the exac
 assertion that moved: for example the property, its baseline and the measured delta.
 
 The gate opens no pull request and merges nothing. Promotion to `main` stays the
-maintainer's decision, made with the `Promote` workflow as before.
+maintainer's decision, made with the `Promote` workflow as before. `Auto promote` cannot
+reach `main` either: it promotes `staging` to `testing` and nothing else.
 
 To run any of these by hand:
 

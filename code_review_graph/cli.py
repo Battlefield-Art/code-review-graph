@@ -2180,22 +2180,15 @@ def _dispatch() -> None:
                     estimate_file_tokens,
                     format_context_savings_panel,
                 )
-                from .incremental import (
-                    get_changed_files,
-                    get_staged_and_unstaged,
-                    resolve_review_base,
-                )
+                from .incremental import discover_review_changes
 
                 # Reuse the base the update actually resolved to (args.base is
                 # None by default now, which get_changed_files cannot accept),
                 # then apply the same merge-base rule as detect-changes so a
                 # branch ref scopes the summary to this branch's own commits.
-                brief_base = resolve_review_base(
+                changed, brief_base = discover_review_changes(
                     repo_root, result.get("base_resolved") or "HEAD~1"
                 )
-                changed = get_changed_files(repo_root, brief_base)
-                if not changed:
-                    changed = get_staged_and_unstaged(repo_root)
                 if changed:
                     impact = analyze_changes(
                         store,
@@ -2504,17 +2497,16 @@ def _dispatch() -> None:
                 attach_context_savings,
                 estimate_file_tokens,
             )
-            from .incremental import get_changed_files, get_staged_and_unstaged, resolve_review_base
+            from .incremental import discover_review_changes
 
-            base = resolve_review_base(repo_root, args.base)
-            # require_vcs: this command's exit code is a review gate. "I
-            # could not look" must never render as "there is nothing to
-            # review" — a CI job keyed on exit 0 would wave through a pull
-            # request nobody read. ChangeDiscoveryError reaches main() and
-            # becomes one `Error: ...` line and exit 1.
-            changed = get_changed_files(repo_root, base, require_vcs=True)
-            if not changed:
-                changed = get_staged_and_unstaged(repo_root, require_vcs=True)
+            # discover_review_changes runs the same three steps on the
+            # short discovery budget, with require_vcs throughout: this
+            # command's exit code is a review gate, so "I could not look"
+            # must never render as "there is nothing to review" — a CI job
+            # keyed on exit 0 would wave through a pull request nobody read.
+            # ChangeDiscoveryError reaches main() and becomes one
+            # `Error: ...` line and exit 1.
+            changed, base = discover_review_changes(repo_root, args.base)
 
             if not changed:
                 print("No changes detected.")
