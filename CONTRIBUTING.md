@@ -86,6 +86,77 @@ ignored.
 **Hotfixes** for a released version follow the same path. If a fix is urgent, open the PR
 against `staging` and promote twice in a row; do not open PRs against `main`.
 
+### The promotion gate
+
+Every time something lands on `testing`, `.github/workflows/promotion-gate.yml` runs the
+slow checks that are too expensive for a pull request. It also runs on demand from the
+Actions tab. It never runs on a pull request, so no contributor waits for it.
+
+It runs seven checks:
+
+| Check | What it does | If it fails |
+| ----- | ------------- | ----------- |
+| `upgrade-path` | Installs the last three PyPI releases, builds a real graph with each, then opens and updates that graph with the current code. | Blocks |
+| `packaging`    | Builds the wheel and the sdist, installs each into a clean environment with the checkout out of reach, and drives the installed program. | Blocks |
+| `determinism`  | Rebuilds one corpus nine times, serial and parallel, thread and process, under two hash seeds, and compares every table. | Blocks |
+| `suite`        | The ordinary test suite with the 65% coverage floor, on Python 3.10, 3.11, 3.12 and 3.13. | Blocks |
+| `e2e`          | Drives the real MCP server over stdio on Linux, macOS and Windows. | Blocks on Linux and macOS, reports on Windows |
+| `corpus`       | Clones eight pinned third-party repositories, builds a graph over each, and compares twelve measured properties against recorded baselines. | Reports |
+| `browser`      | Renders the generated visualization page in headless Chromium. | Reports |
+
+**Blocks** means: do not promote `testing` to `main` until it is green or the maintainer
+has decided in writing why it does not matter. **Reports** means the failure is recorded
+and shown but does not hold a release.
+
+The split is not about how important a check is, it is about whether a failure is
+evidence about our code:
+
+- `upgrade-path` blocks because it is the only check that proves a database a user
+  already has survives the upgrade. A migration that corrupts it cannot be undone by a
+  later patch release.
+- `packaging` blocks because a wheel missing a data file is broken for every user at once
+  and needs another release to fix. It installs from PyPI, which every other job here
+  already does, so it adds no new way to fail.
+- `determinism` blocks because it needs no network and no third-party checkout: a
+  failure is a real difference, never an outage.
+- `suite` blocks because it is the same suite the pull-request CI already requires,
+  re-run against the merged state of `testing`, which no single pull request tested.
+- `e2e` blocks on Linux and macOS because the stdio MCP interface is what every editor
+  integration speaks. The Windows leg reports, because process spawning and file-handle
+  timing on the Windows runner is the flakiest surface in this repository and a runner
+  hiccup must not hold a release.
+- `corpus` reports because it clones eight repositories that belong to other people. A
+  rate limit, an outage or an upstream force-push fails it for a reason that has nothing
+  to do with this code, and a failed clone must not stop a release. A property that moved
+  is still a real regression: read the numbers and decide.
+- `browser` reports because it downloads a Chromium build at run time, and a page that
+  fails to render damages nobody's data.
+
+Reporting is not the same as ignoring. Every check is wrapped by
+`scripts/promotion_gate.py`, which fails it when its test module is not in the checkout,
+when the run collected almost nothing, or when the tests were skipped instead of
+run, including a `browser` run that skipped because Playwright was missing. A check that
+quietly tested nothing is recorded as a failure, not as a pass.
+
+The result is posted twice: to the run's job summary, and as one comment on the open
+issue labelled `promotion-gate` (the workflow opens that issue the first time it needs
+it). The report names every check, whether it passed, and for a failure the exact
+assertion that moved: for example the property, its baseline and the measured delta.
+
+The gate opens no pull request and merges nothing. Promotion to `main` stays the
+maintainer's decision, made with the `Promote` workflow as before.
+
+To run any of these by hand:
+
+```bash
+CRG_UPGRADE_TEST=1 uv run pytest -m upgrade -q -rxX   # upgrade-path
+uv run pytest tests/test_packaging.py -m packaging -q # packaging
+uv run pytest -m determinism -q -rxX                  # determinism
+uv run pytest -m corpus -q                            # corpus (clones 8 repos)
+uv run pytest -m browser -q                           # browser (needs the browser-test extra)
+uv run pytest -m e2e -q                               # e2e
+```
+
 **Releases** are cut from `main` only: bump the version, tag `vX.Y.Z`, publish a GitHub
 release, and the `publish` workflow uploads to PyPI. Nothing is ever released from
 `staging` or `testing`.

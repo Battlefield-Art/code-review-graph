@@ -2,9 +2,75 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Numeric environment overrides (#912)
+# ---------------------------------------------------------------------------
+#
+# Most of these are read at module scope, so a typo in a shell profile used to
+# abort the import with a bare ``ValueError: invalid literal for int()`` — a
+# traceback that never named the variable at fault and killed every command,
+# including the ones that do not use the setting. One helper, used by every
+# numeric override in the package, keeps that impossible: an unusable value
+# falls back to the documented default and says so once, by name.
+
+_warned_env_vars: set[str] = set()
+
+
+def _warn_invalid_env(name: str, raw: str, default: object) -> None:
+    """Warn once per variable that its value was ignored."""
+    if name in _warned_env_vars:
+        return
+    _warned_env_vars.add(name)
+    logger.warning(
+        "Ignoring invalid %s=%r (not a number); using the default %s.",
+        name,
+        raw,
+        default,
+    )
+
+
+def env_int(name: str, default: int) -> int:
+    """Read *name* as an int, falling back to *default* when it is unusable.
+
+    An unset variable is the default silently; a set-but-unparseable one
+    (empty string, word, version number) is the default *and* a warning
+    naming the variable, so the operator can find the typo.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        _warn_invalid_env(name, raw, default)
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    """Read *name* as a float. See :func:`env_int` for the fallback rules.
+
+    NaN and infinity are rejected alongside unparseable text: they are
+    accepted by ``float()`` but poison every comparison they reach.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw.strip())
+    except (TypeError, ValueError):
+        _warn_invalid_env(name, raw, default)
+        return default
+    if not math.isfinite(value):
+        _warn_invalid_env(name, raw, default)
+        return default
+    return value
 
 
 def _bounded_float_env(
@@ -40,10 +106,10 @@ SECURITY_KEYWORDS: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 # Configurable limits (override via environment variables)
 # ---------------------------------------------------------------------------
-MAX_IMPACT_NODES = int(os.environ.get("CRG_MAX_IMPACT_NODES", "500"))
-MAX_IMPACT_DEPTH = int(os.environ.get("CRG_MAX_IMPACT_DEPTH", "2"))
-MAX_BFS_DEPTH = int(os.environ.get("CRG_MAX_BFS_DEPTH", "15"))
-MAX_SEARCH_RESULTS = int(os.environ.get("CRG_MAX_SEARCH_RESULTS", "20"))
+MAX_IMPACT_NODES = env_int("CRG_MAX_IMPACT_NODES", 500)
+MAX_IMPACT_DEPTH = env_int("CRG_MAX_IMPACT_DEPTH", 2)
+MAX_BFS_DEPTH = env_int("CRG_MAX_BFS_DEPTH", 15)
+MAX_SEARCH_RESULTS = env_int("CRG_MAX_SEARCH_RESULTS", 20)
 
 # Impact traversal engine: "sql" (bounded SQLite relaxation) or "networkx".
 BFS_ENGINE = os.environ.get("CRG_BFS_ENGINE", "sql")
@@ -122,3 +188,29 @@ def crg_home() -> Path:
     if override:
         return Path(override).expanduser()
     return _DEFAULT_CRG_HOME
+
+
+# ---------------------------------------------------------------------------
+# Directory-scoped import targets
+# ---------------------------------------------------------------------------
+
+#: ``edges.extra`` key that marks an ``IMPORTS_FROM`` target as a DIRECTORY
+#: rather than a file. Two import forms name a directory: a Go import names a
+#: package, and Ruby's ``require_all`` names a tree. Fanning either one out to
+#: one edge per member file makes the edge count grow with imports times
+#: package size -- 73,507 of kubernetes' import edges came from a single such
+#: fan-out -- and makes an incremental update disagree with a rebuild, because
+#: the edge's target set then depends on which files were in the package when
+#: the importing file happened to be parsed. One edge names the directory and
+#: the read path expands it; see ``expand_import_scope`` in graph.py.
+IMPORT_SCOPE_KEY = "import_scope"
+
+#: The target directory's own files are the imported unit; subdirectories are
+#: separate packages and are NOT members. This is Go's rule.
+IMPORT_SCOPE_PACKAGE = "package"
+
+#: Every file below the target directory is a member, at any depth. This is
+#: what the ``require_all`` gem loads.
+IMPORT_SCOPE_TREE = "tree"
+
+IMPORT_SCOPES = (IMPORT_SCOPE_PACKAGE, IMPORT_SCOPE_TREE)

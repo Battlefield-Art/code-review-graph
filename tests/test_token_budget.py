@@ -45,6 +45,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +54,7 @@ import pytest
 from code_review_graph import main as crg_main
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
-from code_review_graph.tools import analysis_tools, community_tools, review
+from code_review_graph.tools import analysis_tools, community_tools, query, review
 from code_review_graph.tools import refactor_tools as refactor_mod
 
 try:  # pragma: no cover - exercised only when tiktoken is installed
@@ -189,9 +190,6 @@ HUGE = 10**6
 # Tools whose result lists live in code_review_graph/tools/query.py. That
 # module is owned elsewhere and its unbounded worst cases are reported, not
 # fixed, by this change:
-#   * get_impact_radius  -- changed_nodes and edges ignore max_results
-#     (3.4M tokens on a whole-repo diff), and max_results is not even
-#     exposed on the MCP tool signature.
 #   * find_large_functions -- limit is neither validated nor capped
 #     (737k tokens at limit=10**6).
 #   * traverse_graph -- token_budget is neither validated nor capped
@@ -200,7 +198,6 @@ HUGE = 10**6
 # Their *default* budgets are still asserted below; only the worst case is
 # skipped, so a regression in normal use is still caught here.
 QUERY_OWNED_UNBOUNDED = {
-    "get_impact_radius_tool",
     "find_large_functions_tool",
     "traverse_graph_tool",
     "semantic_search_nodes_tool",
@@ -238,12 +235,20 @@ BUDGETS: dict[str, dict[str, Any]] = {
     },
     "get_impact_radius_tool": {
         "default": {"changed_files": "LEAF"},
-        "worst": {"changed_files": "ALL", "max_depth": 5},
-        # Higher than it should be: changed_nodes and edges ignore
-        # max_results in query.py, so even a single-file default grows with
-        # the graph. Reported, not fixed here.
+        "worst": {
+            "changed_files": "ALL", "max_depth": 5, "max_results": HUGE,
+        },
         "default_max": 12_000,
-        "worst_max": None,  # see QUERY_OWNED_UNBOUNDED
+        # Every list now has a fixed ceiling -- the same 100 nodes / 150
+        # edges / 200 files get_review_context applies to the same radius --
+        # so a caller asking for everything on a whole-repo diff gets a
+        # response whose size is a constant rather than a function of the
+        # repository. Before those ceilings this case was 3.4M tokens on this
+        # fixture, and DEFAULT arguments cost 189k on kubernetes.
+        # Measured here: 43,641 with tiktoken, ~30k under the documented
+        # len/4 fallback; the ceiling is the sibling tool's, which carries
+        # the same lists at the same caps.
+        "worst_max": 50_000,
     },
     "query_graph_tool": {
         "default": {"pattern": "callers_of", "target": "helper_0_0_0"},
@@ -254,6 +259,27 @@ BUDGETS: dict[str, dict[str, Any]] = {
         "default_max": 4_000,
         # query.py caps this one via max_results; the ceiling is the caller's
         # own value, so a whole-file summary is the realistic worst case.
+        "worst_max": 40_000,
+    },
+    # The bare target above resolves ambiguously, so it never reaches the
+    # callers_of body. This case does, against the fixture's most-called
+    # helper: every function in the neighbouring package calls it, so it is
+    # the widest call-site list the fixture can produce. It is what pins the
+    # cost of returning one row per call site rather than one per caller.
+    "query_graph_tool:callers_of": {
+        "tool": "query_graph_tool",
+        "default": {"pattern": "callers_of", "target": "CALLEE_QN"},
+        "worst": {
+            "pattern": "callers_of", "target": "CALLEE_QN",
+            "max_results": HUGE,
+        },
+        # Measured 23,599 at the 100-result default and 34,426 for the whole
+        # answer. One row per call site costs ~2.7% over one row per caller
+        # here: the extra key is a line plus, only where the call is written
+        # outside the caller's own file, a path.
+        "default_max": 25_000,
+        # Bounded only by max_results, like every other query.py pattern, so
+        # the caller's own value is the ceiling.
         "worst_max": 40_000,
     },
     "get_review_context_tool": {
@@ -505,6 +531,14 @@ def _register_fixture(repo: dict[str, Any]) -> None:
 
 _FLOW_SQL = "SELECT id FROM flows ORDER BY node_count DESC LIMIT 1"
 _COMMUNITY_SQL = "SELECT id, name FROM communities ORDER BY size DESC LIMIT 1"
+# The most-called function in the fixture, by incoming CALLS edges. Read from
+# the graph rather than hard-coded so it follows the fixture if it changes.
+_CALLEE_SQL = (
+    "SELECT n.qualified_name FROM nodes n "
+    "JOIN edges e ON e.target_qualified = n.qualified_name AND e.kind = 'CALLS' "
+    "WHERE n.kind = 'Function' "
+    "GROUP BY n.qualified_name ORDER BY COUNT(*) DESC, n.qualified_name LIMIT 1"
+)
 
 
 def _resolve_kwargs(kwargs: dict[str, Any], repo: dict[str, Any]) -> dict[str, Any]:
@@ -523,6 +557,8 @@ def _resolve_kwargs(kwargs: dict[str, Any], repo: dict[str, Any]) -> dict[str, A
             resolved[key] = _pick_row(repo, _COMMUNITY_SQL, 0)
         elif value == "COMMUNITY_NAME":
             resolved[key] = _pick_row(repo, _COMMUNITY_SQL, 1)
+        elif value == "CALLEE_QN":
+            resolved[key] = _pick_row(repo, _CALLEE_SQL, 0)
         elif value == "REFACTOR_ID":
             resolved[key] = repo["refactor_id"]
         elif value == "FLOOD_NAMES":
@@ -685,6 +721,9 @@ MAX_CEILINGS = {
     "refactor_tools._MAX_REFACTOR_RESULTS": (
         refactor_mod._MAX_REFACTOR_RESULTS, 150,
     ),
+    "query._MAX_IMPACT_NODES_SHOWN": (query._MAX_IMPACT_NODES_SHOWN, 100),
+    "query._MAX_IMPACT_EDGES": (query._MAX_IMPACT_EDGES, 150),
+    "query._MAX_IMPACT_FILES": (query._MAX_IMPACT_FILES, 200),
 }
 
 
@@ -759,6 +798,40 @@ def test_hard_ceilings_bind(repo):
     # Each snippet can overshoot by the "..." separators it inserts, so allow
     # a small margin over the raw line budget.
     assert emitted_lines <= review._MAX_REVIEW_SOURCE_LINES * 1.5
+    # The source lines themselves are accounted for exactly: the budget is
+    # allocated once over the risk-ranked file list, and what a file does not
+    # use is handed to the next file rather than spent twice.
+    source_lines = sum(
+        1
+        for snippet in context["source_snippets"].values()
+        for line in snippet.splitlines()
+        if re.match(r"^\d+: ", line)
+    )
+    assert source_lines <= review._MAX_REVIEW_SOURCE_LINES
+    # And no single file may hold more than its capped share of that budget.
+    share_cap = review._source_share_cap(
+        review._MAX_REVIEW_SOURCE_LINES, review._MAX_LINES_PER_FILE,
+    )
+    for name, snippet in context["source_snippets"].items():
+        held = sum(
+            1 for line in snippet.splitlines() if re.match(r"^\d+: ", line)
+        )
+        assert held <= share_cap, f"{name} starved the rest of the ranking"
+
+    impact = crg_main.get_impact_radius_tool(
+        repo_root=root, changed_files=all_files, max_depth=5,
+        max_results=HUGE,
+    )
+    assert len(impact["impacted_nodes"]) <= query._MAX_IMPACT_NODES_SHOWN
+    assert len(impact["edges"]) <= query._MAX_IMPACT_EDGES
+    assert len(impact["changed_nodes"]) <= query._MAX_IMPACT_NODES_SHOWN
+    assert len(impact["impacted_files"]) <= query._MAX_IMPACT_FILES
+    # Every cap says what it dropped, so the response is never silently short.
+    assert impact["nodes_omitted"] == (
+        impact["total_impacted"] - len(impact["impacted_nodes"])
+    )
+    assert impact["changed_nodes_omitted"] > 0
+    assert impact["truncated"] is True
 
     dead = crg_main.refactor_tool(
         repo_root=root, mode="dead_code", max_results=HUGE,

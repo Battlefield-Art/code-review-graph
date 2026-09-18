@@ -31,6 +31,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 from .config_keys import is_spring_config_path, normalize_spring_config_key
+from .constants import (
+    IMPORT_SCOPE_KEY,
+    IMPORT_SCOPE_PACKAGE,
+    IMPORT_SCOPE_TREE,
+)
 from .custom_languages import CustomLanguage, load_custom_languages
 
 try:
@@ -675,6 +680,147 @@ def _load_tree_sitter_parser(grammar: str):
 
 
 _PhpPsr4Mappings = tuple[tuple[str, tuple[str, ...]], ...]
+
+
+class _ImportSpec(NamedTuple):
+    """One import statement: its module string, its own line, and its form.
+
+    ``line`` is the line of the individual specifier, not of the statement
+    that encloses it: every spec in a Go ``import ( ... )`` block used to be
+    stamped with the line of the ``import (`` token.
+
+    ``form`` carries the language keyword when identical module strings
+    resolve by different algorithms depending on it. Ruby needs it --
+    ``require "x"`` searches the load paths while ``require_relative "x"``
+    searches the requiring file's own directory -- and it is part of the
+    resolution cache key. ``None`` for the languages with a single form.
+    """
+
+    module: str
+    line: int
+    form: Optional[str] = None
+
+
+class _GoModule(NamedTuple):
+    """One ``go.mod``: its directory, the module path it declares, and the
+    ``replace`` directives that redirect a module prefix to a local path."""
+
+    root: Path
+    path: str
+    replacements: tuple[tuple[str, str], ...]
+
+
+# ``module github.com/cli/cli/v2`` -- the anchor that tells this repository's
+# own packages from its dependencies. go.mod also allows the legacy quoted
+# spelling.
+_GO_MODULE_LINE_RE = re.compile(r'^\s*module\s+"?([^\s"]+)"?\s*(?://.*)?$')
+# ``old [vX] => ./local [vX]`` inside or outside a ``replace ( ... )`` block.
+_GO_REPLACE_LINE_RE = re.compile(
+    r"^\s*(?:replace\s+)?([^\s=>]+)(?:\s+v\S+)?\s*=>\s*(\S+)(?:\s+v\S+)?"
+    r"\s*(?://.*)?$",
+)
+# ``s.require_paths = ["lib"]`` / ``s.require_paths = %w[lib ext]`` /
+# ``s.require_path = "lib"`` -- a gem's load roots, declared in its gemspec.
+_RUBY_REQUIRE_PATHS_RE = re.compile(
+    r"""require_paths?\s*=\s*(?:\[([^\]]*)\]|%w[\[({]([^\])}]*)[\])}]|(['"])([^'"]+)\3)""",
+)
+# ``$LOAD_PATH.unshift File.expand_path("../lib", __FILE__)`` and the ``$:``
+# spelling, with or without parentheses.
+_RUBY_LOAD_PATH_RE = re.compile(
+    r"""(?:\$LOAD_PATH|\$:)\s*(?:\.unshift|\.push|<<)\s*\(?\s*"""
+    r"""(?:File\.expand_path\(\s*)?(['"])([^'"]+)\1\s*(?:,\s*(__dir__|__FILE__))?""",
+)
+# Ruby methods that name a file to load. Matching the METHOD, not the text,
+# is what keeps `raise "... are required."` out of the import graph.
+_RUBY_IMPORT_METHODS = frozenset({
+    "require", "require_relative", "load", "autoload", "require_all",
+})
+# `autoload :Const, "path"` names the path second; every other form first.
+_RUBY_IMPORT_PATH_ARGUMENT = {"autoload": 1}
+# Bound the manifest scans: a go.mod or gemspec beyond this is not shaped
+# like one.
+_GO_MOD_MAX_LINES = 2_000
+
+
+@lru_cache(maxsize=256)
+def _read_go_mod(
+    go_mod_path: str,
+    _mtime_ns: int,
+    _size: int,
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Read the module path and local ``replace`` targets from one go.mod.
+
+    The declared module path is the only thing that tells this repository's
+    own packages (``github.com/cli/cli/v2/pkg/cmdutil``) from a dependency
+    (``github.com/spf13/cobra``), so without it there is no anchor to
+    resolve from. Cached on (path, mtime, size) like the composer.json
+    reader, so a whole-repository build reads each go.mod once.
+
+    Returns ``("", ())`` when the file is unreadable or declares no module.
+    """
+    try:
+        text = Path(go_mod_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "", ()
+    module_path = ""
+    replacements: list[tuple[str, str]] = []
+    in_replace_block = False
+    for raw_line in text.splitlines()[:_GO_MOD_MAX_LINES]:
+        line = raw_line.strip()
+        if not line or line.startswith("//"):
+            continue
+        if not module_path:
+            match = _GO_MODULE_LINE_RE.match(raw_line)
+            if match:
+                module_path = match.group(1)
+                continue
+        if line.startswith("replace") and line.endswith("("):
+            in_replace_block = True
+            continue
+        if in_replace_block and line == ")":
+            in_replace_block = False
+            continue
+        if "=>" not in line or not (in_replace_block or line.startswith("replace")):
+            continue
+        match = _GO_REPLACE_LINE_RE.match(raw_line)
+        if match is None:
+            continue
+        old, new = match.group(1), match.group(2)
+        # Only a local directory replacement points at code in this
+        # repository; ``=> github.com/other/mod v1.2.3`` is still a download.
+        if new.startswith(("./", "../", "/")) or new in (".", ".."):
+            replacements.append((old, new))
+    # Longest prefix first, so ``example.com/a/b`` wins over ``example.com/a``.
+    replacements.sort(key=lambda item: len(item[0]), reverse=True)
+    return module_path, tuple(replacements)
+
+
+@lru_cache(maxsize=64)
+def _read_gemspec_require_paths(
+    gemspec_path: str,
+    _mtime_ns: int,
+    _size: int,
+) -> tuple[str, ...]:
+    """Read ``require_paths`` from one .gemspec.
+
+    A gemspec that declares none still has load roots: RubyGems defaults
+    ``require_paths`` to ``["lib"]``, which is what jekyll, rubocop and most
+    gems rely on.
+    """
+    try:
+        text = Path(gemspec_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ()
+    match = _RUBY_REQUIRE_PATHS_RE.search(text)
+    if match is None:
+        return ("lib",)
+    bracketed, word_array, _quote, single = match.groups()
+    if single:
+        return (single,)
+    if word_array is not None:
+        return tuple(word for word in word_array.split() if word)
+    values = tuple(re.findall(r"""['"]([^'"]+)['"]""", bracketed or ""))
+    return values or ("lib",)
 
 
 def _path_is_within(path: Path, root: Path) -> bool:
@@ -1331,23 +1477,78 @@ _TEST_PATTERNS = [
     re.compile(r"_spec$"),
 ]
 
-_TEST_FILE_PATTERNS = [
-    re.compile(r"test_.*\.py$"),
-    re.compile(r".*_test\.py$"),
-    re.compile(r".*\.test\.[jt]sx?$"),
-    re.compile(r".*\.spec\.[jt]sx?$"),
-    re.compile(r".*_test\.go$"),
-    re.compile(r"tests?/"),
-    re.compile(r"[\\/]__tests__[\\/]"),
-    re.compile(r".*_test\.dart$"),
-    re.compile(r"test[_-].*\.[rR]$"),
-    re.compile(r"tests/testthat/"),
-    re.compile(r".*Test\.kt$"),
-    re.compile(r".*Test\.java$"),
-    re.compile(r".*_test\.resi?$"),
-    re.compile(r".*\.test\.resi?$"),
-    re.compile(r"test/runtests\.jl$"),
-    re.compile(r"test/.*\.jl$"),
+# Path separator or start of the repository-relative path.  Directory and
+# stem patterns anchor on it so "src/latest/" is not read as a "test/"
+# directory and "contests/" is not read as "tests/".  Both separators are
+# accepted: the graph stores POSIX paths, but callers pass native ones.
+_SEP = r"(?:^|[\\/])"
+
+# Absolute-path shapes, tested against the POSIX-normalised spelling: a
+# leading slash, a Windows drive letter, or a UNC share.
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:/|//)")
+
+# Directory conventions.  These are matched against the path RELATIVE to the
+# repository root, never against the absolute path the graph stores: the
+# directories ABOVE a checkout are not part of the project, so a repository
+# cloned into a CI workspace named "test" would otherwise have every one of
+# its production symbols classified as test code.
+_TEST_DIR_PATTERNS = [
+    # Python ``tests/``, Go and Rust ``tests/``, Java/Kotlin ``src/test/``.
+    # The singular ``test/`` is handled separately below so a library that
+    # ships a ``test`` subpackage keeps its production status.
+    re.compile(_SEP + r"tests[\\/]"),
+    re.compile(_SEP + r"__tests__[\\/]"),
+    re.compile(_SEP + r"e2e[_-]?tests?[\\/]"),
+    re.compile(_SEP + r"testthat[\\/]"),
+    # Ruby RSpec.  The directory name alone is not evidence: "spec/" and
+    # "specs/" just as often hold design documents or generated API specs,
+    # which are production artefacts.  Require a Ruby source file under it.
+    re.compile(_SEP + r"specs?[\\/].*\.(?:rb|rake)$"),
+]
+
+# The singular ``test/`` directory, kept out of the list above so the
+# shipped-package exception in :func:`_is_shipped_test_package` applies to it
+# alone.
+_SINGULAR_TEST_DIR_RE = re.compile(_SEP + r"test[\\/]")
+
+# Directories that hold helpers *for* tests.  Ambiguous on purpose: a shared
+# library published from ``test-utils/`` is production code with a public API,
+# so this is opt-in (``include_helper_dirs``) rather than part of the default
+# answer.  Only dead-code detection asks for it, where a false "dead" report
+# costs a reviewer more than a missed one.  See :func:`is_test_file`.
+_TEST_HELPER_DIR_PATTERNS = [
+    re.compile(_SEP + r"test[_-]utils?[\\/]"),
+]
+
+# Filename conventions.  Matched against the basename alone, so they hold
+# whatever the repository root is.
+_TEST_NAME_PATTERNS = [
+    # Python: pytest/unittest stems plus conftest, which holds fixtures.
+    re.compile(r"^test_.*\.py$"),
+    re.compile(r"_test\.py$"),
+    re.compile(r"^conftest\.py$"),
+    # JavaScript / TypeScript.
+    re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$"),
+    # Go.
+    re.compile(r"_test\.go$"),
+    # Ruby.
+    re.compile(r"_(?:test|spec)\.rb$"),
+    # Java / Kotlin / Scala / Groovy, C#, PHP (PHPUnit).  The character
+    # before "Test" must be lowercase or a digit so the suffix is a class
+    # name boundary rather than a substring: "ABTest.php" is an A/B testing
+    # feature, not a test for a class named "AB".  Acronym-prefixed suites
+    # such as "APITest.java" are caught by the test-directory rule instead.
+    re.compile(r"[a-z0-9]Tests?\.(?:java|kt|kts|scala|groovy)$"),
+    re.compile(r"[a-z0-9]Tests?\.cs$"),
+    re.compile(r"[a-z0-9]Test\.php$"),
+    # Dart.
+    re.compile(r"_test\.dart$"),
+    # R.
+    re.compile(r"^test[_-].*\.[rR]$"),
+    # ReScript.
+    re.compile(r"[_.]test\.resi?$"),
+    # Julia.
+    re.compile(r"^runtests\.jl$"),
 ]
 
 _TEST_RUNNER_NAMES = frozenset({
@@ -1951,19 +2152,214 @@ def _scan_rescript_modules(cleaned: str, offset_to_line) -> list[dict]:
     return modules
 
 
-def _is_test_file(path: str) -> bool:
-    return any(p.search(path) for p in _TEST_FILE_PATTERNS)
+@lru_cache(maxsize=64)
+def _repo_root_prefixes(repo_root: str) -> tuple[str, ...]:
+    """Return the POSIX spellings a path under *repo_root* may start with.
+
+    Both the spelling the caller gave and its symlink-resolved form are
+    returned: ``/tmp`` and ``/private/tmp`` name the same directory on macOS,
+    and a graph built through one spelling is often queried through the other.
+    """
+    root = normalize_file_path(repo_root).rstrip("/")
+    if not root:
+        return ()
+    prefixes = [root]
+    try:
+        resolved = normalize_file_path(Path(repo_root).resolve()).rstrip("/")
+    except (OSError, ValueError, RuntimeError):
+        resolved = ""
+    if resolved and resolved not in prefixes:
+        prefixes.append(resolved)
+    return tuple(prefixes)
+
+
+@lru_cache(maxsize=2048)
+def _resolved_dir(directory: str) -> str:
+    """Symlink-resolved POSIX spelling of *directory*, or "" if unresolvable."""
+    try:
+        return normalize_file_path(Path(directory).resolve())
+    except (OSError, ValueError, RuntimeError):
+        return ""
+
+
+def _strip_prefix(normalized: str, root: str) -> Optional[str]:
+    if normalized == root:
+        return ""
+    if normalized.startswith(root + "/"):
+        return normalized[len(root) + 1:]
+    # macOS and Windows filesystems are case-insensitive by default, so the
+    # stored path and the configured root can differ only in case.
+    if normalized.lower().startswith(root.lower() + "/"):
+        return normalized[len(root) + 1:]
+    return None
+
+
+def _repo_relative_path(
+    normalized: str, repo_root: "str | PurePath | None",
+) -> Optional[str]:
+    """Return *normalized* relative to *repo_root*, or ``None`` if unknowable.
+
+    ``None`` means "this path cannot be placed inside a repository", which
+    happens in exactly two ways: the path is absolute and no root was given,
+    or it is absolute and lies outside the root (a dependency, a generated
+    file, a stale row from another checkout).  Callers must not fall back to
+    the absolute path in that case — see :func:`is_test_file`.
+    """
+    if not _ABSOLUTE_PATH_RE.match(normalized):
+        # Already relative; by convention that is relative to the repo root.
+        return normalized
+    if repo_root is None:
+        return None
+    prefixes = _repo_root_prefixes(str(repo_root))
+    for root in prefixes:
+        relative = _strip_prefix(normalized, root)
+        if relative is not None:
+            return relative
+    # The two spellings can still name the same directory: ``/tmp`` and
+    # ``/private/tmp`` on macOS, or a checkout reached through a symlink.
+    # Resolving the path's own directory (cached, so once per directory) is
+    # the last attempt before giving up.
+    directory, _, name = normalized.rpartition("/")
+    resolved = _resolved_dir(directory) if directory else ""
+    if resolved and resolved != directory:
+        candidate = f"{resolved}/{name}"
+        for root in prefixes:
+            relative = _strip_prefix(candidate, root)
+            if relative is not None:
+                return relative
+    return None
+
+
+@lru_cache(maxsize=256)
+def _is_python_package_dir(directory: str) -> bool:
+    """Whether *directory* is an importable Python package (has __init__.py)."""
+    try:
+        return os.path.isfile(os.path.join(directory, "__init__.py"))
+    except (OSError, ValueError):
+        return False
+
+
+def _is_shipped_test_package(
+    normalized: str, relative: str, repo_root: "str | PurePath | None",
+) -> bool:
+    """Whether the singular ``test/`` directory in *relative* is shipped code.
+
+    ``django/test/client.py`` is production code: ``django/test/`` carries an
+    ``__init__.py`` and sits inside the ``django`` package, so users import it
+    as ``django.test``.  A top-level ``test/`` directory in an application is
+    not shipped — its parent is the repository root, which is not a package —
+    and neither is a ``test/`` directory holding a test-named module, which
+    the filename rules have already claimed before this is reached.
+
+    Returns False whenever the directories cannot be inspected (a relative
+    path with no root, a graph queried away from its checkout, a deleted
+    file), which keeps the conservative answer: the file stays test code.
+    """
+    if not relative.endswith(".py"):
+        return False
+    segments = relative.split("/")
+    dirs = segments[:-1]
+    try:
+        # The innermost "test" directory decides; anything under it inherits.
+        index = len(dirs) - 1 - dirs[::-1].index("test")
+    except ValueError:
+        return False
+    if index == 0:
+        # Top-level test/: its parent is the repository root, not a package.
+        return False
+    # The directories are read off disk, so they need a filesystem path. A
+    # relative input only has one when the caller gave the root; guessing
+    # against the working directory would make the answer depend on where
+    # the process happens to be running.
+    if len(normalized) > len(relative) and normalized.endswith(relative):
+        prefix = normalized[: len(normalized) - len(relative)]
+    elif repo_root is not None:
+        prefix = normalize_file_path(repo_root).rstrip("/") + "/"
+    else:
+        return False
+    test_dir = prefix + "/".join(dirs[: index + 1])
+    parent_dir = prefix + "/".join(dirs[:index])
+    return _is_python_package_dir(test_dir) and _is_python_package_dir(parent_dir)
+
+
+def repo_relative_path(
+    path: "str | PurePath", repo_root: "str | PurePath | None" = None,
+) -> Optional[str]:
+    """Return *path* as a POSIX path inside *repo_root*, or ``None``.
+
+    ``None`` says the path cannot be placed inside the repository — it is
+    absolute and either no root was given or it lies outside that root.  Any
+    rule that reads meaning from a directory name (``tests/``, a package
+    directory matched against an import specifier) needs this: the
+    directories above a checkout belong to whoever cloned it, not to the
+    project, and reading them as project structure is how a CI workspace
+    named "test" silences an entire report.  See #1023.
+    """
+    return _repo_relative_path(normalize_file_path(path), repo_root)
+
+
+def is_test_file(
+    path: "str | PurePath",
+    repo_root: "str | PurePath | None" = None,
+    *,
+    include_helper_dirs: bool = False,
+) -> bool:
+    """Return whether *path* holds test code.
+
+    Everything in a test file is test code: the test functions, the classes
+    that group them, the fixtures and the private helpers they call.  Callers
+    outside the parser use this to keep test-file symbols out of reports about
+    production code.
+
+    *repo_root* is required to answer directory conventions such as ``tests/``
+    for an absolute path, because those directories must be inside the project.
+    The graph stores absolute paths, so without a root a repository checked
+    out under a directory named ``test`` (a CI workspace, a job directory)
+    would have every production symbol classified as test code and the
+    untested-code report would go silent.  When the root is unknown, or the
+    path lies outside it, only the filename conventions apply; that under-
+    reports test files but never hides a production gap.
+
+    *include_helper_dirs* additionally claims ``test-utils/`` and
+    ``test_utils/``.  Those directories are genuinely ambiguous — shared
+    libraries are published from them — so only dead-code detection opts in,
+    where over-suppressing costs less than a false "dead" report.
+    """
+    normalized = normalize_file_path(path)
+    basename = normalized.rsplit("/", 1)[-1]
+    if any(p.search(basename) for p in _TEST_NAME_PATTERNS):
+        return True
+
+    relative = _repo_relative_path(normalized, repo_root)
+    if relative is None:
+        return False
+    if any(p.search(relative) for p in _TEST_DIR_PATTERNS):
+        return True
+    if include_helper_dirs and any(
+        p.search(relative) for p in _TEST_HELPER_DIR_PATTERNS
+    ):
+        return True
+    if _SINGULAR_TEST_DIR_RE.search(relative):
+        return not _is_shipped_test_package(normalized, relative, repo_root)
+    return False
+
+
+# Historical private spelling, kept because other modules import it.
+_is_test_file = is_test_file
 
 
 def _is_test_function(
-    name: str, file_path: str, decorators: tuple[str, ...] = (),
+    name: str,
+    file_path: str,
+    decorators: tuple[str, ...] = (),
+    repo_root: "str | PurePath | None" = None,
 ) -> bool:
     """A function is a test if its name matches test patterns, it lives
     in a test file and has a test-runner name, or it has a @Test annotation.
     """
     if any(p.search(name) for p in _TEST_PATTERNS):
         return True
-    if _is_test_file(file_path) and name in _TEST_RUNNER_NAMES:
+    if is_test_file(file_path, repo_root) and name in _TEST_RUNNER_NAMES:
         return True
     if decorators and any(d in _TEST_ANNOTATIONS for d in decorators):
         return True
@@ -2540,6 +2936,9 @@ class CodeParser:
     """Parses source files using Tree-sitter and extracts structural information."""
 
     _MODULE_CACHE_MAX = 15_000  # Evict cache to cap memory on huge monorepos
+    # Ruby load-root discovery reads a handful of repository-root scripts.
+    _RUBY_MANIFEST_SCAN_MAX = 10
+    _RUBY_MANIFEST_MAX_BYTES = 256 * 1024
     _BLADE_COMMENT_RE = re.compile(r"\{\{--.*?(?:--\}\}|$)", re.DOTALL)
     _BLADE_DIRECTIVE_RE = re.compile(
         r"""(?<!@)@(extends|include|component|livewire)\s*\(\s*(['"])([^'"]+)\2\s*\)""",
@@ -2561,9 +2960,21 @@ class CodeParser:
         self._dbt_model_paths_cache: dict[Path, tuple[Path, ...]] = {}
         self._parsers: dict[str, object] = {}
         self._module_file_cache: dict[str, Optional[str]] = {}
-        # Directory listings for case-exact Python module lookup; see
-        # :meth:`_python_file_exists`.
-        self._python_dir_entries: dict[str, frozenset[str]] = {}
+        # Ignore patterns per repository boundary, so a resolver never names
+        # a path the build will not index; see :meth:`_path_is_indexed`.
+        self._ignore_patterns_cache: dict[str, Optional[list[str]]] = {}
+        # Memoised ignore-pattern verdicts. One verdict costs a resolve() and
+        # a walk of every pattern, and a whole-repository build asks about
+        # the same package directory once per import that names it.
+        self._indexed_path_cache: dict[str, bool] = {}
+        # Directory listings for case-exact module lookup; see
+        # :meth:`_file_exists_exact`. Shared by every language resolver.
+        self._dir_entries_cache: dict[str, frozenset[str]] = {}
+        # go.mod discovery, keyed by directory; see :meth:`_go_module_chain`.
+        self._go_module_cache: dict[str, Optional["_GoModule"]] = {}
+        # Ruby load roots, keyed by repository boundary; see
+        # :meth:`_ruby_load_roots`.
+        self._ruby_load_roots_cache: dict[str, tuple[Path, ...]] = {}
         # (module file, symbol) -> file that really defines the symbol; see
         # :meth:`_python_reexport_origin`.
         self._python_reexport_cache: dict[str, str] = {}
@@ -2729,6 +3140,16 @@ class CodeParser:
 
         return SHEBANG_INTERPRETER_TO_LANGUAGE.get(interpreter)
 
+    def _is_test_path(self, path: "str | PurePath") -> bool:
+        """Whether *path* holds test code, judged inside this repository.
+
+        Every test-ness question the parser asks goes through here so the
+        repository root is never left out: :func:`is_test_file` reads
+        directory conventions from the path relative to the root, and an
+        absolute path with no root silently loses them.
+        """
+        return is_test_file(path, self._repo_root)
+
     def parse_file(self, path: Path) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a single file and return extracted nodes and edges."""
         try:
@@ -2746,6 +3167,24 @@ class CodeParser:
         *source* so the stored file hash always describes the bytes that were
         actually parsed (issue #746).
         """
+        nodes, edges = self._extract_bytes(path, source)
+        # Every node from a test file is test code, whatever its kind: the
+        # test classes, the fixtures and the private helpers as much as the
+        # test functions.  Marking them here rather than at each of the ~40
+        # NodeInfo construction sites is what keeps Class nodes from being
+        # reported as untested production code (issue #1014).  It runs after
+        # extraction so TESTED_BY generation, which keys off the test
+        # functions alone, is unaffected.
+        fallback_path = normalize_file_path(path)
+        for node in nodes:
+            if not node.is_test and self._is_test_path(node.file_path or fallback_path):
+                node.is_test = True
+        return nodes, edges
+
+    def _extract_bytes(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Language dispatch for :meth:`parse_bytes`."""
         language = self.detect_language(path, source)
         if not language:
             return [], []
@@ -2848,7 +3287,7 @@ class CodeParser:
         file_path_str = normalize_file_path(path)
 
         # File node
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
         file_extra: dict = {}
         # C#: record the namespace(s) this file declares so query-time
         # fallbacks can resolve namespace-form IMPORTS_FROM targets (from
@@ -3102,7 +3541,7 @@ class CodeParser:
                 line_start=1,
                 line_end=source.count(b"\n") + 1,
                 language="blade",
-                is_test=_is_test_file(file_path),
+                is_test=self._is_test_path(file_path),
             ),
         ]
         edges: list[EdgeInfo] = []
@@ -3129,7 +3568,7 @@ class CodeParser:
 
         tree = vue_parser.parse(source)
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         all_nodes: list[NodeInfo] = [NodeInfo(
             kind="File",
@@ -3252,7 +3691,7 @@ class CodeParser:
 
         tree = svelte_parser.parse(source)
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         all_nodes: list[NodeInfo] = [NodeInfo(
             kind="File",
@@ -3441,7 +3880,7 @@ class CodeParser:
                 line_start=1,
                 line_end=1,
                 language=kernel_lang,
-                is_test=_is_test_file(file_path_str),
+                is_test=self._is_test_path(file_path_str),
             )], []
 
         return self._parse_notebook_cells(path, cells, kernel_lang)
@@ -3460,7 +3899,7 @@ class CodeParser:
             default_language: Default language for the File node.
         """
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         # Group cells by language
         lang_cells: dict[str, list[CellInfo]] = {}
@@ -3664,7 +4103,7 @@ class CodeParser:
                 line_start=1,
                 line_end=1,
                 language="python",
-                is_test=_is_test_file(file_path_str),
+                is_test=self._is_test_path(file_path_str),
             )
             file_node.extra["notebook_format"] = "databricks_py"
             return [file_node], []
@@ -3697,7 +4136,7 @@ class CodeParser:
         statements = _vbnet_logical_lines(cleaned)
         file_path = normalize_file_path(path)
         line_count = text.count("\n") + 1
-        test_file = _is_test_file(file_path)
+        test_file = self._is_test_path(file_path)
 
         nodes = [NodeInfo(
             kind="File",
@@ -3938,7 +4377,7 @@ class CodeParser:
                 key = ((scope or "").casefold(), name.casefold())
                 member_index = member_nodes.get(key)
                 if member_index is None:
-                    is_test = _is_test_function(name, file_path)
+                    is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
                     extra = {"vbnet_kind": member_kind}
                     if type_params:
                         extra["vbnet_type_parameters"] = type_params
@@ -4118,7 +4557,7 @@ class CodeParser:
         """
         text = source.decode("utf-8", errors="replace")
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
         is_interface = path.suffix.lower() == ".resi"
 
         # Strip comments and string/backtick literal content so downstream
@@ -4210,7 +4649,7 @@ class CodeParser:
             if not is_top_level(off, parent):
                 continue  # nested local `let` — not a structural node
             line_start = offset_to_line(off)
-            is_test_fn = _is_test_function(name, file_path_str)
+            is_test_fn = _is_test_function(name, file_path_str, repo_root=self._repo_root)
             let_entries.append({
                 "name": name,
                 "start_off": off,
@@ -4525,7 +4964,7 @@ class CodeParser:
         """
         text = source.decode("utf-8", errors="replace")
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
@@ -7701,7 +8140,7 @@ class CodeParser:
             )
             if fn_name is None:
                 return False
-            is_test = _is_test_function(fn_name, file_path)
+            is_test = _is_test_function(fn_name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(fn_name, file_path, enclosing_class)
             nodes.append(NodeInfo(
@@ -8699,7 +9138,7 @@ class CodeParser:
             if lhs is not None and lhs.type == "call_expression":
                 name = self._julia_short_func_name(lhs)
                 if name:
-                    is_test = _is_test_function(name, file_path, ())
+                    is_test = _is_test_function(name, file_path, (), repo_root=self._repo_root)
                     kind = "Test" if is_test else "Function"
                     lexical_parent = self._julia_scope_join(
                         enclosing_class, enclosing_func,
@@ -9124,7 +9563,7 @@ class CodeParser:
         # Check for anonymous function: local foo = function(...) end
         for expr in expr_list.children:
             if expr.type == "function_definition":
-                is_test = _is_test_function(var_name, file_path)
+                is_test = _is_test_function(var_name, file_path, repo_root=self._repo_root)
                 kind = "Test" if is_test else "Function"
                 qualified = self._qualify(var_name, file_path, enclosing_class)
                 params = self._get_params(expr, language, source)
@@ -9205,7 +9644,7 @@ class CodeParser:
         if not table_name or not method_name:
             return False
 
-        is_test = _is_test_function(method_name, file_path)
+        is_test = _is_test_function(method_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(method_name, file_path, table_name)
         params = self._get_params(child, language, source)
@@ -9367,7 +9806,7 @@ class CodeParser:
         if not name:
             return False
 
-        is_test = _is_test_function(name, file_path)
+        is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(name, file_path, enclosing_class)
 
@@ -9692,7 +10131,7 @@ class CodeParser:
             if not var_name or not func_node:
                 continue
 
-            is_test = _is_test_function(var_name, file_path)
+            is_test = _is_test_function(var_name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(var_name, file_path, enclosing_class)
             params = self._get_params(func_node, language, source)
@@ -9764,7 +10203,7 @@ class CodeParser:
         if not prop_name or not func_node:
             return False
 
-        is_test = _is_test_function(prop_name, file_path)
+        is_test = _is_test_function(prop_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(prop_name, file_path, enclosing_class)
         params = self._get_params(func_node, language, source)
@@ -9872,7 +10311,7 @@ class CodeParser:
         if member_name is None:
             return False
 
-        is_test = _is_test_function(member_name, file_path)
+        is_test = _is_test_function(member_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(member_name, file_path, enclosing_class)
         params = self._get_params(right, language, source)
@@ -11430,12 +11869,12 @@ class CodeParser:
         if deco_list:
             decorators = tuple(deco_list)
 
-        is_test = _is_test_function(name, file_path, decorators)
+        is_test = _is_test_function(name, file_path, decorators, repo_root=self._repo_root)
         # PHPUnit's name convention is ``test*`` (not only ``test_*``).
         if (
             language == "php"
             and child.type == "method_declaration"
-            and _is_test_file(file_path)
+            and self._is_test_path(file_path)
             and name.startswith("test")
         ):
             is_test = True
@@ -11665,19 +12104,65 @@ class CodeParser:
         invocation). Returning False lets the dispatcher fall through to call
         extraction instead of silently dropping the call. See: Ruby call graph.
         """
-        imports = self._extract_import(child, language, source, file_path)
-        for imp_target in imports:
-            resolved = self._resolve_module_to_file(
-                imp_target, file_path, language,
+        specs = self._extract_import_specs(child, language, source, file_path)
+        for spec in specs:
+            target, scope = self._resolve_import_target(
+                spec.module, file_path, language, spec.form,
             )
+            if target is None:
+                # Nothing in this repository: the standard library, a gem, a
+                # dependency that is not vendored, or a directory the build
+                # does not index. Keep the bare module string, which is what
+                # the edge said before -- never a guessed path.
+                target, scope = spec.module, None
             edges.append(EdgeInfo(
                 kind="IMPORTS_FROM",
                 source=file_path,
-                target=resolved if resolved else imp_target,
+                target=target,
                 file_path=file_path,
-                line=child.start_point[0] + 1,
+                line=spec.line,
+                extra={IMPORT_SCOPE_KEY: scope} if scope else {},
             ))
-        return bool(imports)
+        return bool(specs)
+
+    def _resolve_import_target(
+        self,
+        module: str,
+        file_path: str,
+        language: str,
+        form: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The single target one import statement names, and its scope.
+
+        Most languages name a file, and the scope is ``None``. Two do not:
+        a Go import names a PACKAGE, which is a directory of files, and
+        Ruby's ``require_all`` names a directory tree. Both resolve to the
+        directory itself with :data:`IMPORT_SCOPE_PACKAGE` or
+        :data:`IMPORT_SCOPE_TREE`, and the read path expands the directory
+        to its member files when a caller asks.
+
+        Naming the directory rather than fanning out to one edge per file is
+        what keeps the edge count proportional to the number of imports
+        instead of imports times package size, and what makes an incremental
+        update equal a rebuild: the target no longer depends on which files
+        happened to be in the package when the importing file was parsed.
+        """
+        if language == "go":
+            package_dir = self._resolve_go_package_dir(module, file_path)
+            if package_dir is None:
+                return None, None
+            return normalize_file_path(package_dir), IMPORT_SCOPE_PACKAGE
+        if language == "ruby" and form == "require_all":
+            directory = self._resolve_ruby_require_all_dir(module, file_path)
+            if directory is not None:
+                return normalize_file_path(directory), IMPORT_SCOPE_TREE
+            # ``require_all`` on a plain file argument behaves like
+            # ``require``, which is what the gem itself does.
+            form = "require"
+        resolved = self._resolve_module_to_file(
+            module, file_path, language, form=form,
+        )
+        return (resolved, None) if resolved else (None, None)
 
     def _extract_calls(
         self,
@@ -11724,7 +12209,7 @@ class CodeParser:
         if (
             call_name
             and language in ("javascript", "typescript", "tsx")
-            and _is_test_file(file_path)
+            and self._is_test_path(file_path)
             and call_name not in _TEST_RUNNER_NAMES
         ):
             effective_call_name = (
@@ -11735,7 +12220,7 @@ class CodeParser:
         if (
             effective_call_name
             and language in ("javascript", "typescript", "tsx")
-            and _is_test_file(file_path)
+            and self._is_test_path(file_path)
             and effective_call_name in _TEST_RUNNER_NAMES
         ):
             test_desc = self._get_test_description(child, source)
@@ -14288,8 +14773,13 @@ class CodeParser:
             return {name for name in value if isinstance(name, str)}
         return None
 
-    def _python_repo_boundary(self, file_path: str) -> Path:
-        """Return the filesystem boundary for safe Python import lookup."""
+    def _import_repo_boundary(self, file_path: str) -> Path:
+        """Return the filesystem boundary for safe import lookup.
+
+        Shared by every language whose resolver walks the filesystem: the
+        configured repository root when there is one, else the nearest VCS
+        checkout at or above the caller.
+        """
         caller_dir = Path(file_path).resolve().parent
         if self._repo_root is not None:
             return self._repo_root
@@ -14307,8 +14797,8 @@ class CodeParser:
             return False
         return True
 
-    def _python_file_exists(self, path: Path) -> bool:
-        """Case-exact ``is_file`` for Python module lookup.
+    def _file_exists_exact(self, path: Path) -> bool:
+        """Case-exact ``is_file`` for module lookup in any language.
 
         ``Path.is_file()`` answers "yes" to ``Registry.py`` on APFS/NTFS when
         only ``registry.py`` exists, which is how a wrong import target
@@ -14325,18 +14815,7 @@ class CodeParser:
         below reaches around. Missing *here* also lets resolution fall through
         to the next candidate, exactly as the real absence would.
         """
-        parent = path.parent
-        key = str(parent)
-        entries = self._python_dir_entries.get(key)
-        if entries is None:
-            try:
-                entries = frozenset(os.listdir(parent))
-            except OSError:
-                entries = frozenset()
-            if len(self._python_dir_entries) >= self._MODULE_CACHE_MAX:
-                self._python_dir_entries.clear()
-            self._python_dir_entries[key] = entries
-        if path.name not in entries:
+        if path.name not in self._dir_entry_names(path.parent):
             return False
         try:
             if not path.is_file():
@@ -14347,25 +14826,87 @@ class CodeParser:
             return False
         return True
 
-    def _python_dir_exists(self, path: Path) -> bool:
-        """Case-exact ``is_dir`` for Python package lookup.
+    def _dir_entry_names(self, directory: Path) -> frozenset[str]:
+        """The real names in *directory*, cached per directory.
 
-        Same reason as :meth:`_python_file_exists`: a PEP 420 namespace
+        One listing backs every case-exact probe below, because a package is
+        probed once per import that names it.
+        """
+        key = str(directory)
+        entries = self._dir_entries_cache.get(key)
+        if entries is None:
+            try:
+                entries = frozenset(os.listdir(directory))
+            except OSError:
+                entries = frozenset()
+            if len(self._dir_entries_cache) >= self._MODULE_CACHE_MAX:
+                self._dir_entries_cache.clear()
+            self._dir_entries_cache[key] = entries
+        return entries
+
+    def _path_is_indexed(self, path: Path, boundary: Path) -> bool:
+        """Whether a build would index *path*, so an edge may name it.
+
+        The ignore patterns are the single source of truth for what becomes a
+        node. Resolving an import into ``vendor/`` -- excluded by the default
+        ``**/vendor/**`` -- produced 73,507 kubernetes edges naming files that
+        no node answers to: a confident-looking path that resolves to
+        nothing, which reads worse than the bare module string it replaced.
+        An import that lands on an unindexed path therefore resolves to
+        nothing, and the edge keeps the bare module string.
+
+        ``incremental`` imports this module, so the patterns can only be
+        fetched at call time; the answer is memoised per boundary, and a
+        parser is rebuilt for every build and every update.
+        """
+        key = str(path)
+        cached = self._indexed_path_cache.get(key)
+        if cached is not None:
+            return cached
+        verdict = self._compute_path_is_indexed(path, boundary)
+        if len(self._indexed_path_cache) >= self._MODULE_CACHE_MAX:
+            self._indexed_path_cache.clear()
+        self._indexed_path_cache[key] = verdict
+        return verdict
+
+    def _compute_path_is_indexed(self, path: Path, boundary: Path) -> bool:
+        """The uncached body of :meth:`_path_is_indexed`."""
+        try:
+            relative = path.resolve().relative_to(boundary).as_posix()
+        except (OSError, ValueError, RuntimeError):
+            return True
+        patterns = self._ignore_patterns(boundary)
+        if patterns is None:
+            return True
+        from .incremental import _should_ignore
+
+        return not _should_ignore(relative, patterns)
+
+    def _ignore_patterns(self, boundary: Path) -> Optional[list[str]]:
+        """The ignore patterns in force under *boundary*, or ``None``."""
+        key = str(boundary)
+        if key in self._ignore_patterns_cache:
+            return self._ignore_patterns_cache[key]
+        patterns: Optional[list[str]]
+        try:
+            from .incremental import _load_ignore_patterns
+
+            patterns = _load_ignore_patterns(boundary)
+        except Exception:  # pragma: no cover - defensive
+            patterns = None
+        if len(self._ignore_patterns_cache) >= self._MODULE_CACHE_MAX:
+            self._ignore_patterns_cache.clear()
+        self._ignore_patterns_cache[key] = patterns
+        return patterns
+
+    def _dir_exists_exact(self, path: Path) -> bool:
+        """Case-exact ``is_dir`` for package lookup in any language.
+
+        Same reason as :meth:`_file_exists_exact`: a PEP 420 namespace
         package is a directory, and ``Path.is_dir()`` would confirm a
         spelling that is not on disk.
         """
-        parent = path.parent
-        key = str(parent)
-        entries = self._python_dir_entries.get(key)
-        if entries is None:
-            try:
-                entries = frozenset(os.listdir(parent))
-            except OSError:
-                entries = frozenset()
-            if len(self._python_dir_entries) >= self._MODULE_CACHE_MAX:
-                self._python_dir_entries.clear()
-            self._python_dir_entries[key] = entries
-        if path.name not in entries:
+        if path.name not in self._dir_entry_names(path.parent):
             return False
         try:
             return path.is_dir()
@@ -14424,7 +14965,7 @@ class CodeParser:
             package_dir / name / "__init__.py",
             package_dir / f"{name}.py",
         ):
-            if self._python_file_exists(candidate):
+            if self._file_exists_exact(candidate):
                 return normalize_file_path(candidate)
         return None
 
@@ -14446,7 +14987,7 @@ class CodeParser:
                 continue
             if self._python_submodule_file(
                 package_dir, name,
-            ) is not None or self._python_dir_exists(package_dir / name):
+            ) is not None or self._dir_exists_exact(package_dir / name):
                 submodules.append(name)
         return submodules
 
@@ -14461,7 +15002,7 @@ class CodeParser:
         ``.ns`` specifier there would be a target no node can ever answer to.
         """
         package_dir = self._python_package_dir(module, file_path)
-        namespace = package_dir is not None and not self._python_file_exists(
+        namespace = package_dir is not None and not self._file_exists_exact(
             package_dir / "__init__.py",
         )
         prefix = module if module.endswith(".") else f"{module}."
@@ -14487,7 +15028,7 @@ class CodeParser:
         """
         candidate = Path(module)
         if candidate.is_absolute():
-            boundary = self._python_repo_boundary(file_path)
+            boundary = self._import_repo_boundary(file_path)
             try:
                 resolved = candidate.resolve()
             except (OSError, ValueError):
@@ -14496,7 +15037,7 @@ class CodeParser:
                 return None
             return (
                 normalize_file_path(resolved)
-                if self._python_file_exists(resolved)
+                if self._file_exists_exact(resolved)
                 else None
             )
         return self._resolve_python_module_in_repo(module, file_path)
@@ -14514,7 +15055,7 @@ class CodeParser:
         module.
         """
         caller_dir = Path(file_path).resolve().parent
-        boundary = self._python_repo_boundary(file_path)
+        boundary = self._import_repo_boundary(file_path)
         leading_dots = len(module) - len(module.lstrip("."))
         module_name = module[leading_dots:]
         relative = Path(*module_name.split(".")) if module_name else Path()
@@ -14567,7 +15108,7 @@ class CodeParser:
                     continue
                 if not self._path_is_within(resolved, boundary):
                     continue
-                if self._python_file_exists(resolved):
+                if self._file_exists_exact(resolved):
                     return normalize_file_path(resolved)
         return None
 
@@ -14602,7 +15143,7 @@ class CodeParser:
                 if candidate.is_dir():
                     return candidate
                 continue
-            if self._python_dir_exists(candidate):
+            if self._dir_exists_exact(candidate):
                 return candidate
         return None
 
@@ -14966,20 +15507,31 @@ class CodeParser:
         self._python_reexport_cache.clear()
 
     def _resolve_module_to_file(
-        self, module: str, file_path: str, language: str,
+        self,
+        module: str,
+        file_path: str,
+        language: str,
+        form: Optional[str] = None,
     ) -> Optional[str]:
         """Resolve a module/import path to an absolute file path.
 
         Uses self._module_file_cache to avoid repeated filesystem lookups.
         Files marked via :meth:`exclude_files` resolve to ``None`` so callers
         fall back to the bare module string, matching a build without them.
+
+        *form* distinguishes two import keywords that take identical module
+        strings and resolve them differently -- Ruby's ``require`` against
+        the load paths, ``require_relative`` against the requiring file's
+        own directory -- so it is part of the cache key, not just an
+        argument. See :class:`_ImportSpec`.
         """
         caller_dir = str(Path(file_path).parent)
-        cache_key = f"{language}:{caller_dir}:{module}"
+        prefix = f"{language}:{form}" if form else language
+        cache_key = f"{prefix}:{caller_dir}:{module}"
         if cache_key in self._module_file_cache:
             resolved = self._module_file_cache[cache_key]
         else:
-            resolved = self._do_resolve_module(module, file_path, language)
+            resolved = self._do_resolve_module(module, file_path, language, form)
             if resolved is not None:
                 # Resolution walks the real filesystem, so on Windows the
                 # raw result uses backslashes; identity must not (#774).
@@ -14992,10 +15544,23 @@ class CodeParser:
         return resolved
 
     def _do_resolve_module(
-        self, module: str, file_path: str, language: str,
+        self,
+        module: str,
+        file_path: str,
+        language: str,
+        form: Optional[str] = None,
     ) -> Optional[str]:
         """Language-aware module-to-file resolution."""
         caller_dir = Path(file_path).parent
+
+        if language == "go":
+            # A Go import names a package -- a directory -- so there is no
+            # single file to answer with. :meth:`_resolve_import_target` is
+            # the entry point, and it resolves to the directory itself.
+            return None
+
+        if language == "ruby":
+            return self._resolve_ruby_module_file(module, file_path, form)
 
         if language == "bash":
             # ``source ./lib.sh`` or ``source lib.sh`` — resolve relative
@@ -15058,7 +15623,7 @@ class CodeParser:
             while True:
                 for candidate in candidates:
                     target = current / candidate
-                    if self._python_file_exists(target):
+                    if self._file_exists_exact(target):
                         found = target.resolve()
                         if self._repo_root is not None and not _path_is_within(
                             found, self._repo_root,
@@ -15258,6 +15823,456 @@ class CodeParser:
                     break
                 current = current.parent
 
+        return None
+
+    # ------------------------------------------------------------------
+    # Repository-bounded, case-exact path walking.
+    #
+    # Shared by the Go and Ruby resolvers below. Both reuse the existing
+    # machinery rather than adding a third one: `_dir_entries_cache` backs
+    # the case-exact probes, and `_path_is_within` is the repository clamp
+    # that Python, Rust and PHP already apply.
+    # ------------------------------------------------------------------
+
+    def _parts_within(
+        self, base: Path, relative: str, boundary: Path,
+    ) -> Optional[tuple[str, ...]]:
+        """Join *relative* onto *base*, as parts relative to *boundary*.
+
+        ``None`` when the result leaves *boundary*. That is the repository
+        rule: a go.mod ``replace => ../outside`` and a
+        ``require_relative "../../../elsewhere"`` both name real files, and
+        neither may become an edge target.
+        """
+        try:
+            joined = Path(os.path.normpath(os.path.join(str(base), relative)))
+            return joined.relative_to(boundary).parts
+        except (OSError, ValueError):
+            return None
+
+    def _exact_dir(self, boundary: Path, parts: tuple[str, ...]) -> Optional[Path]:
+        """Walk *parts* below *boundary*, each component case-exactly.
+
+        Empty *parts* is *boundary* itself, which is what a Go import equal
+        to the module path (``import "github.com/spf13/cobra"``) names.
+        """
+        current = boundary
+        for part in parts:
+            if not part or part in (".", ".."):
+                return None
+            if not self._dir_exists_exact(current / part):
+                return None
+            current = current / part
+        return current
+
+    def _exact_file(self, boundary: Path, parts: tuple[str, ...]) -> Optional[Path]:
+        """The file at *parts* below *boundary*, every component case-exact."""
+        if not parts:
+            return None
+        parent = self._exact_dir(boundary, parts[:-1])
+        if parent is None:
+            return None
+        candidate = parent / parts[-1]
+        return candidate if self._file_exists_exact(candidate) else None
+
+    # ------------------------------------------------------------------
+    # Go: go.mod anchored package resolution
+    # ------------------------------------------------------------------
+
+    def _go_module_at(self, directory: Path) -> Optional[_GoModule]:
+        """The ``go.mod`` declared in *directory*, if there is one."""
+        key = str(directory)
+        if key in self._go_module_cache:
+            return self._go_module_cache[key]
+        record: Optional[_GoModule] = None
+        candidate = directory / "go.mod"
+        if self._file_exists_exact(candidate):
+            try:
+                stat = candidate.stat()
+            except OSError:
+                stat = None
+            if stat is not None:
+                module_path, replacements = _read_go_mod(
+                    str(candidate), stat.st_mtime_ns, stat.st_size,
+                )
+                if module_path:
+                    record = _GoModule(directory, module_path, replacements)
+        if len(self._go_module_cache) >= self._MODULE_CACHE_MAX:
+            self._go_module_cache.clear()
+        self._go_module_cache[key] = record
+        return record
+
+    def _go_module_chain(
+        self, caller_dir: Path, boundary: Path,
+    ) -> list[_GoModule]:
+        """Every go.mod from *caller_dir* up to *boundary*, nearest first.
+
+        Nearest first is what makes a nested module win over its ancestor.
+        Keeping the ancestors in the chain is what lets a file inside a
+        nested module (cli/cli has one under .github/codeql) still resolve
+        an import of the outer module's own packages.
+        """
+        chain: list[_GoModule] = []
+        current = caller_dir
+        while True:
+            record = self._go_module_at(current)
+            if record is not None:
+                chain.append(record)
+            if current == boundary or current == current.parent:
+                break
+            current = current.parent
+            if not _path_is_within(current, boundary):
+                break
+        return chain
+
+    def _go_package_dir(
+        self, record: _GoModule, module: str, boundary: Path,
+    ) -> Optional[Path]:
+        """The directory *module* names within one module, or ``None``."""
+        if module == record.path:
+            relative = ""
+        elif module.startswith(record.path + "/"):
+            relative = module[len(record.path) + 1:]
+        else:
+            for prefix, local in record.replacements:
+                if module == prefix:
+                    remainder = ""
+                elif module.startswith(prefix + "/"):
+                    remainder = module[len(prefix) + 1:]
+                else:
+                    continue
+                parts = self._parts_within(
+                    record.root / local, remainder, boundary,
+                )
+                return None if parts is None else self._exact_dir(boundary, parts)
+            return None
+        parts = self._parts_within(record.root, relative, boundary)
+        return None if parts is None else self._exact_dir(boundary, parts)
+
+    def _go_package_holds_source(
+        self, package_dir: Path, boundary: Path,
+    ) -> bool:
+        """Whether *package_dir* holds at least one indexed ``.go`` file.
+
+        A Go import path names a package, and a directory with no indexed Go
+        source is not one that this graph can answer for: ``vendor/`` is
+        excluded by the default ignore patterns, and ``k8s.io/kubernetes``
+        has an ``api/`` directory of OpenAPI specs that no import can mean.
+        Only PRESENCE is tested, never how many files, so adding a file to a
+        package -- the case that made an incremental update disagree with a
+        rebuild -- never changes what an import of it resolves to.
+        """
+        if not self._path_is_indexed(package_dir, boundary):
+            return False
+        return any(
+            name.endswith(".go")
+            and self._path_is_indexed(package_dir / name, boundary)
+            for name in self._dir_entry_names(package_dir)
+        )
+
+    def _resolve_go_package_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """Resolve one Go import path to the package DIRECTORY it names.
+
+        A directory, not a file: a Go import names a package, and every file
+        in that directory is part of it. Emitting the directory once is what
+        keeps the edge count proportional to the number of import statements
+        rather than to imports times package size; the read path expands the
+        directory to its files. See :meth:`_resolve_import_target`.
+
+        Returns ``None`` for the standard library, for any dependency that is
+        neither vendored nor ``replace``d into this repository, and for any
+        directory the build does not index, so the caller keeps the bare
+        import string rather than naming a path nothing will answer to.
+        """
+        if not module or module.startswith("."):
+            return None
+        if "." not in module.split("/", 1)[0]:
+            # No dot in the first segment is the standard library, by
+            # definition (``fmt``, ``net/http``, ``path/filepath``). Searching
+            # the filesystem for these instead would bind 149 of cli/cli's
+            # 3575 standard-library imports to same-named repository
+            # directories (context 133, embed 11, io 5).
+            return None
+        # Memoised on the same cache, with the same key shape and eviction
+        # cap, as :meth:`_resolve_module_to_file`; the ``go-pkg`` prefix keeps
+        # a package directory from colliding with a file resolution.
+        cache_key = f"go-pkg:{Path(file_path).parent}:{module}"
+        if cache_key in self._module_file_cache:
+            cached = self._module_file_cache[cache_key]
+            return Path(cached) if cached else None
+        resolved = self._do_resolve_go_package_dir(module, file_path)
+        if len(self._module_file_cache) >= self._MODULE_CACHE_MAX:
+            self._module_file_cache.clear()
+        self._module_file_cache[cache_key] = str(resolved) if resolved else None
+        return resolved
+
+    def _do_resolve_go_package_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """The uncached body of :meth:`_resolve_go_package_dir`."""
+        try:
+            caller_dir = Path(file_path).resolve().parent
+        except (OSError, RuntimeError, ValueError):
+            return None
+        boundary = self._import_repo_boundary(file_path)
+        if not _path_is_within(caller_dir, boundary):
+            return None
+        chain = self._go_module_chain(caller_dir, boundary)
+        candidates: list[Path] = []
+        for record in chain:
+            package_dir = self._go_package_dir(record, module, boundary)
+            if package_dir is not None:
+                candidates.append(package_dir)
+        # ``vendor/<import path>`` holds a dependency's own source in-tree.
+        # It is only a target when the build actually indexes it: the default
+        # ignore patterns exclude ``**/vendor/**``, and 73,507 of kubernetes'
+        # import edges used to name files inside it that are not nodes.
+        for record in chain:
+            parts = self._parts_within(record.root / "vendor", module, boundary)
+            if parts is None:
+                continue
+            package_dir = self._exact_dir(boundary, parts)
+            if package_dir is not None:
+                candidates.append(package_dir)
+        for package_dir in candidates:
+            if self._go_package_holds_source(package_dir, boundary):
+                return package_dir
+        return None
+
+    # ------------------------------------------------------------------
+    # Ruby: load-path and caller-relative resolution
+    # ------------------------------------------------------------------
+
+    def _ruby_looks_like_rails(self, boundary: Path) -> bool:
+        """Whether *boundary* is shaped like a Rails application."""
+        try:
+            return (
+                (boundary / "config" / "application.rb").is_file()
+                or (boundary / "app" / "models").is_dir()
+            )
+        except OSError:
+            return False
+
+    def _ruby_gemspec_require_paths(self, boundary: Path) -> tuple[str, ...]:
+        """``require_paths`` declared by the gemspecs at the repository root."""
+        try:
+            gemspecs = sorted(
+                name for name in os.listdir(boundary)
+                if name.endswith(".gemspec")
+            )[:self._RUBY_MANIFEST_SCAN_MAX]
+        except OSError:
+            return ()
+        paths: list[str] = []
+        for name in gemspecs:
+            candidate = boundary / name
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            for value in _read_gemspec_require_paths(
+                str(candidate), stat.st_mtime_ns, stat.st_size,
+            ):
+                if value not in paths:
+                    paths.append(value)
+        return tuple(paths)
+
+    def _ruby_load_path_additions(self, boundary: Path) -> list[Path]:
+        """Directories a repository-root script adds to ``$LOAD_PATH``.
+
+        Only the scripts a build can afford to read are scanned: the root's
+        own ``.rb`` files, ``Rakefile``, ``Gemfile``, the gemspecs, and the
+        two conventional test helpers. A ``$LOAD_PATH`` push written
+        anywhere else is not visible here. That is a stated limit, not a
+        guarantee -- the alternative is reading every file in the repository
+        before resolving the first import.
+        """
+        candidates: list[Path] = []
+        try:
+            for name in sorted(os.listdir(boundary)):
+                if name in ("Rakefile", "Gemfile") or name.endswith(
+                    (".rb", ".gemspec"),
+                ):
+                    candidates.append(boundary / name)
+        except OSError:
+            return []
+        candidates = candidates[:self._RUBY_MANIFEST_SCAN_MAX]
+        candidates.append(boundary / "spec" / "spec_helper.rb")
+        candidates.append(boundary / "test" / "test_helper.rb")
+        additions: list[Path] = []
+        for path in candidates:
+            try:
+                if path.stat().st_size > self._RUBY_MANIFEST_MAX_BYTES:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for match in _RUBY_LOAD_PATH_RE.finditer(text):
+                literal, anchor = match.group(2), match.group(3)
+                if anchor == "__FILE__":
+                    # File.expand_path("../lib", __FILE__) expands against
+                    # the file PATH, so the first ".." is the file itself.
+                    base = path
+                elif anchor == "__dir__":
+                    base = path.parent
+                else:
+                    # A bare literal is relative to the working directory,
+                    # which for a repository-root script is the root.
+                    base = boundary
+                additions.append(
+                    Path(os.path.normpath(os.path.join(str(base), literal))),
+                )
+        return additions
+
+    def _ruby_load_roots(self, boundary: Path) -> tuple[Path, ...]:
+        """The directories a bare ``require`` searches in this repository.
+
+        Discovered from the repository rather than guessed: the gemspec's
+        ``require_paths`` (``lib`` when it declares none), ``lib``/``test``/
+        ``spec`` when they exist, the Rails ``app`` autoload roots, and any
+        directory a ``$LOAD_PATH.unshift`` in a repository-root script
+        names.
+
+        Rails' implicit Zeitwerk autoloading by constant name is out of
+        scope and deliberately absent: a bare ``Jekyll::Drops::Drop``
+        reference is not an import statement, so there is nothing for a
+        module-to-file import resolver to resolve. Supporting it needs a
+        constant-reference resolver and autoload-root discovery from
+        config/application.rb, which is a separate feature.
+        """
+        key = str(boundary)
+        cached = self._ruby_load_roots_cache.get(key)
+        if cached is not None:
+            return cached
+        roots: list[Path] = []
+        seen: set[str] = set()
+
+        def add(path: Path) -> None:
+            try:
+                candidate = Path(os.path.normpath(str(path)))
+            except (OSError, ValueError):
+                return
+            token = str(candidate)
+            if token in seen or not _path_is_within(candidate, boundary):
+                return
+            try:
+                if not candidate.is_dir():
+                    return
+            except OSError:
+                return
+            seen.add(token)
+            roots.append(candidate)
+
+        for name in self._ruby_gemspec_require_paths(boundary):
+            add(boundary / name)
+        for name in ("lib", "test", "spec"):
+            add(boundary / name)
+        if self._ruby_looks_like_rails(boundary):
+            app = boundary / "app"
+            add(app)
+            try:
+                for child in sorted(os.listdir(app)):
+                    add(app / child)
+            except OSError:
+                pass
+        for extra in self._ruby_load_path_additions(boundary):
+            add(extra)
+        result = tuple(roots)
+        if len(self._ruby_load_roots_cache) >= self._MODULE_CACHE_MAX:
+            self._ruby_load_roots_cache.clear()
+        self._ruby_load_roots_cache[key] = result
+        return result
+
+    def _ruby_tree_holds_source(self, directory: Path, boundary: Path) -> bool:
+        """Whether any indexed ``.rb`` file sits below *directory*.
+
+        Like :meth:`_go_package_holds_source`, this tests presence and never
+        counts: what a ``require_all`` resolves to does not change when a
+        file is added to or removed from the tree it names.
+        """
+        if not self._path_is_indexed(directory, boundary):
+            return False
+        for current, dirnames, filenames in os.walk(directory):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if name.endswith(".rb") and self._path_is_indexed(
+                    Path(current) / name, boundary,
+                ):
+                    return True
+        return False
+
+    def _resolve_ruby_require_all_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """Resolve ``require_all "jekyll/commands"`` to the DIRECTORY it names.
+
+        The ``require_all`` gem loads every ``.rb`` file below the directory
+        it names, so it is a directory-scoped import like a Go package
+        import, not a single file. jekyll declares six subsystems this way
+        (commands, converters, converters/markdown, drops, generators, tags)
+        and every one of them was invisible to the graph.
+
+        ``None`` when the name is not an indexed directory, which sends the
+        caller to the ordinary ``require`` probe -- what the gem itself does
+        for a plain file argument.
+        """
+        if not module:
+            return None
+        try:
+            caller_dir = Path(file_path).resolve().parent
+        except (OSError, RuntimeError, ValueError):
+            return None
+        boundary = self._import_repo_boundary(file_path)
+        for root in (caller_dir, *self._ruby_load_roots(boundary)):
+            parts = self._parts_within(root, module, boundary)
+            if parts is None:
+                continue
+            directory = self._exact_dir(boundary, parts)
+            if directory is None:
+                continue
+            if self._ruby_tree_holds_source(directory, boundary):
+                return directory
+        return None
+
+    def _resolve_ruby_module_file(
+        self, module: str, file_path: str, form: Optional[str],
+    ) -> Optional[str]:
+        """Resolve one Ruby require/autoload/load to a file in this repository.
+
+        ``require_relative`` resolves against the requiring file's own
+        directory. ``require``, ``load`` and ``autoload`` resolve against
+        the repository's load roots. A gem or a stdlib feature matches no
+        root and stays ``None``, so the edge keeps the bare string --
+        ``nokogiri`` must never bind to a repository file.
+        """
+        if not module:
+            return None
+        try:
+            caller_dir = Path(file_path).resolve().parent
+        except (OSError, RuntimeError, ValueError):
+            return None
+        boundary = self._import_repo_boundary(file_path)
+        roots: tuple[Path, ...] = (
+            (caller_dir,) if form == "require_relative"
+            else self._ruby_load_roots(boundary)
+        )
+        # ``load`` always carries the extension; the other forms may omit it.
+        candidates = (
+            (module,) if module.endswith(".rb") else (module + ".rb", module)
+        )
+        for root in roots:
+            for candidate in candidates:
+                parts = self._parts_within(root, candidate, boundary)
+                if parts is None:
+                    continue
+                found = self._exact_file(boundary, parts)
+                # An unindexed file (``vendor/bundle``, anything a
+                # .code-review-graphignore excludes) is not a target: the
+                # graph has no node for it, so naming it would be a
+                # confident path that resolves to nothing.
+                if found is not None and self._path_is_indexed(found, boundary):
+                    return str(found)
         return None
 
     @staticmethod
@@ -15710,7 +16725,7 @@ class CodeParser:
                 candidate = module_path.resolve()
             except (OSError, ValueError):
                 return None
-            boundary = self._python_repo_boundary(file_path)
+            boundary = self._import_repo_boundary(file_path)
             if not self._path_is_within(candidate, boundary) or not candidate.is_file():
                 return None
             resolved = normalize_file_path(candidate)
@@ -16997,6 +18012,128 @@ class CodeParser:
                         )
         return bases
 
+    @staticmethod
+    def _extract_go_import_specs(node) -> list[_ImportSpec]:
+        """Every specifier of one Go import declaration, at its own line.
+
+        Covers all eight forms: single, grouped, named (``alias "path"``),
+        blank (``_ "path"``), dot (``. "path"``), vendored, internal and
+        standard library. The alias, the blank and the dot are discarded --
+        they change what the importing file may call the package, never
+        which package is imported.
+
+        The line comes from the ``import_spec``, not the enclosing
+        ``import_declaration``: every spec in a grouped block used to be
+        stamped with the line of the ``import (`` token.
+        """
+        specs: list[_ImportSpec] = []
+
+        def add(spec_node) -> None:
+            for part in spec_node.children:
+                if part.type != "interpreted_string_literal":
+                    continue
+                value = part.text.decode("utf-8", errors="replace").strip('"')
+                if value:
+                    specs.append(
+                        _ImportSpec(value, spec_node.start_point[0] + 1),
+                    )
+                return
+
+        for child in node.children:
+            if child.type == "import_spec_list":
+                for spec in child.children:
+                    if spec.type == "import_spec":
+                        add(spec)
+            elif child.type == "import_spec":
+                add(child)
+        return specs
+
+    @staticmethod
+    def _ruby_string_literal(node) -> Optional[str]:
+        """The literal value of a Ruby string node, or ``None``.
+
+        ``None`` for anything that is not a plain literal -- an
+        interpolated string, an escape, a ``File.join(...)`` call, a bare
+        variable. A path a program builds at runtime is not a path this
+        parser may guess at: ``require File.join(__dir__, "app", "helper")``
+        used to become an edge to ``app``, the first quoted string in the
+        call.
+        """
+        if node.type != "string":
+            return None
+        parts: list[str] = []
+        for child in node.children:
+            if child.type == "string_content":
+                parts.append(child.text.decode("utf-8", errors="replace"))
+            elif child.type in ("interpolation", "escape_sequence"):
+                return None
+        return "".join(parts) or None
+
+    def _extract_ruby_import_specs(self, node) -> list[_ImportSpec]:
+        """The file one Ruby ``call`` node loads, if it loads one at all.
+
+        Dispatches on the call's METHOD, not on whether the node's text
+        happens to contain the letters "require". The substring test made
+        14% of jekyll's ruby import edges false positives, with targets
+        like ``Missing --ssl_cert or --ssl_key. Both are required.`` from a
+        ``raise``, and it never saw ``autoload``, which is how jekyll
+        declares its entire internal module graph (49 statements).
+        """
+        method = node.child_by_field_name("method")
+        if method is None or method.type != "identifier":
+            return []
+        name = method.text.decode("utf-8", errors="replace")
+        if name not in _RUBY_IMPORT_METHODS:
+            return []
+        receiver = node.child_by_field_name("receiver")
+        if receiver is not None and not (
+            name == "autoload"
+            and receiver.type in ("constant", "self", "scope_resolution")
+        ):
+            # `Jekyll.autoload :Site, "jekyll/site"` names a real path;
+            # `some_object.load(x)` is an ordinary method call.
+            return []
+        arguments = node.child_by_field_name("arguments")
+        if arguments is None:
+            return []
+        positional = [
+            child for child in arguments.children
+            if child.type not in (",", "(", ")")
+        ]
+        index = _RUBY_IMPORT_PATH_ARGUMENT.get(name, 0)
+        if len(positional) <= index:
+            return []
+        value = self._ruby_string_literal(positional[index])
+        if value is None:
+            return []
+        return [_ImportSpec(value, node.start_point[0] + 1, name)]
+
+    def _extract_import_specs(
+        self,
+        node,
+        language: str,
+        source: bytes,
+        file_path: Optional[str] = None,
+    ) -> list[_ImportSpec]:
+        """Import statements as (module, line, form) triples.
+
+        Most grammars give one form and one line per statement, so those
+        come straight from :meth:`_extract_import`. Go and Ruby do not: a Go
+        ``import ( ... )`` block holds many specifiers at many lines, and
+        Ruby's ``require`` and ``require_relative`` resolve identical
+        strings by different algorithms, so the keyword has to survive as
+        far as the resolver.
+        """
+        if language == "go":
+            return self._extract_go_import_specs(node)
+        if language == "ruby":
+            return self._extract_ruby_import_specs(node)
+        line = node.start_point[0] + 1
+        return [
+            _ImportSpec(module, line)
+            for module in self._extract_import(node, language, source, file_path)
+        ]
+
     def _extract_import(
         self,
         node,
@@ -17046,19 +18183,9 @@ class CodeParser:
                     val = child.text.decode("utf-8", errors="replace").strip("'\"")
                     imports.append(val)
         elif language == "go":
-            for child in node.children:
-                if child.type == "import_spec_list":
-                    for spec in child.children:
-                        if spec.type == "import_spec":
-                            for s in spec.children:
-                                if s.type == "interpreted_string_literal":
-                                    val = s.text.decode("utf-8", errors="replace")
-                                    imports.append(val.strip('"'))
-                elif child.type == "import_spec":
-                    for s in child.children:
-                        if s.type == "interpreted_string_literal":
-                            val = s.text.decode("utf-8", errors="replace")
-                            imports.append(val.strip('"'))
+            imports.extend(
+                spec.module for spec in self._extract_go_import_specs(node)
+            )
         elif language == "rust":
             imports.extend(
                 original_path
@@ -17130,11 +18257,9 @@ class CodeParser:
                             imports.append(val)
                     break  # Only first argument matters
         elif language == "ruby":
-            # require 'module' or require_relative 'path'
-            if "require" in text:
-                match = re.search(r"""['"](.*?)['"]""", text)
-                if match:
-                    imports.append(match.group(1))
+            imports.extend(
+                spec.module for spec in self._extract_ruby_import_specs(node)
+            )
         elif language == "dart":
             # import 'dart:async' or import 'package:flutter/material.dart'
             # Node structure: import_or_export > library_import > import_specification
@@ -17724,7 +18849,7 @@ class CodeParser:
 
         if right.type == "function_definition" and left.type == "identifier":
             name = left.text.decode("utf-8", errors="replace")
-            is_test = _is_test_function(name, file_path)
+            is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(name, file_path, enclosing_class)
             params = self._get_params(right, language, source)

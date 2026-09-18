@@ -513,6 +513,55 @@ class TestChanges:
             assert result["test_gaps"] == []
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 
+    def test_detect_changes_tool_reports_an_undiscoverable_diff_as_an_error(self):
+        """The MCP tool must not flatten "could not look" into the all-clear.
+
+        ``test_detect_changes_tool_no_changes`` above pins what a genuinely
+        clean tree looks like: ``status: ok`` and an empty analysis. A git
+        that could not be run has to be distinguishable from that, or a
+        client cannot tell a reviewed pull request from an unreviewed one.
+        """
+        from code_review_graph.errors import ChangeDiscoveryError
+        from code_review_graph.tools import detect_changes_func
+
+        with (
+            patch("code_review_graph.tools.review._get_store") as mock_get_store,
+            patch(
+                "code_review_graph.tools.review.get_changed_files",
+                side_effect=ChangeDiscoveryError(
+                    "could not determine the changes: git could not be run"
+                ),
+            ),
+            patch.object(self.store, "close"),
+        ):
+            mock_get_store.return_value = (self.store, Path("/fake/repo"))
+
+            result = detect_changes_func(base="HEAD~1", repo_root="/fake/repo")
+
+        assert result["status"] == "error"
+        assert "could not determine the changes" in result["error"]
+
+    def test_detect_changes_tool_asks_for_a_working_vcs(self):
+        """The distinction is requested at the call, not hoped for."""
+        from code_review_graph.tools import detect_changes_func
+
+        with (
+            patch("code_review_graph.tools.review._get_store") as mock_get_store,
+            patch(
+                "code_review_graph.tools.review.get_changed_files", return_value=[]
+            ) as get_changed,
+            patch(
+                "code_review_graph.tools.review.get_staged_and_unstaged",
+                return_value=[],
+            ) as get_staged,
+            patch.object(self.store, "close"),
+        ):
+            mock_get_store.return_value = (self.store, Path("/fake/repo"))
+            detect_changes_func(base="HEAD~1", repo_root="/fake/repo")
+
+        assert get_changed.call_args.kwargs["require_vcs"] is True
+        assert get_staged.call_args.kwargs["require_vcs"] is True
+
     def test_detect_changes_tool_with_changes(self):
         """detect_changes_func returns full analysis for changed files."""
         from code_review_graph.tools import detect_changes_func
@@ -567,7 +616,11 @@ class TestChanges:
 
         assert result["status"] == "ok"
         resolve.assert_called_once_with(root, "origin/main")
-        get_changed.assert_called_once_with(root, "merge-base-sha")
+        # require_vcs=True: "no changed files" is an all-clear, so a git that
+        # could not be run must not produce it.
+        get_changed.assert_called_once_with(
+            root, "merge-base-sha", require_vcs=True,
+        )
         parse_ranges.assert_called_once_with(str(root), "merge-base-sha")
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 
@@ -861,15 +914,17 @@ class TestRiskScoreChurn:
 
         baseline = analyze_changes(self.store, **kwargs)
         with patch(
-            "code_review_graph.changes.compute_file_churn",
-            return_value={"app.py": 10},
+            "code_review_graph.changes.compute_file_churn_with_status",
+            return_value=({"app.py": 10}, "ok"),
         ):
             churned = analyze_changes(self.store, include_churn=True, **kwargs)
 
         assert churned["risk_score"] - baseline["risk_score"] == pytest.approx(0.15)
 
     def test_analyze_changes_does_not_compute_churn_by_default(self, tmp_path):
-        with patch("code_review_graph.changes.compute_file_churn") as churn:
+        with patch(
+            "code_review_graph.changes.compute_file_churn_with_status",
+        ) as churn:
             analyze_changes(
                 self.store,
                 changed_files=["app.py"],

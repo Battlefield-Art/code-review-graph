@@ -43,6 +43,73 @@
 
 ### Fixed
 
+- Go and Ruby imports resolve into the repository instead of staying bare
+  strings. Go reads the module path from the nearest `go.mod` (nested
+  modules win over their ancestors, and local `replace` targets are
+  honoured) and maps an in-repo import to the package DIRECTORY it names;
+  the standard library, undownloaded dependencies and anything the ignore
+  patterns exclude stay unresolved. Ruby resolves `require_relative`
+  against the requiring file and `require`, `load`, `autoload` and
+  `require_all` against the repository's load roots (gemspec
+  `require_paths`, `lib`, `test`, `spec`, the Rails `app` roots, and
+  `$LOAD_PATH.unshift` in a root script); gems stay unresolved.
+  `importers_of` for cli/cli's `pkg/iostreams/color.go` goes from 0 to 424,
+  and for jekyll's `test/helper.rb` from 0 to 51.
+- A Go import names a package and a Ruby `require_all` names a directory
+  tree, so both emit ONE edge naming that directory, tagged
+  `extra.import_scope`, and the read path expands a directory to its member
+  files. `importers_of` matches edges targeting a file's own package,
+  `imports_of` reports `import_target_kind`, and the impact traversal
+  follows a package target at every hop without spending one. Emitting an
+  edge per member file instead would make the edge count grow with imports
+  times package size. On kubernetes/kubernetes that was 588,972 edges against
+  the 93,650 recorded now, one per import statement (73,507 of the 588,972
+  came from a single imported package), and 524.6s of build time against
+  about 146s. It also made an incremental update disagree with a rebuild,
+  because an edge's targets then depend on which files were in the package
+  when the importing file happened to be parsed.
+- Resolving imports that previously resolved to nothing costs build time and
+  disk, on every repository measured, and never saves either. Measured
+  against the graph built before this change: a kubernetes/kubernetes build
+  goes from 115.1s and 122.8s to 148.7s and 146.5s (about 24% slower) and its
+  database from 4.41 GB to 5.36 GB (21.5% larger), run isolated and
+  alternating on one idle machine; cli/cli goes from a 7.6s build and a
+  281.1 MB database to 9.3s and 325.9 MB. What that buys is that a bound
+  import also lets the call resolver attribute cross-file calls: on cli/cli
+  the CALLS edges bound to an indexed node go from 5503 to 22564 of 67503,
+  with the edge count unchanged.
+- The impact traversal's directory branch is pinned to an index seek on
+  `(target_qualified, kind)`. Left to itself SQLite drove it from the
+  covering index on `kind` alone and rescanned every `IMPORTS_FROM` row once
+  per frontier directory, which was 18 seconds of a 19-second kubernetes
+  traversal; pinned it is 1.8s, against 6.5s for the same answer under the
+  per-file fan-out. `tests/test_import_scope.py` asserts the plan.
+- No import edge names a path the build does not index. 73,512 kubernetes
+  import edges named a path the build never indexed, 73,507 of them files
+  under `vendor/`, which `**/vendor/**` excludes, so every one of them was a
+  confident-looking path that matched no node. Five remain. Such an import
+  keeps its bare module string, which is visibly external.
+- `get_impact_radius` bounds every list in its response by a fixed ceiling
+  -- the same 100 nodes, 150 edges and 200 files `get_review_context`
+  applies to the same radius -- and reports `edges_omitted`,
+  `changed_nodes_omitted` and `impacted_files_omitted` alongside the
+  existing `nodes_omitted` and `total_impacted`. `edges` and `changed_nodes`
+  had no ceiling at all and `max_results` was not exposed on the MCP tool,
+  so the response grew with the repository: 138k tokens on one changed file
+  of cli/cli and 189,163 on one of kubernetes, against a documented 12k
+  budget. That kubernetes response is now 23,669 tokens. Edges that touch the
+  changed code are kept first, and `max_results` is now an argument of
+  `get_impact_radius_tool`.
+- Every specifier in a Go `import ( ... )` block carries its own line.
+  8636 of cli/cli's 8687 import edges (99.4%) were stamped with the line of
+  the `import (` token.
+- Ruby import extraction dispatches on the call's method name instead of
+  testing whether the node text contains "require". 31 of jekyll's 227
+  import edges (14%) were not on a require line at all, with targets such
+  as `Missing --ssl_cert or --ssl_key. Both are required.`; those call
+  subtrees were also being dropped whole, so their calls are now
+  extracted. `autoload`, which is how jekyll declares its entire internal
+  module graph, produced no edge at all.
 - Freshness metadata follows what was stored. A no-op `update` that
   confirms `HEAD` advances the Git anchor, so queries after a commit no
   longer carry a stale-graph caveat, and a file that fails to parse no

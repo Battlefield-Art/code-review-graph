@@ -2023,6 +2023,77 @@ class TestBuildPostprocessResolvesBareEndpoints:
         finally:
             reopened.close()
 
+    def _stored_build_state(self) -> str | None:
+        from code_review_graph.tools.build import BUILD_STATE_KEY
+
+        reopened = GraphStore(self.db_path)
+        try:
+            return reopened.get_metadata(BUILD_STATE_KEY)
+        finally:
+            reopened.close()
+
+    def test_manual_run_postprocess_clears_the_marker_after_a_repair(
+        self, monkeypatch
+    ):
+        """A build that stored every file and died is what this command repairs.
+
+        Leaving the marker set after a successful repair would promote every
+        later update to a full rebuild of a graph that is already right.
+        """
+        import code_review_graph.tools.build as build_module
+        from code_review_graph.build_state import POSTPROCESS_PENDING
+        from code_review_graph.tools.build import BUILD_COMPLETE, BUILD_STATE_KEY
+
+        self.store.set_metadata(BUILD_STATE_KEY, POSTPROCESS_PENDING)
+        monkeypatch.setattr(
+            build_module,
+            "_get_store",
+            lambda _repo_root: (self.store, Path("/repo")),
+        )
+        result = build_module.run_postprocess(
+            flows=False,
+            communities=False,
+            fts=False,
+            repo_root="/repo",
+        )
+
+        assert result["status"] == "ok"
+        assert result.get("build_incomplete") is not True
+        assert self._stored_build_state() == BUILD_COMPLETE
+
+    def test_manual_run_postprocess_keeps_the_marker_when_files_are_missing(
+        self, monkeypatch
+    ):
+        """Derived data over a graph missing files is not a complete graph.
+
+        Every stage reads the stored nodes, so all of them succeed and none
+        can notice the files the dead build never parsed. Clearing the marker
+        there hands back a half-built graph labelled healthy.
+        """
+        import code_review_graph.tools.build as build_module
+        from code_review_graph.tools.build import BUILD_IN_PROGRESS, BUILD_STATE_KEY
+
+        self.store.set_metadata(BUILD_STATE_KEY, BUILD_IN_PROGRESS)
+        monkeypatch.setattr(
+            build_module,
+            "_get_store",
+            lambda _repo_root: (self.store, Path("/repo")),
+        )
+        result = build_module.run_postprocess(
+            flows=False,
+            communities=False,
+            fts=False,
+            repo_root="/repo",
+        )
+
+        # It still repairs what it can, and reports what it could not.
+        assert result["bare_edges_resolved"] == 1
+        assert result["status"] == "partial"
+        assert result["build_incomplete"] is True
+        assert any("stopped before every file was stored" in w
+                   for w in result["warnings"])
+        assert self._stored_build_state() == BUILD_IN_PROGRESS
+
 
 class TestComputeSummaries:
     """Tests for _compute_summaries: pins the contents of the three

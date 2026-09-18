@@ -374,7 +374,11 @@ class TestDetectChangesCommand:
 
         assert json.loads(capsys.readouterr().out)["summary"] == "resolved"
         resolve.assert_called_once_with(repo.resolve(), "origin/main")
-        get_changed.assert_called_once_with(repo.resolve(), "merge-base-sha")
+        # require_vcs=True: detect-changes' exit code is a review gate, so a
+        # git it could not run must not be reported as "no changes".
+        get_changed.assert_called_once_with(
+            repo.resolve(), "merge-base-sha", require_vcs=True,
+        )
         assert analyze.call_args.kwargs["base"] == "merge-base-sha"
 
     def test_brief_output_includes_token_savings_panel(self, tmp_path, capsys):

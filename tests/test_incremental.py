@@ -646,10 +646,30 @@ class TestGitOperations:
     def test_get_all_tracked_files(self, mock_run, tmp_path):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\nb.py\nc.go\n",
+            stdout="a.py\0b.py\0c.go\0",
         )
         result = get_all_tracked_files(tmp_path)
         assert result == ["a.py", "b.py", "c.go"]
+        assert "-z" in mock_run.call_args[0][0]
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_all_tracked_files_keeps_paths_git_would_quote(
+        self, mock_run, tmp_path
+    ):
+        """-z means no C-quoting, so odd paths arrive usable.
+
+        Without it core.quotePath makes git answer
+        '"src/caf\\303\\251.py"' — quotes and backslashes included — and the
+        file is dropped from the inventory because that spelling is not on
+        disk. A newline in a path would also end a record.
+        """
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="src/caf\u00e9.py\0src/my module.py\0src/two\nlines.py\0",
+        )
+        assert get_all_tracked_files(tmp_path) == [
+            "src/caf\u00e9.py", "src/my module.py", "src/two\nlines.py",
+        ]
 
     @patch("code_review_graph.incremental.subprocess.run")
     def test_get_all_tracked_files_recurse_submodules_param(
@@ -657,7 +677,7 @@ class TestGitOperations:
     ):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\nsub/b.py\n",
+            stdout="a.py\0sub/b.py\0",
         )
         result = get_all_tracked_files(tmp_path, recurse_submodules=True)
         assert result == ["a.py", "sub/b.py"]
@@ -670,7 +690,7 @@ class TestGitOperations:
     ):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\n",
+            stdout="a.py\0",
         )
         result = get_all_tracked_files(tmp_path)
         assert result == ["a.py"]
@@ -684,7 +704,7 @@ class TestGitOperations:
     ):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\nsub/c.py\n",
+            stdout="a.py\0sub/c.py\0",
         )
         # None -> falls back to env var (_RECURSE_SUBMODULES=True)
         result = get_all_tracked_files(tmp_path, recurse_submodules=None)
@@ -699,7 +719,7 @@ class TestGitOperations:
     ):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="a.py\n",
+            stdout="a.py\0",
         )
         # Explicit False overrides env var
         result = get_all_tracked_files(tmp_path, recurse_submodules=False)
@@ -1409,8 +1429,12 @@ class TestWatchReconciliation:
             with (
                 patch("watchdog.observers.Observer") as observer,
                 patch("time.sleep", side_effect=KeyboardInterrupt),
+                # Patch the entry point post-processing calls, not the
+                # rebuild underneath it: whether a sync rebuilds or applies
+                # a delta depends on how much of the graph moved, and this
+                # test is about the warning, not about which path ran.
                 patch(
-                    "code_review_graph.search.rebuild_fts_index",
+                    "code_review_graph.search.update_fts_index",
                     side_effect=sqlite3.OperationalError("forced FTS failure"),
                 ),
                 pytest.raises(

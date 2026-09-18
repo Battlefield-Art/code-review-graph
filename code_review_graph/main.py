@@ -21,6 +21,7 @@ from fastmcp import FastMCP
 
 from . import __version__
 from . import incremental as _incremental
+from .constants import env_int
 from .graph import GraphStore
 from .incremental import find_project_root, get_db_path, start_watch_thread
 from .prompts import (
@@ -222,26 +223,40 @@ def get_minimal_context_tool(
 def get_impact_radius_tool(
     changed_files: Optional[list[str]] = None,
     max_depth: int = 2,
+    max_results: int = 500,
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
     detail_level: str = "standard",
+    resolution: str = "all",
 ) -> dict:
     """Analyze the blast radius of changed files in the codebase.
 
     Shows which functions, classes, and files are impacted by changes.
     Auto-detects changed files from git if not specified.
 
+    An impacted node that calls or references the changed code directly also
+    carries the ``call_site`` (file and line) it does so at, and
+    ``unresolved_call_sites`` counts call sites that name a changed symbol but
+    were never bound to it, so an empty radius is not mistaken for proof.
+
     Args:
         changed_files: List of changed file paths (relative to repo root). Auto-detected if omitted.
         max_depth: Number of hops to traverse in the dependency graph. Default: 2.
+        max_results: How many impacted nodes to traverse to. Default: 500. Each
+            list in the response also has a fixed ceiling (100 nodes, 150
+            edges, 200 files) so the response size does not grow with the
+            repository; the omitted counts report the rest.
         repo_root: Repository root path. Auto-detected if omitted.
         base: Git ref for auto-detecting changes. Default: HEAD~1.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
+        resolution: "all" (default) or "direct" to traverse only calls bound to an indexed node.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(get_impact_radius(
         changed_files=changed_files, max_depth=max_depth,
+        max_results=max_results,
         repo_root=root, base=base, detail_level=detail_level,
+        resolution=resolution,
     ), root)
 
 
@@ -252,6 +267,7 @@ def query_graph_tool(
     repo_root: Optional[str] = None,
     detail_level: str = "standard",
     max_results: int = 100,
+    resolution: str = "all",
 ) -> dict:
     """Run a predefined graph query to explore code relationships.
 
@@ -273,17 +289,25 @@ def query_graph_tool(
     - consumers_of: Find classes that consume a Spring configuration property
     - file_summary: Get all nodes in a file
 
+    callers_of, callees_of and references_to return one row per call site, each
+    carrying the ``call_site`` (file and line) the call is written at, plus a
+    ``resolution_split`` saying how many of those call sites are bound to an
+    indexed node and how many are bare-name matches.
+
     Args:
         pattern: Query pattern name (see above).
         target: Node name, qualified name, or file path to query.
         repo_root: Repository root path. Auto-detected if omitted.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
         max_results: Maximum results to return. Default: 100.
+        resolution: "all" (default), "direct" for only calls bound to an indexed
+            node, or "unresolved" for only the bare-name matches.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(query_graph(
         pattern=pattern, target=target, repo_root=root,
         detail_level=detail_level, max_results=max_results,
+        resolution=resolution,
     ), root)
 
 
@@ -722,7 +746,7 @@ async def detect_changes_tool(
         ), root)
 
     coro = asyncio.to_thread(_run)
-    tool_timeout = int(os.environ.get("CRG_TOOL_TIMEOUT", "0"))
+    tool_timeout = env_int("CRG_TOOL_TIMEOUT", 0)
     if tool_timeout > 0:
         try:
             return await asyncio.wait_for(coro, timeout=tool_timeout)
@@ -1146,7 +1170,6 @@ def _apply_tool_filter(tools: str | None = None) -> None:
         CRG_TOOLS=query_graph_tool,semantic_search_nodes_tool
     """
     import asyncio
-    import os
 
     raw = tools or os.environ.get("CRG_TOOLS")
     if not raw:
